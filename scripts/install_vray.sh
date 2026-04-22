@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # ===== 3x-ui / Xray installer for VPnBot =====
+# Source of truth:
+#   https://github.com/youtubediscord/vpnbot_node_installer
 # Usage:
-#   bash <(curl -fsSL "https://gist.githubusercontent.com/loop-uh/dfa8b38cb421e6002ae1e783a1053e47/raw/install_vray.sh?ts=$(date +%s)")
-# Published gist source:
-#   https://gist.github.com/loop-uh/dfa8b38cb421e6002ae1e783a1053e47
-# After local edits, sync the published gist via:
-#   gh gist edit dfa8b38cb421e6002ae1e783a1053e47 scripts/install_vray.sh -f install_vray.sh
+#   bash <(curl -fsSL "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/main/install.sh?ts=$(date +%s)")
+#
+# Important: all raw.githubusercontent.com downloads use a cache-busting query.
 # Supported backend modes:
 # - 3x-ui    -> current panel-based workflow for VPnBot
 # - xray-core -> standalone official Xray-core in a dedicated folder, without x-ui
@@ -139,8 +139,7 @@ XRAY_CORE_SMOKE_PORT_EFFECTIVE=""
 XRAY_CORE_SMOKE_PUBLIC_KEY=""
 XRAY_CORE_SMOKE_SHORT_ID=""
 XRAY_CORE_SMOKE_LINK=""
-INSTALL_VRAY_GIST_RAW_URL="${INSTALL_VRAY_GIST_RAW_URL:-https://gist.githubusercontent.com/loop-uh/dfa8b38cb421e6002ae1e783a1053e47/raw/install_vray.sh}"
-INSTALL_VRAY_CURL_COMMAND='bash <(curl -fsSL "https://gist.githubusercontent.com/loop-uh/dfa8b38cb421e6002ae1e783a1053e47/raw/install_vray.sh?ts=$(date +%s)")'
+INSTALL_VRAY_CURL_COMMAND='bash <(curl -fsSL "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/main/install.sh?ts=$(date +%s)")'
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1255,7 +1254,16 @@ normalize_inputs() {
 
 
 fetch_upstream_installer() {
-    curl -L --max-time 30 "${XUI_UPSTREAM_INSTALL_URL}" -o "${XUI_UPSTREAM_TMP}"
+    local upstream_url="${XUI_UPSTREAM_INSTALL_URL}"
+    local cache_bust="${VPNBOT_NODE_INSTALLER_CACHE_BUST:-$(date +%s)}"
+    if [[ "${upstream_url}" == *"raw.githubusercontent.com"* ]]; then
+        if [[ "${upstream_url}" == *"?"* ]]; then
+            upstream_url="${upstream_url}&ts=${cache_bust}"
+        else
+            upstream_url="${upstream_url}?ts=${cache_bust}"
+        fi
+    fi
+    curl -L --max-time 30 -H "Cache-Control: no-cache" "${upstream_url}" -o "${XUI_UPSTREAM_TMP}"
     python3 - <<'PY'
 from pathlib import Path
 
@@ -1720,10 +1728,13 @@ download_node_installer_asset() {
     local mode="${3:-644}"
     local base_url="${VPNBOT_NODE_INSTALLER_BASE_URL%/}"
     local url="${base_url}/${asset_path}"
+    local cache_bust="${VPNBOT_NODE_INSTALLER_CACHE_BUST:-$(date +%s)}"
     local tmp_file
 
     tmp_file="$(mktemp)"
-    curl -fsSL --retry 3 --connect-timeout 10 -o "${tmp_file}" "${url}"
+    curl -fsSL --retry 3 --connect-timeout 10 \
+        -H "Cache-Control: no-cache" \
+        -o "${tmp_file}" "${url}?ts=${cache_bust}"
     install -m "${mode}" "${tmp_file}" "${destination}"
     rm -f "${tmp_file}"
 }

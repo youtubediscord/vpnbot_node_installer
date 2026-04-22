@@ -14,9 +14,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+cache_bust="${VPNBOT_NODE_INSTALLER_CACHE_BUST:-$(date +%s)}"
+
 curl -fsSL --retry 3 --connect-timeout 10 \
+    -H "Cache-Control: no-cache" \
     -o "${tmp_dir}/install_vray.sh" \
-    "${VPNBOT_NODE_INSTALLER_BASE_URL%/}/scripts/install_vray.sh"
+    "${VPNBOT_NODE_INSTALLER_BASE_URL%/}/scripts/install_vray.sh?ts=${cache_bust}"
 
 chmod 755 "${tmp_dir}/install_vray.sh"
 export VPNBOT_NODE_INSTALLER_REF

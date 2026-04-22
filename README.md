@@ -4,6 +4,8 @@ Latest-based installer bundle for VPnBot VPN nodes.
 
 The entrypoint is `install.sh`. It downloads the current `scripts/install_vray.sh`
 from `main`, and that installer downloads helper assets from `assets/`.
+All raw GitHub downloads use `?ts=$(date +%s)` cache busting so fresh installs do
+not accidentally receive stale CDN content.
 
 ## Install
 
@@ -28,3 +30,6 @@ the current installer and current assets.
 
 If a bad installer is pushed, rollback is done by fixing or reverting `main`,
 not by selecting older release tags.
+
+Do not publish a parallel gist copy of this installer. The old VLESS/Xray gist
+was intentionally retired so there is one source of truth: this repository.
