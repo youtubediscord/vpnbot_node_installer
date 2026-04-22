@@ -2,6 +2,20 @@
 
 Latest-based installer bundle for VPnBot VPN nodes.
 
+## Public Repository Notice
+
+This repository is intentionally **public**.
+
+Fresh VPN nodes must be able to download the installer with plain `curl`
+without GitHub tokens, SSH keys, or any private repository access. Because of
+that, this repository must contain only installer code, helper scripts, static
+templates, and public documentation.
+
+Never commit runtime secrets here: no `.env` files, API tokens, SSH private
+keys, real panel passwords, live server credentials, production runtime JSON, or
+logs with sensitive data. If a value is generated during installation, it must
+stay on the target server and must not be copied back into this repository.
+
 The entrypoint is `install.sh`. It downloads the current `scripts/install_vray.sh`
 from `main`, and that installer downloads helper assets from `assets/`.
 The bootstrap uses `raw.githubusercontent.com/.../refs/heads/main` only for the first tiny `install.sh`. After that it downloads the current branch archive through `codeload.github.com`, so helper assets are installed from the same fresh extracted tree instead of stale branch-file CDN responses.
