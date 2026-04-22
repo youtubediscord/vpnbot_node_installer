@@ -1180,18 +1180,55 @@ prepare_apt_networking() {
 }
 
 
+ensure_nginx_runtime_limits() {
+    mkdir -p /etc/systemd/system/nginx.service.d
+    cat > /etc/systemd/system/nginx.service.d/limits.conf <<'EOF'
+[Service]
+LimitNOFILE=65535
+EOF
+
+    python3 - <<'PY'
+from pathlib import Path
+import re
+
+path = Path('/etc/nginx/nginx.conf')
+if not path.exists():
+    raise SystemExit(0)
+
+text = path.read_text(encoding='utf-8')
+original = text
+
+if 'worker_rlimit_nofile' not in text:
+    text = text.replace('worker_processes auto;\n', 'worker_processes auto;\nworker_rlimit_nofile 65535;\n', 1)
+
+match = re.search(r'(^\s*worker_connections\s+)(\d+)(;)', text, re.MULTILINE)
+if match:
+    current = int(match.group(2))
+    if current < 4096:
+        text = text[:match.start()] + f"{match.group(1)}4096{match.group(3)}" + text[match.end():]
+
+if text != original:
+    path.write_text(text, encoding='utf-8')
+PY
+
+    systemctl daemon-reload
+}
+
+
 install_dependencies() {
     prepare_apt_networking || exit 1
     apt-get update -qq
     if is_xray_core_backend; then
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             curl ca-certificates openssl tar nginx libnginx-mod-stream certbot python3 python3-certbot-nginx iptables jq
+        ensure_nginx_runtime_limits
         log "Base packages installed for standalone Xray-core mode with nginx shared-port support"
         return 0
     fi
 
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         curl ca-certificates openssl tar nginx libnginx-mod-stream certbot python3 python3-certbot-nginx iptables jq sqlite3
+    ensure_nginx_runtime_limits
     log "Base packages installed for 3x-ui mode"
 }
 
