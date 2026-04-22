@@ -20,6 +20,7 @@ DEFAULT_XRAY_BIN = "/opt/vpnbot/xray-core/bin/xray"
 DEFAULT_XRAY_CONFDIR = "/opt/vpnbot/xray-core/config"
 DEFAULT_XRAY_ASSET_DIR = "/opt/vpnbot/xray-core/share"
 DEFAULT_API_SERVER = "127.0.0.1:10085"
+DEFAULT_XRAY_SERVICE_NAME = "vpnbot-xray.service"
 
 
 class XrayCtlError(RuntimeError):
@@ -222,6 +223,11 @@ def _api_reports_duplicate(out: str, err: str) -> bool:
     return "already exists" in f"{out}\n{err}".lower()
 
 
+def _api_reports_handler_missing(out: str, err: str) -> bool:
+    text = f"{out}\n{err}".lower()
+    return "handler not found" in text and "failed to get handler" in text
+
+
 def _validate_config(ns: argparse.Namespace) -> None:
     env = os.environ.copy()
     env["XRAY_LOCATION_ASSET"] = str(ns.xray_asset_dir)
@@ -277,6 +283,27 @@ def _api_remove_user(ns: argparse.Namespace, tag: str, email: str) -> tuple[int,
         [str(ns.xray_bin), "api", "rmu", f"--server={ns.api_server}", f"-tag={tag}", email],
         timeout=30,
     )
+
+
+def _restart_xray_service(ns: argparse.Namespace) -> None:
+    code, out, err = _run(
+        ["systemctl", "restart", str(ns.xray_service_name)],
+        timeout=60,
+    )
+    if code != 0:
+        raise XrayCtlError(
+            f"failed to restart xray service {ns.xray_service_name}: "
+            f"exit={code} stdout={out[-500:]} stderr={err[-500:]}"
+        )
+    code, out, err = _run(
+        ["systemctl", "is-active", str(ns.xray_service_name)],
+        timeout=20,
+    )
+    if code != 0 or str(out or "").strip() != "active":
+        raise XrayCtlError(
+            f"xray service {ns.xray_service_name} did not become active after restart: "
+            f"exit={code} stdout={out[-200:]} stderr={err[-200:]}"
+        )
 
 
 def _lock_path(ns: argparse.Namespace) -> Path:
@@ -351,12 +378,28 @@ def cmd_ensure_client(ns: argparse.Namespace) -> dict[str, Any]:
             _validate_config(ns)
             api_payload = _api_user_action_payload(inbound, new_client)
             code, out, err = _api_add_user(ns, api_payload)
+            restarted_for_handler_mismatch = False
+            if code != 0 and _api_reports_handler_missing(out, err):
+                _restart_xray_service(ns)
+                restarted_for_handler_mismatch = True
+                code, out, err = _api_add_user(ns, api_payload)
             if code != 0:
                 raise XrayCtlError(f"xray api add user failed: exit={code} stdout={out[-500:]} stderr={err[-500:]}")
             repaired_duplicate = False
             if _api_added_no_users(out):
                 tag = str(inbound.get("tag") or "").strip()
                 email = str(new_client.get("email") or "").strip()
+                if _api_reports_handler_missing(out, err) and not restarted_for_handler_mismatch:
+                    _restart_xray_service(ns)
+                    restarted_for_handler_mismatch = True
+                    retry_code, retry_out, retry_err = _api_add_user(ns, api_payload)
+                    if retry_code == 0 and not _api_added_no_users(retry_out):
+                        out, err = retry_out, retry_err
+                    elif retry_code != 0:
+                        raise XrayCtlError(
+                            "xray handler-mismatch add retry failed after restart: "
+                            f"exit={retry_code} stdout={retry_out[-500:]} stderr={retry_err[-500:]}"
+                        )
                 if _api_reports_duplicate(out, err) and tag and email:
                     rm_code, rm_out, rm_err = _api_remove_user(ns, tag, email)
                     if rm_code == 0:
@@ -444,6 +487,9 @@ def cmd_remove_client(ns: argparse.Namespace) -> dict[str, Any]:
         try:
             _validate_config(ns)
             code, out, err = _api_remove_user(ns, tag, target_email)
+            if code != 0 and _api_reports_handler_missing(out, err):
+                _restart_xray_service(ns)
+                code, out, err = _api_remove_user(ns, tag, target_email)
             if code != 0:
                 raise XrayCtlError(f"xray api remove user failed: exit={code} stdout={out[-500:]} stderr={err[-500:]}")
         except Exception:
@@ -460,6 +506,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xray-confdir", default=DEFAULT_XRAY_CONFDIR)
     parser.add_argument("--xray-asset-dir", default=DEFAULT_XRAY_ASSET_DIR)
     parser.add_argument("--api-server", default=DEFAULT_API_SERVER)
+    parser.add_argument("--xray-service-name", default=DEFAULT_XRAY_SERVICE_NAME)
     parser.add_argument("--lock-file", default="")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
