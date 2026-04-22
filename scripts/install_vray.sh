@@ -3242,6 +3242,14 @@ def parse_publication_spec(text: str) -> dict:
     return {"mode": "shared", "port": port}
 
 
+def resolve_publication_spec(tag: str, remark: str) -> tuple[dict, str]:
+    for candidate in (str(tag or ""), str(remark or "")):
+        if not MARK_RE.search(candidate):
+            continue
+        return parse_publication_spec(candidate), candidate
+    return parse_publication_spec(str(tag or "")), str(tag or "")
+
+
 def normalize_inbound_rows(raw_obj) -> list[dict]:
     if raw_obj is None:
         return []
@@ -3462,6 +3470,7 @@ def main() -> int:
     for idx, row in enumerate(rows, start=1):
         row_id = row.get("id") if row.get("id") is not None else idx
         tag = str(row.get("tag") or "")
+        remark = str(row.get("remark") or "")
         protocol = str(row.get("protocol") or "").lower()
         port = int(row.get("port") or 0)
 
@@ -3472,9 +3481,11 @@ def main() -> int:
             report_lines.append(f"id={row_id} skip invalid_port tag={tag!r}")
             continue
 
-        publication = parse_publication_spec(tag)
+        publication, publication_source = resolve_publication_spec(tag, remark)
         if publication["mode"] != "shared" or not publication.get("port"):
-            report_lines.append(f"id={row_id} direct port={port} protocol={protocol} tag={tag!r}")
+            report_lines.append(
+                f"id={row_id} direct port={port} protocol={protocol} tag={tag!r} remark={remark!r}"
+            )
             continue
         shared_port = int(publication["port"])
         shared_ports.add(shared_port)
@@ -3508,7 +3519,8 @@ def main() -> int:
                 register_stream_target(shared_port, domain, backend_target, passthrough_by_port, f"xray inbound #{row_id}")
             report_lines.append(
                 f"id={row_id} shared-stream external_port={shared_port} network={network or '<none>'} security={security or '<none>'} "
-                f"domains={','.join(domains)} backend_port={port} protocol={protocol} tag={tag!r}"
+                f"domains={','.join(domains)} backend_port={port} protocol={protocol} "
+                f"marker_source={publication_source!r} tag={tag!r} remark={remark!r}"
             )
             continue
 
@@ -3518,7 +3530,8 @@ def main() -> int:
             write_http_route(safe_name, path, port, grpc=False)
             report_lines.append(
                 f"id={row_id} shared-http external_port={shared_port} network=ws security={security or '<none>'} "
-                f"path={path} backend_port={port} protocol={protocol} tag={tag!r}"
+                f"path={path} backend_port={port} protocol={protocol} "
+                f"marker_source={publication_source!r} tag={tag!r} remark={remark!r}"
             )
             continue
 
@@ -3528,7 +3541,8 @@ def main() -> int:
             write_http_route(safe_name, "/" + service_name.lstrip("/"), port, grpc=True)
             report_lines.append(
                 f"id={row_id} shared-http external_port={shared_port} network=grpc security={security or '<none>'} "
-                f"service=/{service_name.lstrip('/')} backend_port={port} protocol={protocol} tag={tag!r}"
+                f"service=/{service_name.lstrip('/')} backend_port={port} protocol={protocol} "
+                f"marker_source={publication_source!r} tag={tag!r} remark={remark!r}"
             )
             continue
 
@@ -3544,13 +3558,15 @@ def main() -> int:
             write_http_route(safe_name, path, port, grpc=False)
             report_lines.append(
                 f"id={row_id} shared-http external_port={shared_port} network={network} security={security or '<none>'} "
-                f"path={path} backend_port={port} protocol={protocol} tag={tag!r}"
+                f"path={path} backend_port={port} protocol={protocol} "
+                f"marker_source={publication_source!r} tag={tag!r} remark={remark!r}"
             )
             continue
 
         report_lines.append(
             f"id={row_id} unsupported_shared_port external_port={shared_port} network={network or '<none>'} security={security or '<none>'} "
-            f"backend_port={port} protocol={protocol} reason=no_sni_or_http_route tag={tag!r}"
+            f"backend_port={port} protocol={protocol} reason=no_sni_or_http_route "
+            f"marker_source={publication_source!r} tag={tag!r} remark={remark!r}"
         )
 
     for route in load_extra_routes():
