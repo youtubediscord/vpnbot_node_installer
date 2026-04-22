@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import zlib
 from pathlib import Path
@@ -21,6 +22,8 @@ DEFAULT_XRAY_CONFDIR = "/opt/vpnbot/xray-core/config"
 DEFAULT_XRAY_ASSET_DIR = "/opt/vpnbot/xray-core/share"
 DEFAULT_API_SERVER = "127.0.0.1:10085"
 DEFAULT_XRAY_SERVICE_NAME = "vpnbot-xray.service"
+DEFAULT_HANDLER_MISMATCH_RESTART_COOLDOWN_SECONDS = 900
+DEFAULT_RESTART_STATE_FILE = "/var/lib/vpnbot-xrayctl/restart_state.json"
 
 
 class XrayCtlError(RuntimeError):
@@ -285,6 +288,44 @@ def _api_remove_user(ns: argparse.Namespace, tag: str, email: str) -> tuple[int,
     )
 
 
+def _load_restart_state(path: Path) -> dict[str, float]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, float] = {}
+    for key, value in payload.items():
+        try:
+            result[str(key)] = float(value)
+        except Exception:
+            continue
+    return result
+
+
+def _save_restart_state(path: Path, payload: dict[str, float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
+def _restart_state_path(ns: argparse.Namespace) -> Path:
+    raw = str(getattr(ns, "restart_state_file", "") or "").strip()
+    return Path(raw or DEFAULT_RESTART_STATE_FILE)
+
+
 def _restart_xray_service(ns: argparse.Namespace) -> None:
     code, out, err = _run(
         ["systemctl", "restart", str(ns.xray_service_name)],
@@ -304,6 +345,27 @@ def _restart_xray_service(ns: argparse.Namespace) -> None:
             f"xray service {ns.xray_service_name} did not become active after restart: "
             f"exit={code} stdout={out[-200:]} stderr={err[-200:]}"
         )
+
+
+def _maybe_restart_xray_service_for_handler_mismatch(ns: argparse.Namespace) -> None:
+    state_path = _restart_state_path(ns)
+    state = _load_restart_state(state_path)
+    service_name = str(ns.xray_service_name)
+    cooldown = max(60, int(getattr(ns, "handler_mismatch_restart_cooldown_seconds", DEFAULT_HANDLER_MISMATCH_RESTART_COOLDOWN_SECONDS)))
+    now = time.time()
+    last_restart_at = float(state.get(service_name) or 0.0)
+    if last_restart_at > 0.0:
+        age = max(0.0, now - last_restart_at)
+        if age < cooldown:
+            left = max(1, int(cooldown - age))
+            raise XrayCtlError(
+                f"xray handler-mismatch restart skipped by cooldown for service {service_name}: "
+                f"{left}s left"
+            )
+
+    _restart_xray_service(ns)
+    state[service_name] = now
+    _save_restart_state(state_path, state)
 
 
 def _lock_path(ns: argparse.Namespace) -> Path:
@@ -380,7 +442,7 @@ def cmd_ensure_client(ns: argparse.Namespace) -> dict[str, Any]:
             code, out, err = _api_add_user(ns, api_payload)
             restarted_for_handler_mismatch = False
             if code != 0 and _api_reports_handler_missing(out, err):
-                _restart_xray_service(ns)
+                _maybe_restart_xray_service_for_handler_mismatch(ns)
                 restarted_for_handler_mismatch = True
                 code, out, err = _api_add_user(ns, api_payload)
             if code != 0:
@@ -390,7 +452,7 @@ def cmd_ensure_client(ns: argparse.Namespace) -> dict[str, Any]:
                 tag = str(inbound.get("tag") or "").strip()
                 email = str(new_client.get("email") or "").strip()
                 if _api_reports_handler_missing(out, err) and not restarted_for_handler_mismatch:
-                    _restart_xray_service(ns)
+                    _maybe_restart_xray_service_for_handler_mismatch(ns)
                     restarted_for_handler_mismatch = True
                     retry_code, retry_out, retry_err = _api_add_user(ns, api_payload)
                     if retry_code == 0 and not _api_added_no_users(retry_out):
@@ -488,15 +550,24 @@ def cmd_remove_client(ns: argparse.Namespace) -> dict[str, Any]:
             _validate_config(ns)
             code, out, err = _api_remove_user(ns, tag, target_email)
             if code != 0 and _api_reports_handler_missing(out, err):
-                _restart_xray_service(ns)
+                _maybe_restart_xray_service_for_handler_mismatch(ns)
+                restarted_for_handler_mismatch = True
                 code, out, err = _api_remove_user(ns, tag, target_email)
+            else:
+                restarted_for_handler_mismatch = False
             if code != 0:
                 raise XrayCtlError(f"xray api remove user failed: exit={code} stdout={out[-500:]} stderr={err[-500:]}")
         except Exception:
             _atomic_write(path, original_payload)
             raise
 
-        return {"ok": True, "removed": True, "runtime_only": False, "email": target_email}
+        return {
+            "ok": True,
+            "removed": True,
+            "runtime_only": False,
+            "email": target_email,
+            "handler_mismatch_restarted": restarted_for_handler_mismatch,
+        }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -507,6 +578,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xray-asset-dir", default=DEFAULT_XRAY_ASSET_DIR)
     parser.add_argument("--api-server", default=DEFAULT_API_SERVER)
     parser.add_argument("--xray-service-name", default=DEFAULT_XRAY_SERVICE_NAME)
+    parser.add_argument("--handler-mismatch-restart-cooldown-seconds", type=int, default=DEFAULT_HANDLER_MISMATCH_RESTART_COOLDOWN_SECONDS)
+    parser.add_argument("--restart-state-file", default=DEFAULT_RESTART_STATE_FILE)
     parser.add_argument("--lock-file", default="")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
