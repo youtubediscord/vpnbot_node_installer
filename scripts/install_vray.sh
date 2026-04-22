@@ -5,9 +5,9 @@ set -euo pipefail
 # Source of truth:
 #   https://github.com/youtubediscord/vpnbot_node_installer
 # Usage:
-#   bash <(curl -fsSL "https://github.com/youtubediscord/vpnbot_node_installer/raw/main/install.sh?ts=$(date +%s)")
+#   bash <(curl -fsSL "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/refs/heads/main/install.sh?ts=$(date +%s)")
 #
-# Important: all github.com/.../raw downloads use a cache-busting query.
+# Important: install.sh fetches the latest branch archive through codeload.github.com; raw fallback downloads use refs/heads/main plus cache busting.
 # Supported backend modes:
 # - 3x-ui    -> current panel-based workflow for VPnBot
 # - xray-core -> standalone official Xray-core in a dedicated folder, without x-ui
@@ -27,7 +27,8 @@ set -euo pipefail
 # - ws / grpc / http-like -> local HTTPS frontend behind nginx http
 
 VPNBOT_NODE_INSTALLER_REF="${VPNBOT_NODE_INSTALLER_REF:-main}"
-VPNBOT_NODE_INSTALLER_BASE_URL="${VPNBOT_NODE_INSTALLER_BASE_URL:-https://github.com/youtubediscord/vpnbot_node_installer/raw/${VPNBOT_NODE_INSTALLER_REF}}"
+VPNBOT_NODE_INSTALLER_REPO="${VPNBOT_NODE_INSTALLER_REPO:-youtubediscord/vpnbot_node_installer}"
+VPNBOT_NODE_INSTALLER_BASE_URL="${VPNBOT_NODE_INSTALLER_BASE_URL:-https://raw.githubusercontent.com/${VPNBOT_NODE_INSTALLER_REPO}/refs/heads/${VPNBOT_NODE_INSTALLER_REF}}"
 
 XUI_UPSTREAM_INSTALL_URL="${XUI_UPSTREAM_INSTALL_URL:-https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh}"
 XUI_MAIN_FOLDER="${XUI_MAIN_FOLDER:-/usr/local/x-ui}"
@@ -139,7 +140,7 @@ XRAY_CORE_SMOKE_PORT_EFFECTIVE=""
 XRAY_CORE_SMOKE_PUBLIC_KEY=""
 XRAY_CORE_SMOKE_SHORT_ID=""
 XRAY_CORE_SMOKE_LINK=""
-INSTALL_VRAY_CURL_COMMAND='bash <(curl -fsSL "https://github.com/youtubediscord/vpnbot_node_installer/raw/main/install.sh?ts=$(date +%s)")'
+INSTALL_VRAY_CURL_COMMAND='bash <(curl -fsSL "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/refs/heads/main/install.sh?ts=$(date +%s)")'
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1726,10 +1727,20 @@ download_node_installer_asset() {
     local asset_path="$1"
     local destination="$2"
     local mode="${3:-644}"
+    local local_root="${VPNBOT_NODE_INSTALLER_LOCAL_ROOT:-}"
+    local local_file=""
     local base_url="${VPNBOT_NODE_INSTALLER_BASE_URL%/}"
     local url="${base_url}/${asset_path}"
     local cache_bust="${VPNBOT_NODE_INSTALLER_CACHE_BUST:-$(date +%s)}"
     local tmp_file
+
+    if [[ -n "${local_root}" ]]; then
+        local_file="${local_root%/}/${asset_path}"
+        if [[ -f "${local_file}" ]]; then
+            install -m "${mode}" "${local_file}" "${destination}"
+            return 0
+        fi
+    fi
 
     tmp_file="$(mktemp)"
     curl -fsSL --retry 3 --connect-timeout 10 \

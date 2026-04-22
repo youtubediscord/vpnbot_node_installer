@@ -4,13 +4,12 @@ Latest-based installer bundle for VPnBot VPN nodes.
 
 The entrypoint is `install.sh`. It downloads the current `scripts/install_vray.sh`
 from `main`, and that installer downloads helper assets from `assets/`.
-All GitHub raw downloads use `?ts=$(date +%s)` cache busting so fresh installs do
-not accidentally receive stale CDN content.
+The bootstrap uses `raw.githubusercontent.com/.../refs/heads/main` only for the first tiny `install.sh`. After that it downloads the current branch archive through `codeload.github.com`, so helper assets are installed from the same fresh extracted tree instead of stale branch-file CDN responses.
 
 ## Install
 
 ```bash
-bash <(curl -fsSL "https://github.com/youtubediscord/vpnbot_node_installer/raw/main/install.sh?ts=$(date +%s)")
+bash <(curl -fsSL "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/refs/heads/main/install.sh?ts=$(date +%s)")
 ```
 
 ## Why This Repo Exists
