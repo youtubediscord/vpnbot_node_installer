@@ -5,7 +5,7 @@ set -euo pipefail
 # Source of truth:
 #   https://github.com/youtubediscord/vpnbot_node_installer
 # Usage:
-#   bash <(curl -fsSL "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/refs/heads/main/install.sh?ts=$(date +%s)")
+#   bash <(curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/refs/heads/main/install.sh?ts=$(date +%s)")
 #
 # Important: install.sh fetches the latest branch archive through codeload.github.com; raw fallback downloads use refs/heads/main plus cache busting.
 # Supported backend modes:
@@ -140,7 +140,7 @@ XRAY_CORE_SMOKE_PORT_EFFECTIVE=""
 XRAY_CORE_SMOKE_PUBLIC_KEY=""
 XRAY_CORE_SMOKE_SHORT_ID=""
 XRAY_CORE_SMOKE_LINK=""
-INSTALL_VRAY_CURL_COMMAND='bash <(curl -fsSL "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/refs/heads/main/install.sh?ts=$(date +%s)")'
+INSTALL_VRAY_CURL_COMMAND='bash <(curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/refs/heads/main/install.sh?ts=$(date +%s)")'
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

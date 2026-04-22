@@ -9,7 +9,7 @@ The bootstrap uses `raw.githubusercontent.com/.../refs/heads/main` only for the 
 ## Install
 
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/refs/heads/main/install.sh?ts=$(date +%s)")
+bash <(curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/refs/heads/main/install.sh?ts=$(date +%s)")
 ```
 
 ## Why This Repo Exists
