@@ -1,0 +1,6392 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ===== 3x-ui / Xray installer for VPnBot =====
+# Usage:
+#   bash <(curl -fsSL "https://gist.githubusercontent.com/loop-uh/dfa8b38cb421e6002ae1e783a1053e47/raw/install_vray.sh?ts=$(date +%s)")
+# Published gist source:
+#   https://gist.github.com/loop-uh/dfa8b38cb421e6002ae1e783a1053e47
+# After local edits, sync the published gist via:
+#   gh gist edit dfa8b38cb421e6002ae1e783a1053e47 scripts/install_vray.sh -f install_vray.sh
+# Supported backend modes:
+# - 3x-ui    -> current panel-based workflow for VPnBot
+# - xray-core -> standalone official Xray-core in a dedicated folder, without x-ui
+# Architecture:
+# - AWG keeps UDP/443
+# - nginx stream owns shared TCP entry ports
+# - shared-port inbounds are published automatically based on remark/tag markers
+# - direct inbounds keep their real port without multiplexing
+#
+# Publication mode markers:
+#   [443] or [shared:443]    -> publish via shared TCP/443
+#   [8443] or [shared:8443]  -> publish via shared TCP/8443
+#   [direct]                 -> keep direct port, do not publish via shared mux
+#
+# Shared TCP port split:
+# - raw TLS / REALITY -> nginx stream (SNI routing)
+# - ws / grpc / http-like -> local HTTPS frontend behind nginx http
+
+VPNBOT_NODE_INSTALLER_REF="${VPNBOT_NODE_INSTALLER_REF:-main}"
+VPNBOT_NODE_INSTALLER_BASE_URL="${VPNBOT_NODE_INSTALLER_BASE_URL:-https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/${VPNBOT_NODE_INSTALLER_REF}}"
+
+XUI_UPSTREAM_INSTALL_URL="${XUI_UPSTREAM_INSTALL_URL:-https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh}"
+XUI_MAIN_FOLDER="${XUI_MAIN_FOLDER:-/usr/local/x-ui}"
+XUI_BIN_CONFIG="${XUI_BIN_CONFIG:-${XUI_MAIN_FOLDER}/bin/config.json}"
+XUI_DB_PATH="${XUI_DB_PATH:-/etc/x-ui/x-ui.db}"
+XUI_PANEL_PORT="${XUI_PANEL_PORT:-2053}"
+XUI_PANEL_WEBBASEPATH="${XUI_PANEL_WEBBASEPATH:-}"
+XUI_PANEL_USERNAME="${XUI_PANEL_USERNAME:-}"
+XUI_PANEL_PASSWORD="${XUI_PANEL_PASSWORD:-}"
+XUI_XRAY_LOG_DIR="${XUI_XRAY_LOG_DIR:-/var/log/xray}"
+XUI_XRAY_ACCESS_LOG="${XUI_XRAY_ACCESS_LOG:-${XUI_XRAY_LOG_DIR}/access.log}"
+XUI_XRAY_ERROR_LOG="${XUI_XRAY_ERROR_LOG:-${XUI_XRAY_LOG_DIR}/error.log}"
+XUI_XRAY_LOGLEVEL="${XUI_XRAY_LOGLEVEL:-warning}"
+XUI_XRAY_DNS_LOG="${XUI_XRAY_DNS_LOG:-false}"
+XRAY_LOGROTATE_FILE="${XRAY_LOGROTATE_FILE:-/etc/logrotate.d/vpnbot-xray}"
+XRAY_LOGROTATE_DAYS="${XRAY_LOGROTATE_DAYS:-7}"
+XRAY_LOGROTATE_MAXSIZE="${XRAY_LOGROTATE_MAXSIZE:-100M}"
+APP_DOMAIN="${APP_DOMAIN:-}"
+PANEL_DOMAIN="${PANEL_DOMAIN:-}"
+MT_DOMAIN="${MT_DOMAIN:-}"
+PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-}"
+LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
+ENABLE_CERTBOT="${ENABLE_CERTBOT:-1}"
+SELF_SIGNED_CERT_NAME="${SELF_SIGNED_CERT_NAME:-}"
+DDNS_PROVIDER="${DDNS_PROVIDER:-}"
+DDNS_ZONE="${DDNS_ZONE:-}"
+DDNS_TOKEN="${DDNS_TOKEN:-}"
+DDNS_INSTRUCTIONS_TEXT="${DDNS_INSTRUCTIONS_TEXT:-}"
+DDNS_HOST_LABEL="${DDNS_HOST_LABEL:-}"
+DDNS_LABEL_SUFFIX="${DDNS_LABEL_SUFFIX:-tls}"
+DDNS_WAIT_TIMEOUT="${DDNS_WAIT_TIMEOUT:-180}"
+DDNS_WAIT_INTERVAL="${DDNS_WAIT_INTERVAL:-5}"
+VPNBOT_SERVER_ID="${VPNBOT_SERVER_ID:-}"
+SHARED_HTTP_DOMAIN="${SHARED_HTTP_DOMAIN:-}"
+HTTP_FRONTEND_LOCAL_PORT="${HTTP_FRONTEND_LOCAL_PORT:-10443}"
+NGINX_SERVER_NAME="${NGINX_SERVER_NAME:-}"
+NGINX_PANEL_LOCATION="${NGINX_PANEL_LOCATION:-}"
+NGINX_SSL_CERT="${NGINX_SSL_CERT:-/etc/nginx/ssl/vpnbot/fullchain.pem}"
+NGINX_SSL_KEY="${NGINX_SSL_KEY:-/etc/nginx/ssl/vpnbot/privkey.pem}"
+XUI_INSTALLER_STATE_FILE="${XUI_INSTALLER_STATE_FILE:-/etc/vpnbot-xui-installer-state.json}"
+XUI_ROLLOUT_BUNDLE_FILE="${XUI_ROLLOUT_BUNDLE_FILE:-/etc/vpnbot-xui-rollout-bundle.json}"
+XUI_INSTALLER_DEFAULTS_FILE="${XUI_INSTALLER_DEFAULTS_FILE:-/etc/vpnbot-xui-defaults.env}"
+XUI_PRESET_HELPER="${XUI_PRESET_HELPER:-/usr/local/bin/vpnbot-xui-presets}"
+VPNBOT_VLESS_PRESET_HELPER="${VPNBOT_VLESS_PRESET_HELPER:-/usr/local/bin/vpnbot-vless-presets}"
+XUI_PRESET_AUTORUN="${XUI_PRESET_AUTORUN:-auto}"
+XUI_DEFAULTS_LOADED=0
+NGINX_HTTP_SITE_FILE="/etc/nginx/sites-available/vpnbot_vray_http.conf"
+NGINX_HTTP_LOCATION_DIR="/etc/nginx/vpnbot-http-locations.d"
+NGINX_STREAM_ROOT_FILE="/etc/nginx/vpnbot-stream-root.conf"
+NGINX_STREAM_INCLUDE_DIR="/etc/nginx/vpnbot-stream.d"
+NGINX_STREAM_MAP_FILE="${NGINX_STREAM_INCLUDE_DIR}/vpnbot_stream_map.conf"
+NGINX_STREAM_SERVER_FILE="${NGINX_STREAM_INCLUDE_DIR}/vpnbot_stream_server.conf"
+NGINX_WS_HELPER="/usr/local/bin/vpnbot-nginx-add-ws-route"
+NGINX_GRPC_HELPER="/usr/local/bin/vpnbot-nginx-add-grpc-route"
+NGINX_ROUTE_LIST_HELPER="/usr/local/bin/vpnbot-nginx-list-routes"
+XUI_SYNC_SCRIPT="/usr/local/bin/vpnbot-xui-sync-routes"
+XUI_SYNC_SERVICE="/etc/systemd/system/vpnbot-xui-sync-routes.service"
+XUI_SYNC_PATH="/etc/systemd/system/vpnbot-xui-sync-routes.path"
+XUI_SYNC_TIMER="/etc/systemd/system/vpnbot-xui-sync-routes.timer"
+XUI_SYNC_STATE_DIR="/var/lib/vpnbot-xui-sync"
+XUI_UPSTREAM_TMP="/tmp/install_3xui_upstream.sh"
+XUI_SOURCED_TMP="/tmp/install_3xui_upstream_sourced.sh"
+VPNBOT_VLESS_BACKEND_EXPLICIT=0
+if [[ -n "${VPNBOT_VLESS_BACKEND:-}" ]]; then
+    VPNBOT_VLESS_BACKEND_EXPLICIT=1
+fi
+VPNBOT_VLESS_BACKEND="${VPNBOT_VLESS_BACKEND:-3x-ui}"
+XRAY_CORE_ROOT="${XRAY_CORE_ROOT:-/opt/vpnbot/xray-core}"
+XRAY_CORE_BIN="${XRAY_CORE_BIN:-${XRAY_CORE_ROOT}/bin/xray}"
+XRAY_CORE_CONFIG_DIR="${XRAY_CORE_CONFIG_DIR:-${XRAY_CORE_ROOT}/config}"
+XRAY_CORE_SHARE_DIR="${XRAY_CORE_SHARE_DIR:-${XRAY_CORE_ROOT}/share}"
+XRAY_CORE_LOG_DIR="${XRAY_CORE_LOG_DIR:-${XRAY_CORE_ROOT}/logs}"
+XRAY_CORE_MANAGED_INBOUNDS_FILE="${XRAY_CORE_MANAGED_INBOUNDS_FILE:-${XRAY_CORE_CONFIG_DIR}/50_vpnbot_managed_inbounds.json}"
+XRAY_CORE_SERVICE_NAME="${XRAY_CORE_SERVICE_NAME:-vpnbot-xray.service}"
+XRAY_CORE_SERVICE_FILE="${XRAY_CORE_SERVICE_FILE:-/etc/systemd/system/${XRAY_CORE_SERVICE_NAME}}"
+XRAY_CORE_INSTALLER_STATE_FILE="${XRAY_CORE_INSTALLER_STATE_FILE:-/etc/vpnbot-xray-installer-state.json}"
+XRAY_CORE_ROLLOUT_BUNDLE_FILE="${XRAY_CORE_ROLLOUT_BUNDLE_FILE:-/etc/vpnbot-xray-rollout-bundle.json}"
+XRAY_CORE_API_SERVER="${XRAY_CORE_API_SERVER:-127.0.0.1:10085}"
+XRAY_CTL_SCRIPT="${XRAY_CTL_SCRIPT:-/usr/local/bin/vpnbot-xrayctl}"
+XRAY_ONLINE_TRACKER_SCRIPT="${XRAY_ONLINE_TRACKER_SCRIPT:-/usr/local/bin/vpnbot-xray-online-tracker}"
+XRAY_ONLINE_TRACKER_SERVICE_NAME="${XRAY_ONLINE_TRACKER_SERVICE_NAME:-vpnbot-xray-online.service}"
+XRAY_ONLINE_TRACKER_SERVICE_FILE="${XRAY_ONLINE_TRACKER_SERVICE_FILE:-/etc/systemd/system/${XRAY_ONLINE_TRACKER_SERVICE_NAME}}"
+XRAY_ONLINE_TRACKER_BIND="${XRAY_ONLINE_TRACKER_BIND:-127.0.0.1}"
+XRAY_ONLINE_TRACKER_PORT="${XRAY_ONLINE_TRACKER_PORT:-10086}"
+XRAY_ONLINE_TRACKER_WINDOW_SECONDS="${XRAY_ONLINE_TRACKER_WINDOW_SECONDS:-180}"
+XRAY_ONLINE_TRACKER_BOOTSTRAP_BYTES="${XRAY_ONLINE_TRACKER_BOOTSTRAP_BYTES:-524288}"
+XRAY_ONLINE_TRACKER_STATS_INTERVAL_SECONDS="${XRAY_ONLINE_TRACKER_STATS_INTERVAL_SECONDS:-15}"
+XRAY_ONLINE_TRACKER_URL="${XRAY_ONLINE_TRACKER_URL:-http://${XRAY_ONLINE_TRACKER_BIND}:${XRAY_ONLINE_TRACKER_PORT}/online}"
+XRAY_ABUSE_AUDIT_WINDOW_SECONDS="${XRAY_ABUSE_AUDIT_WINDOW_SECONDS:-86400}"
+XRAY_ABUSE_AUDIT_MAX_EVENTS="${XRAY_ABUSE_AUDIT_MAX_EVENTS:-50000}"
+XRAY_ABUSE_AUDIT_TOP_LIMIT="${XRAY_ABUSE_AUDIT_TOP_LIMIT:-20}"
+XRAY_ABUSE_AUDIT_URL="${XRAY_ABUSE_AUDIT_URL:-http://${XRAY_ONLINE_TRACKER_BIND}:${XRAY_ONLINE_TRACKER_PORT}/abuse}"
+XRAY_SYNC_SCRIPT="${XRAY_SYNC_SCRIPT:-/usr/local/bin/vpnbot-xray-sync-routes}"
+XRAY_SYNC_SERVICE="${XRAY_SYNC_SERVICE:-/etc/systemd/system/vpnbot-xray-sync-routes.service}"
+XRAY_SYNC_PATH="${XRAY_SYNC_PATH:-/etc/systemd/system/vpnbot-xray-sync-routes.path}"
+XRAY_SYNC_TIMER="${XRAY_SYNC_TIMER:-/etc/systemd/system/vpnbot-xray-sync-routes.timer}"
+XRAY_SYNC_STATE_DIR="${XRAY_SYNC_STATE_DIR:-/var/lib/vpnbot-xray-sync}"
+XRAY_CORE_RELEASE_CHANNEL="${XRAY_CORE_RELEASE_CHANNEL:-stable}"
+XRAY_CORE_VERSION="${XRAY_CORE_VERSION:-latest}"
+XRAY_CORE_RELEASES_API_URL="${XRAY_CORE_RELEASES_API_URL:-https://api.github.com/repos/XTLS/Xray-core/releases}"
+XRAY_CORE_SMOKE_ENABLE="${XRAY_CORE_SMOKE_ENABLE:-0}"
+# Keep TCP/443 free for shared production inbounds by default.
+XRAY_CORE_SMOKE_PORT="${XRAY_CORE_SMOKE_PORT:-8443}"
+XRAY_CORE_SMOKE_DOMAIN="${XRAY_CORE_SMOKE_DOMAIN:-www.cloudflare.com}"
+XRAY_CORE_SMOKE_UUID="${XRAY_CORE_SMOKE_UUID:-}"
+XRAY_CORE_INSTALLED_VERSION=""
+XRAY_CORE_PUBLIC_ENDPOINT=""
+XRAY_CORE_SMOKE_PORT_EFFECTIVE=""
+XRAY_CORE_SMOKE_PUBLIC_KEY=""
+XRAY_CORE_SMOKE_SHORT_ID=""
+XRAY_CORE_SMOKE_LINK=""
+INSTALL_VRAY_GIST_RAW_URL="${INSTALL_VRAY_GIST_RAW_URL:-https://gist.githubusercontent.com/loop-uh/dfa8b38cb421e6002ae1e783a1053e47/raw/install_vray.sh}"
+INSTALL_VRAY_CURL_COMMAND='bash <(curl -fsSL "https://gist.githubusercontent.com/loop-uh/dfa8b38cb421e6002ae1e783a1053e47/raw/install_vray.sh?ts=$(date +%s)")'
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+log()  { echo -e "${GREEN}[+]${NC} $*"; }
+warn() { echo -e "${YELLOW}[!]${NC} $*"; }
+err()  { echo -e "${RED}[✗]${NC} $*" >&2; }
+info() { echo -e "${CYAN}[i]${NC} $*"; }
+
+
+check_root() {
+    [[ ${EUID} -eq 0 ]] || { err "Run this script as root"; exit 1; }
+}
+
+
+is_interactive_terminal() {
+    [[ -t 0 && -t 1 ]]
+}
+
+
+gen_random_string() {
+    local length="$1"
+    openssl rand -base64 $(( length * 2 )) | tr -dc 'a-zA-Z0-9' | head -c "$length"
+}
+
+
+trim_dot_domain() {
+    local value="${1:-}"
+    value="${value#.}"
+    value="${value%.}"
+    printf '%s' "${value}"
+}
+
+
+slugify_host_label() {
+    local value="${1:-}"
+    value="$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-{2,}/-/g')"
+    printf '%s' "${value}"
+}
+
+
+normalize_vpnbot_server_id_value() {
+    local value="${1:-}"
+    value="$(printf '%s' "${value}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    value="$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')"
+    printf '%s' "${value}"
+}
+
+
+normalize_vpnbot_server_id() {
+    local original normalized
+    original="${VPNBOT_SERVER_ID:-}"
+    normalized="$(normalize_vpnbot_server_id_value "${original}")"
+    if [[ -n "${original}" && "${normalized}" != "${original}" ]]; then
+        warn "Normalized VPNBOT_SERVER_ID to lowercase: ${normalized}"
+    fi
+    VPNBOT_SERVER_ID="${normalized}"
+}
+
+
+normalize_vless_backend_mode() {
+    local raw normalized
+    raw="${VPNBOT_VLESS_BACKEND:-3x-ui}"
+    normalized="$(printf '%s' "${raw}" | tr '[:upper:]' '[:lower:]')"
+    case "${normalized}" in
+        3x-ui|3xui|x-ui|xui)
+            VPNBOT_VLESS_BACKEND="3x-ui"
+            ;;
+        xray-core|xraycore|pure-xray|pure_xray|core)
+            VPNBOT_VLESS_BACKEND="xray-core"
+            ;;
+        *)
+            err "Unsupported VPNBOT_VLESS_BACKEND=${raw}. Supported values: 3x-ui, xray-core"
+            exit 1
+            ;;
+    esac
+}
+
+
+is_3xui_backend() {
+    [[ "${VPNBOT_VLESS_BACKEND}" == "3x-ui" ]]
+}
+
+
+is_xray_core_backend() {
+    [[ "${VPNBOT_VLESS_BACKEND}" == "xray-core" ]]
+}
+
+
+env_is_true() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+
+get_primary_ipv4() {
+    local ip=""
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+    if [[ -z "${ip}" ]]; then
+        ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    fi
+    printf '%s' "${ip}"
+}
+
+
+is_ipv4_literal() {
+    local value="${1:-}"
+    IPV4_LITERAL_TO_CHECK="${value}" python3 - <<'PY'
+import ipaddress
+import os
+import sys
+
+value = os.environ.get("IPV4_LITERAL_TO_CHECK", "").strip()
+try:
+    ip = ipaddress.ip_address(value)
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if ip.version == 4 else 1)
+PY
+}
+
+
+wait_for_host_resolution_to_ipv4() {
+    local host="$1"
+    local expected_ipv4="$2"
+    local host_role="${3:-host}"
+    local timeout="${DDNS_WAIT_TIMEOUT}"
+    local interval="${DDNS_WAIT_INTERVAL}"
+
+    if [[ -z "${host}" || -z "${expected_ipv4}" ]]; then
+        return 0
+    fi
+
+    if is_ipv4_literal "${host}"; then
+        if [[ "${host}" == "${expected_ipv4}" ]]; then
+            return 0
+        fi
+        err "${host_role^} ${host} does not match this server IP ${expected_ipv4}."
+        return 1
+    fi
+
+    DOMAIN_TO_CHECK="${host}" EXPECTED_IPV4="${expected_ipv4}" WAIT_TIMEOUT="${timeout}" WAIT_INTERVAL="${interval}" python3 - <<'PY'
+import os
+import socket
+import sys
+import time
+
+domain = os.environ["DOMAIN_TO_CHECK"]
+expected = os.environ["EXPECTED_IPV4"]
+timeout = int(os.environ["WAIT_TIMEOUT"])
+interval = max(1, int(os.environ["WAIT_INTERVAL"]))
+deadline = time.time() + timeout
+last_seen = []
+
+while time.time() < deadline:
+    try:
+        infos = socket.getaddrinfo(domain, None, socket.AF_INET, socket.SOCK_STREAM)
+        addresses = sorted({item[4][0] for item in infos if item and item[4]})
+        last_seen = addresses
+        if expected in addresses:
+            sys.exit(0)
+    except Exception:
+        last_seen = []
+    time.sleep(interval)
+
+msg = ", ".join(last_seen) if last_seen else "<nothing>"
+print(f"Domain {domain} did not resolve to {expected} within {timeout}s. Last seen: {msg}", file=sys.stderr)
+sys.exit(1)
+PY
+}
+
+
+get_default_ddns_host_label() {
+    local base suffix host_short label
+    base="${VPNBOT_SERVER_ID:-}"
+    if [[ -z "${base}" ]]; then
+        host_short="$(hostname -s 2>/dev/null || true)"
+        base="${host_short:-node}"
+    fi
+    label="$(slugify_host_label "${base}")"
+    if [[ -z "${label}" ]]; then
+        label="node"
+    fi
+    suffix="$(slugify_host_label "${DDNS_LABEL_SUFFIX}")"
+    if [[ -n "${suffix}" && "${suffix}" != "none" ]]; then
+        case "${label}" in
+            *-"${suffix}"|"${suffix}")
+                ;;
+            *)
+                label="${label}-${suffix}"
+                ;;
+        esac
+    fi
+    printf '%s' "${label}"
+}
+
+
+load_installer_defaults() {
+    if [[ -f "${XUI_INSTALLER_DEFAULTS_FILE}" ]]; then
+        # shellcheck disable=SC1090
+        source "${XUI_INSTALLER_DEFAULTS_FILE}"
+        XUI_DEFAULTS_LOADED=1
+    fi
+}
+
+
+save_installer_defaults() {
+    umask 077
+    cat > "${XUI_INSTALLER_DEFAULTS_FILE}" <<EOF
+DDNS_PROVIDER=${DDNS_PROVIDER@Q}
+DDNS_ZONE=${DDNS_ZONE@Q}
+DDNS_TOKEN=${DDNS_TOKEN@Q}
+DDNS_LABEL_SUFFIX=${DDNS_LABEL_SUFFIX@Q}
+EOF
+    chmod 600 "${XUI_INSTALLER_DEFAULTS_FILE}"
+}
+
+
+prompt_plain_value() {
+    local prompt="$1"
+    local default_value="${2:-}"
+    local value=""
+    if [[ -n "${default_value}" ]]; then
+        read -r -p "${prompt} [${default_value}]: " value
+        printf '%s' "${value:-${default_value}}"
+        return 0
+    fi
+    while [[ -z "${value}" ]]; do
+        read -r -p "${prompt}: " value
+    done
+    printf '%s' "${value}"
+}
+
+
+prompt_secret_value() {
+    local prompt="$1"
+    local value=""
+    while [[ -z "${value}" ]]; do
+        read -r -s -p "${prompt}: " value
+        echo
+    done
+    printf '%s' "${value}"
+}
+
+
+prompt_multiline_value() {
+    local prompt="$1"
+    local line=""
+    local value=""
+    echo "${prompt}"
+    echo "Finish input with an empty line."
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && break
+        value+="${value:+$'\n'}${line}"
+    done
+    printf '%s' "${value}"
+}
+
+
+prompt_yes_no() {
+    local prompt="$1"
+    local default_answer="${2:-y}"
+    local answer="" hint="" normalized=""
+    case "${default_answer}" in
+        y|Y|yes|YES)
+            hint="[Y/n]"
+            default_answer="y"
+            ;;
+        n|N|no|NO)
+            hint="[y/N]"
+            default_answer="n"
+            ;;
+        *)
+            hint="[y/n]"
+            default_answer=""
+            ;;
+    esac
+
+    while true; do
+        if [[ -n "${hint}" ]]; then
+            read -r -p "${prompt} ${hint}: " answer
+        else
+            read -r -p "${prompt}: " answer
+        fi
+        if [[ -z "${answer}" && -n "${default_answer}" ]]; then
+            answer="${default_answer}"
+        fi
+        normalized="$(printf '%s' "${answer}" | tr '[:upper:]' '[:lower:]')"
+        case "${normalized}" in
+            y|yes)
+                return 0
+                ;;
+            n|no)
+                return 1
+                ;;
+        esac
+        warn "Please answer yes or no."
+    done
+}
+
+
+prompt_domain_setup_mode() {
+    local answer=""
+    while true; do
+        printf '%s\n' "Domain setup mode:" >&2
+        printf '%s\n' "  1) I already have a ready domain/subdomain" >&2
+        printf '%s\n' "  2) Configure Dynv6 automatically" >&2
+        read -r -p "Choose [1/2]: " answer
+        case "${answer}" in
+            1)
+                printf 'ready'
+                return 0
+                ;;
+            2)
+                printf 'dynv6'
+                return 0
+                ;;
+        esac
+        printf '%s\n' "[!] Please choose 1 or 2." >&2
+    done
+}
+
+
+prompt_vless_backend_mode_if_needed() {
+    local answer=""
+
+    if [[ "${VPNBOT_VLESS_BACKEND_EXPLICIT}" == "1" ]]; then
+        normalize_vless_backend_mode
+        info "VLESS backend mode from env: ${VPNBOT_VLESS_BACKEND}"
+        return 0
+    fi
+
+    if ! is_interactive_terminal; then
+        normalize_vless_backend_mode
+        info "VLESS backend mode: ${VPNBOT_VLESS_BACKEND} (non-interactive default; set VPNBOT_VLESS_BACKEND=xray-core to override)"
+        return 0
+    fi
+
+    while true; do
+        printf '%s\n' "VLESS backend mode:" >&2
+        printf '%s\n' "  1) Standalone Xray-core (recommended for new servers)" >&2
+        printf '%s\n' "  2) 3x-ui panel (legacy/current bot production mode)" >&2
+        read -r -p "Choose [1/2, default 1]: " answer
+        answer="${answer:-1}"
+        case "${answer}" in
+            1)
+                VPNBOT_VLESS_BACKEND="xray-core"
+                info "Selected VLESS backend mode: ${VPNBOT_VLESS_BACKEND}"
+                return 0
+                ;;
+            2)
+                VPNBOT_VLESS_BACKEND="3x-ui"
+                info "Selected VLESS backend mode: ${VPNBOT_VLESS_BACKEND}"
+                return 0
+                ;;
+        esac
+        printf '%s\n' "[!] Please choose 1 or 2." >&2
+    done
+}
+
+
+clear_dynv6_runtime_values() {
+    DDNS_PROVIDER=""
+    DDNS_ZONE=""
+    DDNS_TOKEN=""
+    DDNS_INSTRUCTIONS_TEXT=""
+    DDNS_HOST_LABEL=""
+}
+
+
+strip_wrapping_quotes() {
+    local value="${1:-}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ ${#value} -ge 2 ]]; then
+        if [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+            value="${value:1:${#value}-2}"
+        elif [[ "${value:0:1}" == "\"" && "${value: -1}" == "\"" ]]; then
+            value="${value:1:${#value}-2}"
+        fi
+    fi
+    printf '%s' "${value}"
+}
+
+
+PARSED_DYNV6_TOKEN=""
+PARSED_DYNV6_ZONE=""
+
+
+parse_dynv6_instructions_blob() {
+    local blob="${1:-}"
+    local parsed=""
+    PARSED_DYNV6_TOKEN=""
+    PARSED_DYNV6_ZONE=""
+    [[ -n "${blob}" ]] || return 0
+
+    parsed="$(
+        DYNV6_INSTRUCTIONS_BLOB="${blob}" python3 - <<'PY'
+import os
+import re
+
+text = os.environ.get("DYNV6_INSTRUCTIONS_BLOB", "").replace("\r", "")
+token = ""
+zone = ""
+loose_lines = []
+
+for raw in text.splitlines():
+    line = raw.strip()
+    if not line:
+        continue
+    if "=" in line:
+        key, value = line.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip().strip("'\"")
+        if key == "password" and value and value.lower() != "none":
+            token = value
+        elif key == "zone" and value:
+            zone = value
+    else:
+        loose_lines.append(line.strip().strip("'\""))
+
+if not token:
+    compact = [line for line in loose_lines if "=" not in line and "/" not in line]
+    if len(compact) == 1 and "." not in compact[0]:
+        token = compact[0]
+
+if not zone:
+    for item in reversed(loose_lines):
+        candidate = item.strip().strip(".")
+        if re.fullmatch(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+", candidate):
+            zone = candidate
+            break
+
+print(token)
+print(zone)
+PY
+    )"
+
+    PARSED_DYNV6_TOKEN="$(printf '%s' "${parsed}" | sed -n '1p')"
+    PARSED_DYNV6_ZONE="$(printf '%s' "${parsed}" | sed -n '2p')"
+}
+
+
+normalize_dynv6_credentials() {
+    local blob=""
+
+    if [[ -n "${DDNS_INSTRUCTIONS_TEXT}" ]]; then
+        parse_dynv6_instructions_blob "${DDNS_INSTRUCTIONS_TEXT}"
+        if [[ -z "${DDNS_TOKEN}" && -n "${PARSED_DYNV6_TOKEN}" ]]; then
+            DDNS_TOKEN="${PARSED_DYNV6_TOKEN}"
+        fi
+        if [[ -z "${DDNS_ZONE}" && -n "${PARSED_DYNV6_ZONE}" ]]; then
+            DDNS_ZONE="${PARSED_DYNV6_ZONE}"
+        fi
+    fi
+
+    blob="${DDNS_TOKEN}"
+    if [[ "${blob}" == *$'\n'* || "${blob}" == *"password="* || "${blob}" == *"protocol="* || "${blob}" == *"server="* ]]; then
+        parse_dynv6_instructions_blob "${blob}"
+        if [[ -n "${PARSED_DYNV6_TOKEN}" ]]; then
+            DDNS_TOKEN="${PARSED_DYNV6_TOKEN}"
+        fi
+        if [[ -z "${DDNS_ZONE}" && -n "${PARSED_DYNV6_ZONE}" ]]; then
+            DDNS_ZONE="${PARSED_DYNV6_ZONE}"
+        fi
+    fi
+
+    DDNS_TOKEN="$(strip_wrapping_quotes "${DDNS_TOKEN}")"
+    DDNS_ZONE="$(trim_dot_domain "$(strip_wrapping_quotes "${DDNS_ZONE}")")"
+}
+
+
+collect_interactive_defaults() {
+    local domain_mode=""
+    local dynv6_blob=""
+
+    if ! is_interactive_terminal; then
+        return 0
+    fi
+
+    normalize_dynv6_credentials
+
+    if [[ -n "${PUBLIC_DOMAIN}" ]]; then
+        return 0
+    fi
+
+    if [[ ${XUI_DEFAULTS_LOADED} -eq 1 && ( -n "${DDNS_ZONE}" || -n "${DDNS_TOKEN}" || -n "${DDNS_PROVIDER}" ) ]]; then
+        info "Found saved Dynv6 defaults in ${XUI_INSTALLER_DEFAULTS_FILE}."
+        if ! prompt_yes_no "Use saved Dynv6 settings for this run?" "y"; then
+            clear_dynv6_runtime_values
+        fi
+    fi
+
+    if [[ -z "${PUBLIC_DOMAIN}" && -z "${DDNS_PROVIDER}" && -z "${DDNS_ZONE}" && -z "${DDNS_TOKEN}" ]]; then
+        info "This installer can either use an existing public domain or configure Dynv6 for you."
+        domain_mode="$(prompt_domain_setup_mode)"
+        if [[ "${domain_mode}" == "ready" ]]; then
+            PUBLIC_DOMAIN="$(trim_dot_domain "$(prompt_plain_value "App/public domain" "")")"
+            APP_DOMAIN="${PUBLIC_DOMAIN}"
+            prompt_domain_roles_if_needed
+            return 0
+        fi
+        DDNS_PROVIDER="dynv6"
+    fi
+
+    if [[ "${DDNS_PROVIDER}" == "dynv6" || ( -z "${PUBLIC_DOMAIN}" && ( -n "${DDNS_ZONE}" || -n "${DDNS_TOKEN}" ) ) ]]; then
+        DDNS_PROVIDER="dynv6"
+        if [[ -z "${DDNS_ZONE}" && -z "${DDNS_TOKEN}" ]]; then
+            info "Paste the full Dynv6 Instructions block if you have it."
+            info "Leave it empty and press Enter twice if you want to enter zone/password separately."
+            dynv6_blob="$(prompt_multiline_value "Dynv6 Instructions block")"
+            if [[ -n "${dynv6_blob}" ]]; then
+                DDNS_INSTRUCTIONS_TEXT="${dynv6_blob}"
+                normalize_dynv6_credentials
+            fi
+        fi
+        if [[ -z "${DDNS_ZONE}" ]]; then
+            DDNS_ZONE="$(trim_dot_domain "$(prompt_plain_value "Dynv6 zone" "")")"
+        fi
+        if [[ -z "${DDNS_TOKEN}" ]]; then
+            DDNS_TOKEN="$(prompt_secret_value "Dynv6 password from Instructions (password='...')")"
+        fi
+        normalize_dynv6_credentials
+        if [[ -z "${VPNBOT_SERVER_ID}" && -z "${DDNS_HOST_LABEL}" && -z "${PUBLIC_DOMAIN}" ]]; then
+            VPNBOT_SERVER_ID="$(prompt_plain_value "Server id for hostname" "$(hostname -s 2>/dev/null || echo node)")"
+            normalize_vpnbot_server_id
+        fi
+        save_installer_defaults
+        log "Saved shared Dynv6 defaults to ${XUI_INSTALLER_DEFAULTS_FILE}"
+        prompt_domain_roles_if_needed
+        return 0
+    fi
+}
+
+
+suggest_related_domain() {
+    local role="$1"
+    local source="${2:-}"
+    local base=""
+
+    source="$(trim_dot_domain "${source}")"
+    if [[ -z "${source}" ]]; then
+        printf ''
+        return 0
+    fi
+
+    if [[ "${source}" == app.* ]]; then
+        base="${source#app.}"
+    elif [[ "${source}" == panel.* ]]; then
+        base="${source#panel.}"
+    elif [[ "${source}" == mt.* ]]; then
+        base="${source#mt.}"
+    else
+        base="${source}"
+    fi
+
+    printf '%s.%s' "${role}" "${base}"
+}
+
+
+suggest_mt_domain() {
+    local source="${1:-}"
+    suggest_related_domain "mt" "${source}"
+}
+
+
+dynv6_rest_api_request() {
+    local method="$1"
+    local url="$2"
+    local body="${3:-}"
+    local status_file="${4:-}"
+    local response_file status
+    response_file="$(mktemp)"
+    local curl_args=(
+        -sS
+        -o "${response_file}"
+        -w "%{http_code}"
+        -X "${method}"
+        -H "Authorization: Bearer ${DDNS_TOKEN}"
+        -H "Accept: application/json"
+    )
+    if [[ -n "${body}" ]]; then
+        curl_args+=(-H "Content-Type: application/json" --data "${body}")
+    fi
+    status="$(curl "${curl_args[@]}" "${url}" || true)"
+    if [[ -n "${status_file}" ]]; then
+        printf '%s' "${status}" > "${status_file}"
+    fi
+    cat "${response_file}"
+    rm -f "${response_file}"
+    [[ "${status}" =~ ^2[0-9][0-9]$ ]]
+}
+
+
+dynv6_update_api_request() {
+    local hostname="$1"
+    local ipv4_value="$2"
+    local status_file="${3:-}"
+    local response_file status
+    response_file="$(mktemp)"
+    status="$(
+        curl -sSG \
+        -o "${response_file}" \
+        -w "%{http_code}" \
+        "https://dynv6.com/api/update" \
+        --data-urlencode "hostname=${hostname}" \
+        --data-urlencode "token=${DDNS_TOKEN}" \
+        --data-urlencode "ipv4=${ipv4_value}" || true
+    )"
+    if [[ -n "${status_file}" ]]; then
+        printf '%s' "${status}" > "${status_file}"
+    fi
+    cat "${response_file}"
+    rm -f "${response_file}"
+    [[ "${status}" =~ ^2[0-9][0-9]$ ]]
+}
+
+
+dynv6_try_update_api_fallback() {
+    local hostname="$1"
+    local ipv4_value="$2"
+    local reason="${3:-unknown}"
+    local update_response=""
+    local update_status_file=""
+    local update_status=""
+
+    warn "Dynv6 REST API is unavailable for this token (${reason}). Falling back to Dynv6 Update API."
+    warn "This is normal when DDNS_TOKEN is the value from Dynv6 Instructions: password='...'."
+    warn "That value is an update token for Dynv6 Update API, not a full REST API bearer token."
+
+    update_status_file="$(mktemp)"
+    update_response="$(dynv6_update_api_request "${hostname}" "${ipv4_value}" "${update_status_file}" || true)"
+    update_status="$(cat "${update_status_file}" 2>/dev/null || true)"
+    rm -f "${update_status_file}"
+
+    if [[ -z "${update_status}" || ! "${update_status}" =~ ^2[0-9][0-9]$ ]]; then
+        if [[ "${update_status}" == "401" || "${update_status}" == "403" ]]; then
+            err "Dynv6 Update API rejected the provided password/token (HTTP ${update_status}) for ${hostname}."
+            err "The value from Dynv6 Instructions line password='...' is the update token. There is no separate extra HTTP token."
+            err "But this update token is not a full REST bearer token, so it is safer to use an already created hostname."
+            err "Create ${hostname} manually in Dynv6 first, then rerun install_vray.sh with PUBLIC_DOMAIN=${hostname} and without DDNS_PROVIDER/DDNS_ZONE/DDNS_TOKEN."
+        else
+            err "Dynv6 Update API failed for ${hostname} (HTTP ${update_status:-unknown})."
+            err "If you only have the Dynv6 Instructions password='...' value, create ${hostname} manually in Dynv6 first and rerun with PUBLIC_DOMAIN=${hostname}."
+        fi
+        if [[ -n "${update_response}" ]]; then
+            err "Dynv6 response: ${update_response}"
+        fi
+        exit 1
+    fi
+
+    if [[ "${update_response}" == "badauth" || "${update_response}" == "abuse" || "${update_response}" == "notfqdn" || "${update_response}" == "nohost" || "${update_response}" == "dnserr" || "${update_response}" == "911" ]]; then
+        err "Dynv6 Update API returned error: ${update_response}"
+        if [[ "${update_response}" == "nohost" ]]; then
+            err "This usually means the hostname does not exist yet in Dynv6. Create ${hostname} manually first, then rerun with PUBLIC_DOMAIN=${hostname}."
+        elif [[ "${update_response}" == "badauth" ]]; then
+            err "Use the exact value from Dynv6 Instructions line password='...'. Do not include surrounding text."
+        fi
+        exit 1
+    fi
+
+    wait_for_public_domain_resolution "${hostname}" "${ipv4_value}"
+    log "Dynv6 domain ready via Update API: ${hostname} -> ${ipv4_value}"
+    return 0
+}
+
+
+wait_for_public_domain_resolution() {
+    local domain="$1"
+    local expected_ipv4="$2"
+    wait_for_host_resolution_to_ipv4 "${domain}" "${expected_ipv4}" "public domain"
+}
+
+
+derive_domain_bundle_defaults() {
+    local seed="${1:-}"
+    local base=""
+
+    seed="$(trim_dot_domain "${seed}")"
+    if [[ -z "${seed}" ]]; then
+        return 0
+    fi
+
+    if [[ "${seed}" == app.* ]]; then
+        base="${seed#app.}"
+    elif [[ "${seed}" == panel.* ]]; then
+        base="${seed#panel.}"
+    elif [[ "${seed}" == mt.* ]]; then
+        base="${seed#mt.}"
+    else
+        base="${seed}"
+    fi
+
+    printf '%s\n' "app.${base}"
+    printf '%s\n' "panel.${base}"
+    printf '%s\n' "mt.${base}"
+}
+
+
+prompt_domain_roles_if_needed() {
+    if ! is_interactive_terminal; then
+        return 0
+    fi
+
+    local seed="" suggested_app_domain="" suggested_panel_domain="" suggested_mt_domain=""
+    local bundle=""
+
+    if [[ -n "${PUBLIC_DOMAIN}" && -z "${APP_DOMAIN}" ]]; then
+        APP_DOMAIN="${PUBLIC_DOMAIN}"
+    fi
+
+    seed="${APP_DOMAIN:-${PANEL_DOMAIN:-${MT_DOMAIN:-${PUBLIC_DOMAIN}}}}"
+    seed="$(trim_dot_domain "${seed}")"
+    if [[ -z "${seed}" ]]; then
+        return 0
+    fi
+
+    bundle="$(derive_domain_bundle_defaults "${seed}")"
+    suggested_app_domain="$(printf '%s' "${bundle}" | sed -n '1p')"
+    suggested_panel_domain="$(printf '%s' "${bundle}" | sed -n '2p')"
+    suggested_mt_domain="$(printf '%s' "${bundle}" | sed -n '3p')"
+
+    echo ""
+    info "Suggested domain role bundle"
+    if is_xray_core_backend; then
+        echo "  APP_DOMAIN = ${suggested_app_domain}"
+        echo "  MT_DOMAIN  = ${suggested_mt_domain}"
+    else
+        echo "  APP_DOMAIN   = ${suggested_app_domain}"
+        echo "  PANEL_DOMAIN = ${suggested_panel_domain}"
+        echo "  MT_DOMAIN    = ${suggested_mt_domain}"
+    fi
+
+    if prompt_yes_no "Use this suggested domain role bundle?" "y"; then
+        APP_DOMAIN="${suggested_app_domain}"
+        if is_xray_core_backend; then
+            PANEL_DOMAIN=""
+        else
+            PANEL_DOMAIN="${suggested_panel_domain}"
+        fi
+        MT_DOMAIN="${suggested_mt_domain}"
+    else
+        APP_DOMAIN="$(trim_dot_domain "$(prompt_plain_value "App/public domain" "${APP_DOMAIN:-${suggested_app_domain}}")")"
+        if is_xray_core_backend; then
+            PANEL_DOMAIN=""
+        else
+            PANEL_DOMAIN="$(trim_dot_domain "$(prompt_plain_value "Panel domain" "${PANEL_DOMAIN:-${suggested_panel_domain}}")")"
+        fi
+        MT_DOMAIN="$(trim_dot_domain "$(prompt_plain_value "MTProxy domain" "${MT_DOMAIN:-${suggested_mt_domain}}")")"
+    fi
+
+    PUBLIC_DOMAIN="${APP_DOMAIN}"
+
+    echo ""
+    info "Installer domain roles"
+    echo "  App/public domain: ${APP_DOMAIN:-<unset>}"
+    if is_3xui_backend; then
+        echo "  Panel domain: ${PANEL_DOMAIN:-<unset>}"
+    fi
+    echo "  MTProxy domain: ${MT_DOMAIN:-<unset>}"
+}
+
+
+sync_domain_aliases() {
+    APP_DOMAIN="$(trim_dot_domain "${APP_DOMAIN}")"
+    PUBLIC_DOMAIN="$(trim_dot_domain "${PUBLIC_DOMAIN}")"
+    PANEL_DOMAIN="$(trim_dot_domain "${PANEL_DOMAIN}")"
+    MT_DOMAIN="$(trim_dot_domain "${MT_DOMAIN}")"
+    SHARED_HTTP_DOMAIN="$(trim_dot_domain "${SHARED_HTTP_DOMAIN}")"
+
+    if [[ -n "${APP_DOMAIN}" && -n "${PUBLIC_DOMAIN}" && "${APP_DOMAIN}" != "${PUBLIC_DOMAIN}" ]]; then
+        warn "APP_DOMAIN and PUBLIC_DOMAIN differ; using APP_DOMAIN as the effective public domain"
+    fi
+    if [[ -n "${APP_DOMAIN}" ]]; then
+        PUBLIC_DOMAIN="${APP_DOMAIN}"
+    fi
+    if [[ -z "${APP_DOMAIN}" && -n "${PUBLIC_DOMAIN}" ]]; then
+        APP_DOMAIN="${PUBLIC_DOMAIN}"
+    fi
+}
+
+
+validate_configured_public_hosts() {
+    local primary_ip=""
+    local host=""
+    local validated=()
+
+    primary_ip="$(get_primary_ipv4)"
+    if [[ -z "${primary_ip}" ]]; then
+        err "Could not detect the primary IPv4 address to validate configured public hosts."
+        exit 1
+    fi
+
+    for host in "${PANEL_DOMAIN}" "${SHARED_HTTP_DOMAIN}" "${APP_DOMAIN}" "${PUBLIC_DOMAIN}"; do
+        host="$(trim_dot_domain "${host}")"
+        if [[ -z "${host}" ]]; then
+            continue
+        fi
+
+        if [[ " ${validated[*]} " == *" ${host} "* ]]; then
+            continue
+        fi
+        validated+=("${host}")
+
+        info "Checking that ${host} points to this server (${primary_ip})..."
+        if ! wait_for_host_resolution_to_ipv4 "${host}" "${primary_ip}" "configured public host"; then
+            err "Refusing to continue: ${host} does not belong to this server."
+            err "Fix the A record so ${host} resolves to ${primary_ip}, or use the correct domain for this host."
+            exit 1
+        fi
+        log "Verified public host ${host} -> ${primary_ip}"
+    done
+}
+
+
+configure_dynv6_domain() {
+    if [[ -z "${DDNS_ZONE}" && -z "${DDNS_TOKEN}" && -z "${DDNS_PROVIDER}" ]]; then
+        return 0
+    fi
+
+    if [[ -z "${DDNS_PROVIDER}" ]]; then
+        DDNS_PROVIDER="dynv6"
+    fi
+    normalize_dynv6_credentials
+    if [[ "${DDNS_PROVIDER}" != "dynv6" ]]; then
+        err "Unsupported DDNS_PROVIDER=${DDNS_PROVIDER}. Currently install_vray.sh supports only dynv6."
+        exit 1
+    fi
+    if [[ -z "${DDNS_ZONE}" || -z "${DDNS_TOKEN}" ]]; then
+        err "For Dynv6 automation set both DDNS_ZONE and DDNS_TOKEN (or provide DDNS_INSTRUCTIONS_TEXT with the full Dynv6 Instructions block)."
+        exit 1
+    fi
+
+    DDNS_ZONE="$(trim_dot_domain "${DDNS_ZONE}")"
+    if [[ -z "${DDNS_HOST_LABEL}" ]]; then
+        DDNS_HOST_LABEL="$(get_default_ddns_host_label)"
+    else
+        DDNS_HOST_LABEL="$(slugify_host_label "${DDNS_HOST_LABEL}")"
+    fi
+    PUBLIC_DOMAIN="$(trim_dot_domain "${PUBLIC_DOMAIN}")"
+
+    if [[ -z "${PUBLIC_DOMAIN}" ]]; then
+        if [[ -n "${DDNS_HOST_LABEL}" && "${DDNS_HOST_LABEL}" != "@" ]]; then
+            PUBLIC_DOMAIN="${DDNS_HOST_LABEL}.${DDNS_ZONE}"
+        else
+            PUBLIC_DOMAIN="${DDNS_ZONE}"
+        fi
+    fi
+
+    if [[ "${PUBLIC_DOMAIN}" != "${DDNS_ZONE}" && "${PUBLIC_DOMAIN}" != *".${DDNS_ZONE}" ]]; then
+        err "PUBLIC_DOMAIN=${PUBLIC_DOMAIN} must be either ${DDNS_ZONE} itself or one of its subdomains."
+        exit 1
+    fi
+
+    local primary_ip zone_json zone_id records_json record_id rest_status_file rest_status
+    primary_ip="$(get_primary_ipv4)"
+    if [[ -z "${primary_ip}" ]]; then
+        err "Could not detect the primary IPv4 address for Dynv6 DNS update."
+        exit 1
+    fi
+
+    info "Dynv6: ensuring zone ${DDNS_ZONE} and A record ${PUBLIC_DOMAIN} -> ${primary_ip}"
+    rest_status_file="$(mktemp)"
+    zone_json="$(dynv6_rest_api_request GET "https://dynv6.com/api/v2/zones/by-name/${DDNS_ZONE}" "" "${rest_status_file}" || true)"
+    rest_status="$(cat "${rest_status_file}" 2>/dev/null || true)"
+    rm -f "${rest_status_file}"
+    if [[ "${rest_status}" == "401" || "${rest_status}" == "403" ]]; then
+        dynv6_try_update_api_fallback "${PUBLIC_DOMAIN}" "${primary_ip}" "HTTP ${rest_status}"
+        return 0
+    fi
+    if [[ -z "${rest_status}" || ! "${rest_status}" =~ ^2[0-9][0-9]$ && "${rest_status}" != "404" ]]; then
+        dynv6_try_update_api_fallback "${PUBLIC_DOMAIN}" "${primary_ip}" "HTTP ${rest_status:-unknown}"
+        return 0
+    fi
+    zone_id="$(printf '%s' "${zone_json}" | jq -r '.id // empty' 2>/dev/null || true)"
+    if [[ -z "${zone_id}" ]]; then
+        rest_status_file="$(mktemp)"
+        zone_json="$(dynv6_rest_api_request POST "https://dynv6.com/api/v2/zones" "{\"name\":\"${DDNS_ZONE}\",\"ipv4address\":\"${primary_ip}\"}" "${rest_status_file}" || true)"
+        rest_status="$(cat "${rest_status_file}" 2>/dev/null || true)"
+        rm -f "${rest_status_file}"
+        if [[ "${rest_status}" == "401" || "${rest_status}" == "403" || -z "${rest_status}" || ! "${rest_status}" =~ ^2[0-9][0-9]$ ]]; then
+            dynv6_try_update_api_fallback "${PUBLIC_DOMAIN}" "${primary_ip}" "HTTP ${rest_status:-unknown} on zone create"
+            return 0
+        fi
+        zone_id="$(printf '%s' "${zone_json}" | jq -r '.id // empty')"
+    else
+        rest_status_file="$(mktemp)"
+        dynv6_rest_api_request PATCH "https://dynv6.com/api/v2/zones/${zone_id}" "{\"ipv4address\":\"${primary_ip}\"}" "${rest_status_file}" >/dev/null || true
+        rest_status="$(cat "${rest_status_file}" 2>/dev/null || true)"
+        rm -f "${rest_status_file}"
+        if [[ "${rest_status}" == "401" || "${rest_status}" == "403" || -z "${rest_status}" || ! "${rest_status}" =~ ^2[0-9][0-9]$ ]]; then
+            dynv6_try_update_api_fallback "${PUBLIC_DOMAIN}" "${primary_ip}" "HTTP ${rest_status:-unknown} on zone patch"
+            return 0
+        fi
+    fi
+
+    if [[ -z "${zone_id}" ]]; then
+        err "Dynv6 zone ${DDNS_ZONE} was not created or returned no id."
+        exit 1
+    fi
+
+    if [[ "${PUBLIC_DOMAIN}" != "${DDNS_ZONE}" ]]; then
+        rest_status_file="$(mktemp)"
+        records_json="$(dynv6_rest_api_request GET "https://dynv6.com/api/v2/zones/${zone_id}/records" "" "${rest_status_file}" || true)"
+        rest_status="$(cat "${rest_status_file}" 2>/dev/null || true)"
+        rm -f "${rest_status_file}"
+        if [[ "${rest_status}" == "401" || "${rest_status}" == "403" || -z "${rest_status}" || ! "${rest_status}" =~ ^2[0-9][0-9]$ ]]; then
+            dynv6_try_update_api_fallback "${PUBLIC_DOMAIN}" "${primary_ip}" "HTTP ${rest_status:-unknown} on records list"
+            return 0
+        fi
+        record_id="$(printf '%s' "${records_json}" | jq -r --arg name "${PUBLIC_DOMAIN}" '.[] | select(.type == "A" and .name == $name) | .id' | head -n1)"
+        if [[ -n "${record_id}" ]]; then
+            rest_status_file="$(mktemp)"
+            dynv6_rest_api_request PATCH "https://dynv6.com/api/v2/zones/${zone_id}/records/${record_id}" \
+                "{\"name\":\"${PUBLIC_DOMAIN}\",\"type\":\"A\",\"data\":\"${primary_ip}\"}" "${rest_status_file}" >/dev/null || true
+            rest_status="$(cat "${rest_status_file}" 2>/dev/null || true)"
+            rm -f "${rest_status_file}"
+            if [[ "${rest_status}" == "401" || "${rest_status}" == "403" || -z "${rest_status}" || ! "${rest_status}" =~ ^2[0-9][0-9]$ ]]; then
+                dynv6_try_update_api_fallback "${PUBLIC_DOMAIN}" "${primary_ip}" "HTTP ${rest_status:-unknown} on record patch"
+                return 0
+            fi
+        else
+            rest_status_file="$(mktemp)"
+            dynv6_rest_api_request POST "https://dynv6.com/api/v2/zones/${zone_id}/records" \
+                "{\"name\":\"${PUBLIC_DOMAIN}\",\"type\":\"A\",\"data\":\"${primary_ip}\"}" "${rest_status_file}" >/dev/null || true
+            rest_status="$(cat "${rest_status_file}" 2>/dev/null || true)"
+            rm -f "${rest_status_file}"
+            if [[ "${rest_status}" == "401" || "${rest_status}" == "403" || -z "${rest_status}" || ! "${rest_status}" =~ ^2[0-9][0-9]$ ]]; then
+                dynv6_try_update_api_fallback "${PUBLIC_DOMAIN}" "${primary_ip}" "HTTP ${rest_status:-unknown} on record create"
+                return 0
+            fi
+        fi
+    fi
+
+    wait_for_public_domain_resolution "${PUBLIC_DOMAIN}" "${primary_ip}"
+    log "Dynv6 domain ready: ${PUBLIC_DOMAIN} -> ${primary_ip}"
+}
+
+
+apt_dns_works() {
+    timeout 5 getent hosts deb.debian.org >/dev/null 2>&1 \
+        && timeout 5 getent hosts security.debian.org >/dev/null 2>&1
+}
+
+
+apt_dns_tcp_works() {
+    python3 - <<'PY'
+import socket
+import struct
+import sys
+
+query = bytes.fromhex("123401000001000000000000036465620664656269616e036f72670000010001")
+packet = struct.pack("!H", len(query)) + query
+
+for upstream in (("1.1.1.1", 53), ("8.8.8.8", 53), ("9.9.9.9", 53)):
+    try:
+        with socket.create_connection(upstream, timeout=4.0) as sock:
+            sock.sendall(packet)
+            hdr = sock.recv(2)
+            if len(hdr) != 2:
+                continue
+            total = struct.unpack("!H", hdr)[0]
+            data = b""
+            while len(data) < total:
+                chunk = sock.recv(total - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            if data:
+                sys.exit(0)
+    except Exception:
+        continue
+sys.exit(1)
+PY
+}
+
+
+force_tcp_dns_for_apt() {
+    if grep -q '^options .*use-vc' /etc/resolv.conf 2>/dev/null; then
+        return 0
+    fi
+    cp /etc/resolv.conf "/etc/resolv.conf.install_vray.bak.$(date +%s)" 2>/dev/null || true
+    python3 - <<'PY'
+from pathlib import Path
+
+p = Path("/etc/resolv.conf")
+text = p.read_text(encoding="utf-8")
+if "options use-vc" not in text:
+    if not text.endswith("\n"):
+        text += "\n"
+    text += "options use-vc timeout:2 attempts:2\n"
+    p.write_text(text, encoding="utf-8")
+PY
+    warn "Enabled TCP DNS fallback in /etc/resolv.conf for apt operations"
+}
+
+
+apt_http_mirrors_reachable() {
+    timeout 10 curl -I -4 --max-time 8 http://deb.debian.org/debian/ >/dev/null 2>&1 \
+        && timeout 10 curl -I -4 --max-time 8 http://security.debian.org/ >/dev/null 2>&1
+}
+
+
+prepare_apt_networking() {
+    if apt_dns_works; then
+        return 0
+    fi
+
+    warn "Standard DNS resolution failed for Debian mirrors. Checking if TCP DNS fallback is possible..."
+    if apt_dns_tcp_works; then
+        force_tcp_dns_for_apt
+        if apt_dns_works; then
+            log "DNS resolution restored via TCP DNS fallback"
+        else
+            err "TCP DNS fallback was enabled but Debian mirror hostnames still do not resolve"
+            return 1
+        fi
+    else
+        err "Debian mirror hostnames do not resolve, and TCP DNS fallback is also unavailable"
+        return 1
+    fi
+
+    if ! apt_http_mirrors_reachable; then
+        err "Debian HTTP mirrors are unreachable from this host."
+        err "Check provider egress filtering or mirror reachability before retrying install_vray.sh."
+        return 1
+    fi
+}
+
+
+install_dependencies() {
+    prepare_apt_networking || exit 1
+    apt-get update -qq
+    if is_xray_core_backend; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            curl ca-certificates openssl tar nginx libnginx-mod-stream certbot python3 python3-certbot-nginx iptables jq
+        log "Base packages installed for standalone Xray-core mode with nginx shared-port support"
+        return 0
+    fi
+
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        curl ca-certificates openssl tar nginx libnginx-mod-stream certbot python3 python3-certbot-nginx iptables jq sqlite3
+    log "Base packages installed for 3x-ui mode"
+}
+
+
+normalize_inputs() {
+    normalize_vless_backend_mode
+    normalize_vpnbot_server_id
+    sync_domain_aliases
+
+    if is_3xui_backend; then
+        if [[ -z "${XUI_PANEL_USERNAME}" ]]; then
+            XUI_PANEL_USERNAME="admin_$(gen_random_string 6)"
+        fi
+        if [[ -z "${XUI_PANEL_PASSWORD}" ]]; then
+            XUI_PANEL_PASSWORD="$(gen_random_string 16)"
+        fi
+        if [[ -z "${XUI_PANEL_WEBBASEPATH}" ]]; then
+            XUI_PANEL_WEBBASEPATH="$(gen_random_string 18)"
+        fi
+        XUI_PANEL_WEBBASEPATH="${XUI_PANEL_WEBBASEPATH#/}"
+        XUI_PANEL_WEBBASEPATH="${XUI_PANEL_WEBBASEPATH%/}"
+
+        if [[ -z "${NGINX_PANEL_LOCATION}" ]]; then
+            NGINX_PANEL_LOCATION="/${XUI_PANEL_WEBBASEPATH}/"
+        fi
+    fi
+
+    if [[ -z "${SHARED_HTTP_DOMAIN}" && -n "${APP_DOMAIN}" ]]; then
+        SHARED_HTTP_DOMAIN="${APP_DOMAIN}"
+    fi
+
+    if is_3xui_backend && [[ -z "${PANEL_DOMAIN}" ]]; then
+        if [[ -n "${SHARED_HTTP_DOMAIN}" ]]; then
+            PANEL_DOMAIN="${SHARED_HTTP_DOMAIN}"
+        elif [[ -n "${APP_DOMAIN}" ]]; then
+            PANEL_DOMAIN="${APP_DOMAIN}"
+        fi
+    fi
+
+    local nginx_server_names=()
+    local candidate=""
+    for candidate in "${PANEL_DOMAIN}" "${SHARED_HTTP_DOMAIN}" "${APP_DOMAIN}"; do
+        candidate="$(trim_dot_domain "${candidate}")"
+        if [[ -z "${candidate}" ]]; then
+            continue
+        fi
+        if [[ " ${nginx_server_names[*]} " == *" ${candidate} "* ]]; then
+            continue
+        fi
+        nginx_server_names+=("${candidate}")
+    done
+
+    if [[ -z "${NGINX_SERVER_NAME}" ]]; then
+        if [[ "${#nginx_server_names[@]}" -gt 0 ]]; then
+            NGINX_SERVER_NAME="${nginx_server_names[*]}"
+        else
+            NGINX_SERVER_NAME="_"
+        fi
+    fi
+}
+
+
+fetch_upstream_installer() {
+    curl -L --max-time 30 "${XUI_UPSTREAM_INSTALL_URL}" -o "${XUI_UPSTREAM_TMP}"
+    python3 - <<'PY'
+from pathlib import Path
+
+src = Path("/tmp/install_3xui_upstream.sh").read_text(encoding="utf-8")
+marker = '\necho -e "${green}Running...${plain}"\ninstall_base\ninstall_x-ui $1\n'
+if marker not in src:
+    raise SystemExit("Failed to strip autorun section from upstream 3x-ui installer")
+Path("/tmp/install_3xui_upstream_sourced.sh").write_text(src.replace(marker, "\n", 1), encoding="utf-8")
+PY
+    log "Fetched upstream 3x-ui installer"
+}
+
+
+install_3xui_noninteractive() {
+    fetch_upstream_installer
+    # shellcheck disable=SC1090
+    source "${XUI_SOURCED_TMP}"
+
+    config_after_install() {
+        "${xui_folder}/x-ui" setting \
+            -username "${XUI_PANEL_USERNAME}" \
+            -password "${XUI_PANEL_PASSWORD}" \
+            -port "${XUI_PANEL_PORT}" \
+            -webBasePath "${XUI_PANEL_WEBBASEPATH}" >/dev/null 2>&1
+        "${xui_folder}/x-ui" migrate >/dev/null 2>&1 || true
+        log "3x-ui panel configured non-interactively"
+        info "Panel backend port: ${XUI_PANEL_PORT}"
+        info "Panel webBasePath: ${XUI_PANEL_WEBBASEPATH}"
+    }
+
+    prompt_and_setup_ssl() {
+        warn "Skipping upstream panel SSL setup: VPnBot nginx/stream layer handles TCP/443"
+        return 0
+    }
+
+    install_base
+    if [[ -n "${XUI_VERSION:-}" ]]; then
+        install_x-ui "${XUI_VERSION}"
+    else
+        install_x-ui
+    fi
+}
+
+
+get_effective_public_endpoint_host() {
+    local host=""
+    host="$(trim_dot_domain "${APP_DOMAIN:-${PUBLIC_DOMAIN:-}}")"
+    if [[ -z "${host}" ]]; then
+        host="$(get_primary_ipv4)"
+    fi
+    printf '%s' "${host}"
+}
+
+
+choose_available_tcp_port() {
+    local preferred="${1:-0}"
+    PREFERRED_TCP_PORT="${preferred}" python3 - <<'PY'
+import os
+import random
+import socket
+import sys
+
+preferred_raw = os.environ.get("PREFERRED_TCP_PORT", "").strip()
+try:
+    preferred = int(preferred_raw) if preferred_raw else 0
+except ValueError:
+    preferred = 0
+
+
+def is_free(port: int) -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("0.0.0.0", int(port)))
+    except OSError:
+        sock.close()
+        return False
+    sock.close()
+    return True
+
+
+for candidate in [preferred, 8443]:
+    if candidate > 0 and is_free(candidate):
+        print(candidate)
+        sys.exit(0)
+
+for _ in range(2000):
+    port = random.randint(20000, 45000)
+    if is_free(port):
+        print(port)
+        sys.exit(0)
+
+raise SystemExit("Could not find a free TCP port for standalone Xray-core smoke inbound")
+PY
+}
+
+
+get_xray_core_archive_name() {
+    local arch
+    arch="$(uname -m)"
+    case "${arch}" in
+        x86_64|amd64)
+            printf 'Xray-linux-64.zip'
+            ;;
+        aarch64|arm64)
+            printf 'Xray-linux-arm64-v8a.zip'
+            ;;
+        armv7l|armv7*)
+            printf 'Xray-linux-arm32-v7a.zip'
+            ;;
+        *)
+            err "Unsupported CPU architecture for standalone Xray-core mode: ${arch}"
+            exit 1
+            ;;
+    esac
+}
+
+
+resolve_xray_core_release_asset() {
+    local archive_name="$1"
+    XRAY_CORE_RELEASES_API_URL_VALUE="${XRAY_CORE_RELEASES_API_URL}" \
+    XRAY_CORE_RELEASE_CHANNEL_VALUE="${XRAY_CORE_RELEASE_CHANNEL}" \
+    XRAY_CORE_VERSION_VALUE="${XRAY_CORE_VERSION}" \
+    XRAY_CORE_ARCHIVE_NAME_VALUE="${archive_name}" \
+    python3 - <<'PY'
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+
+def request_json(url: str):
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "vpnbot-install-vray",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.load(response)
+
+
+base = str(os.environ["XRAY_CORE_RELEASES_API_URL_VALUE"]).rstrip("/")
+channel = str(os.environ["XRAY_CORE_RELEASE_CHANNEL_VALUE"]).strip().lower() or "stable"
+version = str(os.environ["XRAY_CORE_VERSION_VALUE"]).strip() or "latest"
+archive_name = str(os.environ["XRAY_CORE_ARCHIVE_NAME_VALUE"]).strip()
+
+if version != "latest":
+    release = request_json(f"{base}/tags/{urllib.parse.quote(version, safe='')}")
+else:
+    releases = request_json(f"{base}?per_page=20")
+    if not isinstance(releases, list):
+        raise SystemExit("GitHub releases API did not return a list")
+    release = None
+    for item in releases:
+        if not isinstance(item, dict):
+            continue
+        if channel == "stable" and item.get("prerelease"):
+            continue
+        release = item
+        break
+    if release is None and releases:
+        release = next((item for item in releases if isinstance(item, dict)), None)
+
+if not isinstance(release, dict):
+    raise SystemExit("Could not resolve a suitable Xray-core release")
+
+for asset in release.get("assets") or []:
+    if not isinstance(asset, dict):
+        continue
+    if str(asset.get("name") or "") != archive_name:
+        continue
+    print(str(asset.get("browser_download_url") or "").strip())
+    print(str(release.get("tag_name") or "").strip())
+    sys.exit(0)
+
+raise SystemExit(f"Asset {archive_name} was not found in release {release.get('tag_name')}")
+PY
+}
+
+
+write_xray_core_base_configs() {
+    mkdir -p "${XRAY_CORE_ROOT}/bin" "${XRAY_CORE_CONFIG_DIR}" "${XRAY_CORE_SHARE_DIR}" "${XRAY_CORE_LOG_DIR}"
+    touch "${XRAY_CORE_LOG_DIR}/access.log" "${XRAY_CORE_LOG_DIR}/error.log"
+    chmod 755 "${XRAY_CORE_ROOT}" "${XRAY_CORE_ROOT}/bin" "${XRAY_CORE_CONFIG_DIR}" "${XRAY_CORE_SHARE_DIR}" "${XRAY_CORE_LOG_DIR}"
+    chmod 600 "${XRAY_CORE_LOG_DIR}/access.log" "${XRAY_CORE_LOG_DIR}/error.log" 2>/dev/null || true
+
+    # Keep minimal access/error logs enabled. The online and abuse trackers depend
+    # on access.log, so rerunning the installer repairs older disabled log files.
+    cat > "${XRAY_CORE_CONFIG_DIR}/00_log.json" <<EOF
+{
+  "log": {
+    "access": "${XRAY_CORE_LOG_DIR}/access.log",
+    "error": "${XRAY_CORE_LOG_DIR}/error.log",
+    "loglevel": "${XUI_XRAY_LOGLEVEL}",
+    "dnsLog": false
+  }
+}
+EOF
+
+    if [[ ! -f "${XRAY_CORE_CONFIG_DIR}/10_routing.json" ]]; then
+        cat > "${XRAY_CORE_CONFIG_DIR}/10_routing.json" <<'EOF'
+{
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": []
+  }
+}
+EOF
+    fi
+
+    if [[ ! -f "${XRAY_CORE_CONFIG_DIR}/20_outbounds.json" ]]; then
+        cat > "${XRAY_CORE_CONFIG_DIR}/20_outbounds.json" <<'EOF'
+{
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ]
+}
+EOF
+    fi
+
+    # Xray v26 expects the local API listen address as one host:port value.
+    # Rewriting this file also repairs older installs that had listen+port split.
+    cat > "${XRAY_CORE_CONFIG_DIR}/30_api.json" <<EOF
+{
+  "api": {
+    "tag": "api",
+    "listen": "${XRAY_CORE_API_SERVER}",
+    "services": [
+      "HandlerService",
+      "StatsService"
+    ]
+  },
+  "stats": {}
+}
+EOF
+
+    if [[ ! -f "${XRAY_CORE_CONFIG_DIR}/40_policy.json" ]]; then
+        cat > "${XRAY_CORE_CONFIG_DIR}/40_policy.json" <<'EOF'
+{
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true,
+        "statsUserOnline": true
+      }
+    },
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true,
+      "statsOutboundUplink": true,
+      "statsOutboundDownlink": true
+    }
+  }
+}
+EOF
+    fi
+}
+
+
+write_xray_logrotate_config() {
+    mkdir -p "$(dirname "${XRAY_LOGROTATE_FILE}")"
+    cat > "${XRAY_LOGROTATE_FILE}" <<EOF
+${XRAY_CORE_LOG_DIR}/*.log ${XUI_XRAY_LOG_DIR}/*.log {
+    daily
+    rotate ${XRAY_LOGROTATE_DAYS}
+    maxsize ${XRAY_LOGROTATE_MAXSIZE}
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 root root
+}
+EOF
+    chmod 644 "${XRAY_LOGROTATE_FILE}" 2>/dev/null || true
+    log "Installed Xray logrotate policy: ${XRAY_LOGROTATE_FILE}"
+}
+
+
+write_xray_core_smoke_inbound_if_missing() {
+    local public_host smoke_domain smoke_port smoke_uuid short_id key_output private_key public_key
+
+    XRAY_CORE_PUBLIC_ENDPOINT="$(get_effective_public_endpoint_host)"
+
+    if [[ -f "${XRAY_CORE_MANAGED_INBOUNDS_FILE}" ]]; then
+        info "Standalone Xray managed inbounds file already exists, leaving it unchanged: ${XRAY_CORE_MANAGED_INBOUNDS_FILE}"
+        return 0
+    fi
+
+    if ! env_is_true "${XRAY_CORE_SMOKE_ENABLE}"; then
+        cat > "${XRAY_CORE_MANAGED_INBOUNDS_FILE}" <<'EOF'
+{
+  "inbounds": []
+}
+EOF
+        log "Created empty managed inbounds file for standalone Xray-core"
+        return 0
+    fi
+
+    public_host="${XRAY_CORE_PUBLIC_ENDPOINT}"
+    smoke_domain="$(trim_dot_domain "${XRAY_CORE_SMOKE_DOMAIN}")"
+    if [[ -z "${smoke_domain}" ]]; then
+        smoke_domain="www.cloudflare.com"
+    fi
+    smoke_port="$(choose_available_tcp_port "${XRAY_CORE_SMOKE_PORT}")"
+    smoke_uuid="${XRAY_CORE_SMOKE_UUID:-}"
+    if [[ -z "${smoke_uuid}" ]]; then
+        smoke_uuid="$("${XRAY_CORE_BIN}" uuid 2>/dev/null | tr -d '\r\n' || true)"
+    fi
+    if [[ -z "${smoke_uuid}" ]]; then
+        smoke_uuid="$(python3 - <<'PY'
+import uuid
+
+print(uuid.uuid4())
+PY
+)"
+    fi
+    key_output="$("${XRAY_CORE_BIN}" x25519 2>&1 || true)"
+    parsed_keys="$(XRAY_X25519_OUTPUT="${key_output}" python3 - <<'PY'
+import os
+
+text = os.environ.get("XRAY_X25519_OUTPUT", "")
+private_key = ""
+public_key = ""
+for raw in text.splitlines():
+    line = raw.strip()
+    compact = line.lower().replace(" ", "").replace("_", "")
+    value = line.split(":", 1)[1].strip() if ":" in line else ""
+    if not value:
+        parts = line.split()
+        value = parts[-1].strip() if parts else ""
+    if not private_key and "privatekey" in compact:
+        private_key = value
+    if not public_key and "publickey" in compact:
+        public_key = value
+print(private_key)
+print(public_key)
+PY
+)"
+    private_key="$(printf '%s\n' "${parsed_keys}" | sed -n '1p')"
+    public_key="$(printf '%s\n' "${parsed_keys}" | sed -n '2p')"
+    short_id="$(openssl rand -hex 8)"
+
+    if [[ -z "${smoke_uuid}" || -z "${private_key}" || -z "${public_key}" || -z "${short_id}" ]]; then
+        err "Failed to generate standalone Xray-core smoke-test credentials"
+        err "xray binary: ${XRAY_CORE_BIN}"
+        err "xray x25519 output:"
+        printf '%s\n' "${key_output}" >&2
+        exit 1
+    fi
+
+    XRAY_CORE_SMOKE_PORT_EFFECTIVE="${smoke_port}"
+    XRAY_CORE_SMOKE_UUID="${smoke_uuid}"
+    XRAY_CORE_SMOKE_PUBLIC_KEY="${public_key}"
+    XRAY_CORE_SMOKE_SHORT_ID="${short_id}"
+    XRAY_CORE_SMOKE_LINK="vless://${smoke_uuid}@${public_host}:${smoke_port}?type=tcp&security=reality&pbk=${public_key}&fp=chrome&sni=${smoke_domain}&sid=${short_id}&encryption=none#vpnbot-smoke"
+
+    SMOKE_UUID_VALUE="${smoke_uuid}" \
+    SMOKE_PORT_VALUE="${smoke_port}" \
+    SMOKE_DOMAIN_VALUE="${smoke_domain}" \
+    SMOKE_PRIVATE_KEY_VALUE="${private_key}" \
+    SMOKE_SHORT_ID_VALUE="${short_id}" \
+    MANAGED_INBOUNDS_FILE_VALUE="${XRAY_CORE_MANAGED_INBOUNDS_FILE}" \
+    python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = {
+    "inbounds": [
+        {
+            "tag": "vpnbot-smoke-vless-reality-direct",
+            "listen": "0.0.0.0",
+            "port": int(os.environ["SMOKE_PORT_VALUE"]),
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {
+                        "id": os.environ["SMOKE_UUID_VALUE"],
+                        "email": "vpnbot-smoke"
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "show": False,
+                    "xver": 0,
+                    "dest": f"{os.environ['SMOKE_DOMAIN_VALUE']}:443",
+                    "serverNames": [os.environ["SMOKE_DOMAIN_VALUE"]],
+                    "privateKey": os.environ["SMOKE_PRIVATE_KEY_VALUE"],
+                    "minClientVer": "",
+                    "maxClientVer": "",
+                    "maxTimeDiff": 0,
+                    "shortIds": [os.environ["SMOKE_SHORT_ID_VALUE"]]
+                },
+                "tcpSettings": {
+                    "acceptProxyProtocol": False,
+                    "header": {
+                        "type": "none"
+                    }
+                }
+            },
+            "sniffing": {
+                "enabled": True,
+                "destOverride": ["http", "tls", "quic"],
+                "metadataOnly": False
+            }
+        }
+    ]
+}
+
+Path(os.environ["MANAGED_INBOUNDS_FILE_VALUE"]).write_text(
+    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+    log "Created standalone Xray-core smoke inbound on TCP port ${smoke_port}"
+}
+
+
+write_xray_core_service_unit() {
+    cat > "${XRAY_CORE_SERVICE_FILE}" <<EOF
+[Unit]
+Description=VPnBot standalone Xray-core
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${XRAY_CORE_ROOT}
+Environment=XRAY_LOCATION_ASSET=${XRAY_CORE_SHARE_DIR}
+Environment=XRAY_LOCATION_CONFDIR=${XRAY_CORE_CONFIG_DIR}
+ExecStart=${XRAY_CORE_BIN} run -confdir ${XRAY_CORE_CONFIG_DIR}
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+
+download_node_installer_asset() {
+    local asset_path="$1"
+    local destination="$2"
+    local mode="${3:-644}"
+    local base_url="${VPNBOT_NODE_INSTALLER_BASE_URL%/}"
+    local url="${base_url}/${asset_path}"
+    local tmp_file
+
+    tmp_file="$(mktemp)"
+    curl -fsSL --retry 3 --connect-timeout 10 -o "${tmp_file}" "${url}"
+    install -m "${mode}" "${tmp_file}" "${destination}"
+    rm -f "${tmp_file}"
+}
+
+
+write_xrayctl_assets() {
+    download_node_installer_asset "assets/vpnbot_xrayctl.py" "${XRAY_CTL_SCRIPT}" 755
+    log "Installed Xray-core local control helper: ${XRAY_CTL_SCRIPT}"
+}
+
+
+write_xray_online_tracker_assets() {
+    local tracker_state_dir
+    tracker_state_dir="/var/lib/vpnbot-xray-online"
+    mkdir -p "${tracker_state_dir}"
+    chmod 755 "${tracker_state_dir}"
+
+    cat > "${XRAY_ONLINE_TRACKER_SCRIPT}" <<'PY'
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+
+ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
+BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
+BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
+WINDOW_SECONDS = max(10, min(int(os.environ.get("XRAY_ONLINE_WINDOW_SECONDS", "180")), 3600))
+BOOTSTRAP_BYTES = max(64 * 1024, min(int(os.environ.get("XRAY_ONLINE_BOOTSTRAP_BYTES", "524288")), 8 * 1024 * 1024))
+POLL_INTERVAL = max(0.05, min(float(os.environ.get("XRAY_ONLINE_POLL_INTERVAL", "0.2")), 5.0))
+MAX_IPS_PER_USER = max(1, min(int(os.environ.get("XRAY_ONLINE_MAX_IPS_PER_USER", "20")), 100))
+XRAY_BIN = os.environ.get("XRAY_ONLINE_XRAY_BIN", "/opt/vpnbot/xray-core/bin/xray")
+XRAY_API_SERVER = os.environ.get("XRAY_ONLINE_XRAY_API_SERVER", "127.0.0.1:10085")
+STATS_INTERVAL = max(5.0, min(float(os.environ.get("XRAY_ONLINE_STATS_INTERVAL_SECONDS", "15")), 300.0))
+ABUSE_AUDIT_WINDOW_SECONDS = max(60, min(int(os.environ.get("XRAY_ABUSE_AUDIT_WINDOW_SECONDS", "86400")), 7 * 86400))
+ABUSE_AUDIT_MAX_EVENTS = max(1000, min(int(os.environ.get("XRAY_ABUSE_AUDIT_MAX_EVENTS", "50000")), 500000))
+ABUSE_AUDIT_TOP_LIMIT = max(5, min(int(os.environ.get("XRAY_ABUSE_AUDIT_TOP_LIMIT", "20")), 100))
+
+LOCK = threading.RLock()
+CLIENTS: dict[str, dict] = {}
+ABUSE_EVENTS: list[dict] = []
+LAST_LINE_AT = 0.0
+LAST_ERROR = ""
+TRAFFIC = {
+    "traffic_source": "xray_stats_unavailable",
+    "traffic_up_bytes": 0,
+    "traffic_down_bytes": 0,
+    "traffic_total_bytes": 0,
+    "load_bps": None,
+    "stats_checked_at": "",
+    "stats_last_error": "",
+}
+
+
+def utc_iso(ts: float | None = None) -> str:
+    return datetime.fromtimestamp(ts or time.time(), timezone.utc).isoformat()
+
+
+def parse_xray_ts(value: str) -> float | None:
+    try:
+        return datetime.strptime(value, "%Y/%m/%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+def normalize_ip(value: str) -> str | None:
+    candidate = str(value or "").strip().strip("\"'(){}<>")
+    if not candidate:
+        return None
+
+    lowered = candidate.lower()
+    for prefix in ("tcp:", "udp:", "http:", "https:"):
+        if lowered.startswith(prefix):
+            candidate = candidate[len(prefix):].strip()
+            lowered = candidate.lower()
+            break
+
+    probes = [candidate.strip("[]")]
+    if candidate.startswith("[") and "]" in candidate:
+        probes.append(candidate[1:candidate.index("]")])
+    if "/" in candidate:
+        probes.append(candidate.split("/", 1)[0].strip("[]"))
+    if ":" in candidate and "." in candidate:
+        host_part, _, maybe_port = candidate.rpartition(":")
+        if host_part and maybe_port.isdigit():
+            probes.append(host_part.strip("[]"))
+
+    for probe in probes:
+        probe = str(probe or "").strip()
+        if not probe:
+            continue
+        try:
+            return str(ipaddress.ip_address(probe))
+        except Exception:
+            continue
+    return None
+
+
+def extract_source_ip(line: str) -> str | None:
+    match = re.match(r"^\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+(?P<body>.*)$", line)
+    body = match.group("body") if match else line
+    before_accepted = body.split(" accepted ", 1)[0]
+
+    for token in reversed(re.split(r"[\s,;]+", before_accepted)):
+        ip = normalize_ip(token)
+        if ip:
+            return ip
+
+    for match in re.finditer(r"(?:\d{1,3}\.){3}\d{1,3}", before_accepted):
+        ip = normalize_ip(match.group(0))
+        if ip:
+            return ip
+    return None
+
+
+def normalize_host(value: str) -> str:
+    host = str(value or "").strip().strip("\"'(){}<>[]")
+    if not host:
+        return ""
+    try:
+        return str(ipaddress.ip_address(host))
+    except Exception:
+        return host.lower()
+
+
+def parse_target_endpoint(value: str) -> dict | None:
+    endpoint = str(value or "").strip().strip("\"'(){}<>")
+    if not endpoint:
+        return None
+
+    protocol = ""
+    lowered = endpoint.lower()
+    for prefix in ("tcp:", "udp:", "http:", "https:"):
+        if lowered.startswith(prefix):
+            protocol = prefix[:-1]
+            endpoint = endpoint[len(prefix):].strip()
+            lowered = endpoint.lower()
+            break
+
+    host = ""
+    port = 0
+    if endpoint.startswith("[") and "]" in endpoint:
+        host = endpoint[1:endpoint.index("]")]
+        rest = endpoint[endpoint.index("]") + 1:]
+        if rest.startswith(":") and rest[1:].isdigit():
+            port = int(rest[1:])
+    else:
+        host_part, sep, port_part = endpoint.rpartition(":")
+        if sep and port_part.isdigit():
+            host = host_part
+            port = int(port_part)
+        else:
+            host = endpoint
+
+    host = normalize_host(host)
+    if not host:
+        return None
+    if port < 0 or port > 65535:
+        port = 0
+
+    return {"protocol": protocol, "host": host, "port": port}
+
+
+def extract_target(line: str) -> dict | None:
+    if " accepted " not in line:
+        return None
+    after = line.split(" accepted ", 1)[1].strip()
+    if not after:
+        return None
+    token = after.split(" [", 1)[0].strip().split()[0]
+    return parse_target_endpoint(token)
+
+
+def remember_abuse_event(email: str, ts: float, source_ip: str | None, target: dict | None) -> None:
+    if not target:
+        return
+    ABUSE_EVENTS.append(
+        {
+            "ts": float(ts),
+            "email": email,
+            "source_ip": source_ip or "",
+            "protocol": str(target.get("protocol") or ""),
+            "host": str(target.get("host") or ""),
+            "port": int(target.get("port") or 0),
+        }
+    )
+    if len(ABUSE_EVENTS) > ABUSE_AUDIT_MAX_EVENTS * 2:
+        del ABUSE_EVENTS[:-ABUSE_AUDIT_MAX_EVENTS]
+
+
+def process_line(raw: str) -> None:
+    global LAST_LINE_AT
+
+    line = str(raw or "").strip()
+    if " accepted " not in line or "email:" not in line:
+        return
+
+    ts_match = re.search(r"^(?P<ts>\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})(?:\.\d+)?\s+", line)
+    email_match = re.search(r"\bemail:\s*(?P<email>\S+)", line)
+    if not ts_match or not email_match:
+        return
+
+    ts = parse_xray_ts(ts_match.group("ts"))
+    if ts is None:
+        return
+
+    email = email_match.group("email").strip().strip("\"'[](){}<>")
+    if not email:
+        return
+
+    source_ip = extract_source_ip(line)
+    target = extract_target(line)
+    now = time.time()
+    with LOCK:
+        entry = CLIENTS.setdefault(email, {"email": email, "ips": {}, "last_seen": 0.0})
+        entry["last_seen"] = max(float(entry.get("last_seen") or 0.0), ts)
+        if source_ip:
+            ips = entry.setdefault("ips", {})
+            ips[source_ip] = ts
+            if len(ips) > MAX_IPS_PER_USER * 2:
+                for ip, _ in sorted(ips.items(), key=lambda item: float(item[1]))[:-MAX_IPS_PER_USER]:
+                    ips.pop(ip, None)
+        remember_abuse_event(email, ts, source_ip, target)
+        LAST_LINE_AT = now
+
+
+def purge_stale(now: float | None = None) -> None:
+    now = now or time.time()
+    cutoff = now - WINDOW_SECONDS
+    abuse_cutoff = now - ABUSE_AUDIT_WINDOW_SECONDS
+    with LOCK:
+        for email in list(CLIENTS.keys()):
+            entry = CLIENTS.get(email) or {}
+            if float(entry.get("last_seen") or 0.0) < cutoff:
+                CLIENTS.pop(email, None)
+                continue
+            ips = entry.get("ips")
+            if isinstance(ips, dict):
+                for ip, seen in list(ips.items()):
+                    try:
+                        if float(seen) < cutoff:
+                            ips.pop(ip, None)
+                    except Exception:
+                        ips.pop(ip, None)
+        if ABUSE_EVENTS:
+            ABUSE_EVENTS[:] = [
+                item
+                for item in ABUSE_EVENTS
+                if float(item.get("ts") or 0.0) >= abuse_cutoff
+            ][-ABUSE_AUDIT_MAX_EVENTS:]
+
+
+def build_abuse_audit(
+    window_seconds: int | None = None,
+    email_filter: str = "",
+    port_filter: int | None = None,
+    target_filter: str = "",
+) -> dict:
+    now = time.time()
+    window = max(60, min(int(window_seconds or ABUSE_AUDIT_WINDOW_SECONDS), 7 * 86400))
+    cutoff = now - window
+    email_filter = str(email_filter or "").strip()
+    target_filter = normalize_host(target_filter)
+
+    purge_stale(now)
+    with LOCK:
+        events = [
+            dict(item)
+            for item in ABUSE_EVENTS
+            if float(item.get("ts") or 0.0) >= cutoff
+        ]
+
+    by_user: dict[str, dict] = {}
+    matched = 0
+    for item in events:
+        email = str(item.get("email") or "").strip()
+        if not email:
+            continue
+        if email_filter and email != email_filter:
+            continue
+
+        host = str(item.get("host") or "").strip()
+        port = int(item.get("port") or 0)
+        if port_filter is not None and port != port_filter:
+            continue
+        if target_filter and host != target_filter:
+            continue
+
+        matched += 1
+        entry = by_user.setdefault(
+            email,
+            {
+                "email": email,
+                "event_count": 0,
+                "ports": {},
+                "targets": {},
+                "source_ips": {},
+                "last_seen": 0.0,
+            },
+        )
+        entry["event_count"] += 1
+        if port:
+            entry["ports"][str(port)] = int(entry["ports"].get(str(port), 0)) + 1
+        target_key = f"{host}:{port}" if port else host
+        if target_key:
+            entry["targets"][target_key] = int(entry["targets"].get(target_key, 0)) + 1
+        source_ip = str(item.get("source_ip") or "").strip()
+        if source_ip:
+            entry["source_ips"][source_ip] = int(entry["source_ips"].get(source_ip, 0)) + 1
+        entry["last_seen"] = max(float(entry.get("last_seen") or 0.0), float(item.get("ts") or 0.0))
+
+    users = []
+    for entry in by_user.values():
+        ports = sorted(entry.pop("ports").items(), key=lambda item: int(item[1]), reverse=True)
+        targets = sorted(entry.pop("targets").items(), key=lambda item: int(item[1]), reverse=True)
+        source_ips = sorted(entry.pop("source_ips").items(), key=lambda item: int(item[1]), reverse=True)
+        last_seen = float(entry.pop("last_seen") or 0.0)
+        entry.update(
+            {
+                "unique_ports": len(ports),
+                "unique_targets": len(targets),
+                "source_ip_count": len(source_ips),
+                "top_ports": [
+                    {"port": int(port), "count": int(count)}
+                    for port, count in ports[:ABUSE_AUDIT_TOP_LIMIT]
+                    if str(port).isdigit()
+                ],
+                "top_targets": [
+                    {"target": target, "count": int(count)}
+                    for target, count in targets[:ABUSE_AUDIT_TOP_LIMIT]
+                ],
+                "source_ips": [
+                    {"ip": ip, "count": int(count)}
+                    for ip, count in source_ips[:ABUSE_AUDIT_TOP_LIMIT]
+                ],
+                "last_seen_at": utc_iso(last_seen) if last_seen else "",
+                "last_seen_age_seconds": max(0, int(now - last_seen)) if last_seen else -1,
+            }
+        )
+        users.append(entry)
+
+    users.sort(
+        key=lambda item: (
+            int(item.get("unique_ports") or 0),
+            int(item.get("unique_targets") or 0),
+            int(item.get("event_count") or 0),
+        ),
+        reverse=True,
+    )
+    return {
+        "ok": True,
+        "source": "vpnbot_xray_abuse_audit",
+        "is_recent_activity": True,
+        "access_log": str(ACCESS_LOG),
+        "window_seconds": window,
+        "events_kept": len(events),
+        "matched_events": matched,
+        "filters": {
+            "email": email_filter,
+            "port": port_filter,
+            "target": target_filter,
+        },
+        "top_limit": ABUSE_AUDIT_TOP_LIMIT,
+        "users": users[:ABUSE_AUDIT_TOP_LIMIT],
+    }
+
+
+def extract_traffic_totals(payload: dict, *, prefix: str) -> dict:
+    uplink = 0
+    downlink = 0
+    stats = payload.get("stat")
+    if not isinstance(stats, list):
+        return {"traffic_up_bytes": 0, "traffic_down_bytes": 0, "traffic_total_bytes": 0}
+
+    for item in stats:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        if prefix and not name.startswith(prefix):
+            continue
+        try:
+            value = int(item.get("value") or 0)
+        except Exception:
+            value = 0
+        if value <= 0:
+            continue
+        if name.endswith(">>>traffic>>>uplink"):
+            uplink += value
+        elif name.endswith(">>>traffic>>>downlink"):
+            downlink += value
+
+    return {
+        "traffic_up_bytes": int(uplink),
+        "traffic_down_bytes": int(downlink),
+        "traffic_total_bytes": int(uplink + downlink),
+    }
+
+
+def query_xray_stats(pattern: str) -> dict:
+    proc = subprocess.run(
+        [
+            XRAY_BIN,
+            "api",
+            "statsquery",
+            f"--server={XRAY_API_SERVER}",
+            "-pattern",
+            pattern,
+            "-reset=false",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or f"exit={proc.returncode}")[-500:])
+    return json.loads(proc.stdout or "{}")
+
+
+def poll_xray_stats_once() -> None:
+    now = time.time()
+    source = "xray_stats_inbound"
+    payload = query_xray_stats("inbound>>>")
+    totals = extract_traffic_totals(payload, prefix="inbound>>>")
+    if int(totals.get("traffic_total_bytes") or 0) <= 0:
+        source = "xray_stats_user_fallback"
+        payload = query_xray_stats("user>>>")
+        totals = extract_traffic_totals(payload, prefix="user>>>")
+
+    with LOCK:
+        previous_total = int(TRAFFIC.get("traffic_total_bytes") or 0)
+        previous_checked_at = float(TRAFFIC.get("_checked_at_ts") or 0.0)
+        new_total = int(totals.get("traffic_total_bytes") or 0)
+        load_bps = None
+        if previous_checked_at > 0 and new_total >= previous_total:
+            delta_seconds = max(0.001, now - previous_checked_at)
+            if delta_seconds >= max(5.0, STATS_INTERVAL * 0.5):
+                load_bps = int(((new_total - previous_total) * 8) / delta_seconds)
+
+        TRAFFIC.update(
+            {
+                "traffic_source": source,
+                "traffic_up_bytes": int(totals.get("traffic_up_bytes") or 0),
+                "traffic_down_bytes": int(totals.get("traffic_down_bytes") or 0),
+                "traffic_total_bytes": new_total,
+                "load_bps": load_bps,
+                "stats_checked_at": utc_iso(now),
+                "stats_last_error": "",
+                "_checked_at_ts": now,
+            }
+        )
+
+
+def stats_worker() -> None:
+    global LAST_ERROR
+    while True:
+        try:
+            poll_xray_stats_once()
+        except Exception as exc:
+            with LOCK:
+                TRAFFIC["stats_last_error"] = f"{type(exc).__name__}: {exc}"
+                LAST_ERROR = TRAFFIC["stats_last_error"]
+        time.sleep(STATS_INTERVAL)
+
+
+def snapshot(window_seconds: int | None = None) -> dict:
+    now = time.time()
+    window = max(10, min(int(window_seconds or WINDOW_SECONDS), 3600))
+    cutoff = now - window
+    purge_stale(now)
+
+    details: dict[str, dict] = {}
+    with LOCK:
+        raw_items = list(CLIENTS.items())
+        last_line_at = LAST_LINE_AT
+        last_error = LAST_ERROR
+        traffic = dict(TRAFFIC)
+        abuse_events_kept = len(ABUSE_EVENTS)
+        traffic.pop("_checked_at_ts", None)
+
+    for email, entry in raw_items:
+        try:
+            last_seen = float(entry.get("last_seen") or 0.0)
+        except Exception:
+            continue
+        if last_seen < cutoff:
+            continue
+
+        ips_raw = entry.get("ips") if isinstance(entry.get("ips"), dict) else {}
+        ips = [
+            ip
+            for ip, _ in sorted(ips_raw.items(), key=lambda item: float(item[1]), reverse=True)
+            if float(_) >= cutoff
+        ][:MAX_IPS_PER_USER]
+
+        details[email] = {
+            "email": email,
+            "ips": ips,
+            "last_seen": last_seen,
+            "last_seen_at": utc_iso(last_seen),
+            "last_seen_age_seconds": max(0, int(now - last_seen)),
+        }
+
+    users = sorted(details.keys())
+    max_age = max((item["last_seen_age_seconds"] for item in details.values()), default=-1)
+    return {
+        "ok": True,
+        "source": "vpnbot_xray_online_tracker",
+        "is_recent_activity": True,
+        "access_log": str(ACCESS_LOG),
+        "window_seconds": window,
+        "online_count": len(users),
+        "users": users,
+        "details": details,
+        "max_last_seen_age_seconds": max_age,
+        "abuse_audit": {
+            "endpoint": "/abuse",
+            "window_seconds": ABUSE_AUDIT_WINDOW_SECONDS,
+            "events_kept": abuse_events_kept,
+        },
+        **traffic,
+        "tracker": {
+            "bind": f"{BIND_HOST}:{BIND_PORT}",
+            "started_at": STARTED_AT,
+            "last_line_at": utc_iso(last_line_at) if last_line_at else "",
+            "last_line_age_seconds": max(0, int(now - last_line_at)) if last_line_at else -1,
+            "last_error": last_error,
+        },
+    }
+
+
+def read_bootstrap_tail(path: Path) -> int:
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return 0
+    except Exception:
+        return 0
+    read_size = min(size, BOOTSTRAP_BYTES)
+    if read_size <= 0:
+        return size
+    with path.open("rb") as fh:
+        if size > read_size:
+            fh.seek(size - read_size)
+        text = fh.read().decode("utf-8", errors="replace")
+    for line in text.splitlines():
+        process_line(line)
+    return size
+
+
+def tail_access_log() -> None:
+    global LAST_ERROR
+
+    fh = None
+    inode = None
+    position = 0
+    while True:
+        try:
+            stat = ACCESS_LOG.stat()
+            current_inode = (stat.st_dev, stat.st_ino)
+            if fh is None or inode != current_inode or stat.st_size < position:
+                if fh is not None:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+                ACCESS_LOG.parent.mkdir(parents=True, exist_ok=True)
+                position = read_bootstrap_tail(ACCESS_LOG)
+                fh = ACCESS_LOG.open("r", encoding="utf-8", errors="replace")
+                fh.seek(position)
+                inode = current_inode
+
+            line = fh.readline()
+            if line:
+                process_line(line)
+                position = fh.tell()
+                continue
+
+            purge_stale()
+            time.sleep(POLL_INTERVAL)
+        except Exception as exc:
+            with LOCK:
+                LAST_ERROR = f"{type(exc).__name__}: {exc}"
+            try:
+                if fh is not None:
+                    fh.close()
+            except Exception:
+                pass
+            fh = None
+            inode = None
+            position = 0
+            time.sleep(1.0)
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "vpnbot-xray-online-tracker/1.0"
+
+    def log_message(self, fmt: str, *args) -> None:
+        return
+
+    def _send_json(self, status: int, payload: dict) -> None:
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path in {"/health", "/ready"}:
+            self._send_json(200, {"ok": True, "source": "vpnbot_xray_online_tracker", "started_at": STARTED_AT})
+            return
+        if parsed.path in {"/", "/online", "/stats"}:
+            query = parse_qs(parsed.query)
+            window = None
+            if "window" in query and query["window"]:
+                try:
+                    window = int(query["window"][0])
+                except Exception:
+                    window = None
+            self._send_json(200, snapshot(window))
+            return
+        if parsed.path == "/abuse":
+            query = parse_qs(parsed.query)
+            window = None
+            port = None
+            if "window" in query and query["window"]:
+                try:
+                    window = int(query["window"][0])
+                except Exception:
+                    window = None
+            if "port" in query and query["port"]:
+                try:
+                    port = int(query["port"][0])
+                except Exception:
+                    port = None
+            email = query.get("email", [""])[0]
+            target = query.get("target", [""])[0]
+            self._send_json(200, build_abuse_audit(window, email, port, target))
+            return
+        self._send_json(404, {"ok": False, "error": "not_found"})
+
+
+STARTED_AT = utc_iso()
+
+
+def main() -> None:
+    worker = threading.Thread(target=tail_access_log, name="xray-access-log-tail", daemon=True)
+    worker.start()
+    stats = threading.Thread(target=stats_worker, name="xray-stats-poll", daemon=True)
+    stats.start()
+    server = ThreadingHTTPServer((BIND_HOST, BIND_PORT), Handler)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+PY
+    chmod 755 "${XRAY_ONLINE_TRACKER_SCRIPT}"
+
+    cat > "${XRAY_ONLINE_TRACKER_SERVICE_FILE}" <<EOF
+[Unit]
+Description=VPnBot Xray-core online tracker
+After=network-online.target ${XRAY_CORE_SERVICE_NAME}
+Wants=network-online.target ${XRAY_CORE_SERVICE_NAME}
+
+[Service]
+Type=simple
+User=root
+Environment=XRAY_ONLINE_ACCESS_LOG=${XRAY_CORE_LOG_DIR}/access.log
+Environment=XRAY_ONLINE_BIND_HOST=${XRAY_ONLINE_TRACKER_BIND}
+Environment=XRAY_ONLINE_BIND_PORT=${XRAY_ONLINE_TRACKER_PORT}
+Environment=XRAY_ONLINE_WINDOW_SECONDS=${XRAY_ONLINE_TRACKER_WINDOW_SECONDS}
+Environment=XRAY_ONLINE_BOOTSTRAP_BYTES=${XRAY_ONLINE_TRACKER_BOOTSTRAP_BYTES}
+Environment=XRAY_ONLINE_STATS_INTERVAL_SECONDS=${XRAY_ONLINE_TRACKER_STATS_INTERVAL_SECONDS}
+Environment=XRAY_ONLINE_XRAY_BIN=${XRAY_CORE_BIN}
+Environment=XRAY_ONLINE_XRAY_API_SERVER=${XRAY_CORE_API_SERVER}
+Environment=XRAY_ABUSE_AUDIT_WINDOW_SECONDS=${XRAY_ABUSE_AUDIT_WINDOW_SECONDS}
+Environment=XRAY_ABUSE_AUDIT_MAX_EVENTS=${XRAY_ABUSE_AUDIT_MAX_EVENTS}
+Environment=XRAY_ABUSE_AUDIT_TOP_LIMIT=${XRAY_ABUSE_AUDIT_TOP_LIMIT}
+ExecStart=${XRAY_ONLINE_TRACKER_SCRIPT}
+Restart=always
+RestartSec=2s
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now "${XRAY_ONLINE_TRACKER_SERVICE_NAME}"
+    if ! systemctl is-active --quiet "${XRAY_ONLINE_TRACKER_SERVICE_NAME}"; then
+        journalctl -u "${XRAY_ONLINE_TRACKER_SERVICE_NAME}" -n 100 --no-pager || true
+        err "Xray-core online tracker service failed to reach active state: ${XRAY_ONLINE_TRACKER_SERVICE_NAME}"
+        exit 1
+    fi
+
+    log "Installed Xray-core online tracker service: ${XRAY_ONLINE_TRACKER_SERVICE_NAME}"
+    info "Xray-core online tracker API: ${XRAY_ONLINE_TRACKER_URL}"
+    info "Xray-core abuse audit API: ${XRAY_ABUSE_AUDIT_URL}"
+}
+
+
+install_standalone_xray_core() {
+    local archive_name tmp_dir zip_path extract_dir
+    local asset_url="" release_tag=""
+    local release_meta=()
+
+    archive_name="$(get_xray_core_archive_name)"
+    mapfile -t release_meta < <(resolve_xray_core_release_asset "${archive_name}")
+    asset_url="${release_meta[0]:-}"
+    release_tag="${release_meta[1]:-}"
+
+    if [[ -z "${asset_url}" ]]; then
+        err "Failed to resolve download URL for standalone Xray-core archive ${archive_name}"
+        exit 1
+    fi
+
+    tmp_dir="$(mktemp -d)"
+    zip_path="${tmp_dir}/${archive_name}"
+    extract_dir="${tmp_dir}/extract"
+    mkdir -p "${extract_dir}"
+
+    curl -fsSL --retry 3 --connect-timeout 10 -o "${zip_path}" "${asset_url}"
+    python3 - "${zip_path}" "${extract_dir}" <<'PY'
+import sys
+import zipfile
+
+archive_path = sys.argv[1]
+extract_dir = sys.argv[2]
+
+with zipfile.ZipFile(archive_path) as zf:
+    zf.extractall(extract_dir)
+PY
+
+    write_xray_core_base_configs
+    write_xray_logrotate_config
+
+    install -m 755 "${extract_dir}/xray" "${XRAY_CORE_BIN}"
+    if [[ -f "${extract_dir}/geoip.dat" ]]; then
+        install -m 644 "${extract_dir}/geoip.dat" "${XRAY_CORE_SHARE_DIR}/geoip.dat"
+    fi
+    if [[ -f "${extract_dir}/geosite.dat" ]]; then
+        install -m 644 "${extract_dir}/geosite.dat" "${XRAY_CORE_SHARE_DIR}/geosite.dat"
+    fi
+
+    write_xray_core_smoke_inbound_if_missing
+    write_xray_core_service_unit
+
+    XRAY_LOCATION_ASSET="${XRAY_CORE_SHARE_DIR}" \
+    XRAY_LOCATION_CONFDIR="${XRAY_CORE_CONFIG_DIR}" \
+    "${XRAY_CORE_BIN}" run -confdir "${XRAY_CORE_CONFIG_DIR}" -dump >/dev/null
+
+    systemctl daemon-reload
+    systemctl enable --now "${XRAY_CORE_SERVICE_NAME}"
+    if ! systemctl is-active --quiet "${XRAY_CORE_SERVICE_NAME}"; then
+        journalctl -u "${XRAY_CORE_SERVICE_NAME}" -n 100 --no-pager || true
+        err "Standalone Xray-core service failed to reach active state: ${XRAY_CORE_SERVICE_NAME}"
+        exit 1
+    fi
+
+    XRAY_CORE_INSTALLED_VERSION="${release_tag}"
+    if [[ -z "${XRAY_CORE_PUBLIC_ENDPOINT}" ]]; then
+        XRAY_CORE_PUBLIC_ENDPOINT="$(get_effective_public_endpoint_host)"
+    fi
+
+    rm -rf "${tmp_dir}"
+    log "Installed official Xray-core ${release_tag:-unknown} into ${XRAY_CORE_ROOT}"
+    info "Standalone Xray service: ${XRAY_CORE_SERVICE_NAME}"
+}
+
+
+configure_xray_minimal_logging() {
+    mkdir -p "${XUI_XRAY_LOG_DIR}"
+    touch "${XUI_XRAY_ACCESS_LOG}" "${XUI_XRAY_ERROR_LOG}"
+    chmod 640 "${XUI_XRAY_ACCESS_LOG}" "${XUI_XRAY_ERROR_LOG}" 2>/dev/null || true
+
+    local resolved_config_path=""
+    local attempt=""
+    for attempt in $(seq 1 20); do
+        if [[ -f "${XUI_BIN_CONFIG}" ]]; then
+            resolved_config_path="${XUI_BIN_CONFIG}"
+            break
+        fi
+        for candidate in \
+            "/usr/local/x-ui/bin/config.json" \
+            "/etc/x-ui/config.json" \
+            "/etc/x-ui/xray/config.json"
+        do
+            if [[ -f "${candidate}" ]]; then
+                resolved_config_path="${candidate}"
+                break 2
+            fi
+        done
+        sleep 1
+    done
+
+    if [[ -z "${resolved_config_path}" ]]; then
+        err "Xray config not found after waiting: ${XUI_BIN_CONFIG}"
+        return 1
+    fi
+
+    if [[ "${resolved_config_path}" != "${XUI_BIN_CONFIG}" ]]; then
+        warn "Using detected Xray config path instead of default: ${resolved_config_path}"
+    fi
+
+    XUI_BIN_CONFIG_PATH="${resolved_config_path}" \
+    XUI_XRAY_ACCESS_LOG_PATH="${XUI_XRAY_ACCESS_LOG}" \
+    XUI_XRAY_ERROR_LOG_PATH="${XUI_XRAY_ERROR_LOG}" \
+    XUI_XRAY_LOGLEVEL_VALUE="${XUI_XRAY_LOGLEVEL}" \
+    XUI_XRAY_DNS_LOG_VALUE="${XUI_XRAY_DNS_LOG}" \
+    python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+config_path = Path(os.environ["XUI_BIN_CONFIG_PATH"])
+access_log = str(os.environ["XUI_XRAY_ACCESS_LOG_PATH"]).strip()
+error_log = str(os.environ["XUI_XRAY_ERROR_LOG_PATH"]).strip()
+loglevel = str(os.environ["XUI_XRAY_LOGLEVEL_VALUE"]).strip() or "warning"
+dns_log_raw = str(os.environ["XUI_XRAY_DNS_LOG_VALUE"]).strip().lower()
+dns_log = dns_log_raw in {"1", "true", "yes", "on"}
+
+if not config_path.exists():
+    raise SystemExit(f"Xray config not found: {config_path}")
+
+payload = json.loads(config_path.read_text(encoding="utf-8"))
+log_cfg = payload.get("log")
+if not isinstance(log_cfg, dict):
+    log_cfg = {}
+
+desired = {
+    "access": access_log,
+    "error": error_log,
+    "loglevel": loglevel,
+    "dnsLog": dns_log,
+}
+
+changed = False
+for key, value in desired.items():
+    if log_cfg.get(key) != value:
+        log_cfg[key] = value
+        changed = True
+
+payload["log"] = log_cfg
+
+if changed:
+    config_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+PY
+
+    systemctl restart x-ui
+    log "Configured minimal Xray logging for client IP tracking"
+    info "Xray access log: ${XUI_XRAY_ACCESS_LOG}"
+    info "Xray error log: ${XUI_XRAY_ERROR_LOG}"
+    info "Xray loglevel: ${XUI_XRAY_LOGLEVEL}; dnsLog=${XUI_XRAY_DNS_LOG}"
+}
+
+
+panel_direct_access_local_only() {
+    iptables -C INPUT -p tcp --dport "${XUI_PANEL_PORT}" -s 127.0.0.1 -j ACCEPT 2>/dev/null \
+        || iptables -I INPUT -p tcp --dport "${XUI_PANEL_PORT}" -s 127.0.0.1 -j ACCEPT
+    iptables -C INPUT -p tcp --dport "${XUI_PANEL_PORT}" -j DROP 2>/dev/null \
+        || iptables -A INPUT -p tcp --dport "${XUI_PANEL_PORT}" -j DROP
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save 2>/dev/null || true
+    fi
+    log "Direct external access to panel port ${XUI_PANEL_PORT} blocked; localhost is allowed"
+}
+
+
+ensure_nginx_layout() {
+    local stream_root_file="${NGINX_STREAM_ROOT_FILE}"
+    local legacy_stream_root_file="/etc/nginx/stream_vpnbot_mux.conf"
+
+    mkdir -p /etc/nginx/ssl/vpnbot
+    mkdir -p "${NGINX_HTTP_LOCATION_DIR}"
+    mkdir -p "${NGINX_STREAM_INCLUDE_DIR}"
+    rm -f /etc/nginx/sites-enabled/default || true
+
+    if grep -q 'stream_vpnbot_mux.conf' /etc/nginx/nginx.conf; then
+        stream_root_file="${legacy_stream_root_file}"
+        sed -i '\|include /etc/nginx/vpnbot-stream-root.conf;|d' /etc/nginx/nginx.conf
+    elif ! grep -q 'vpnbot-stream-root.conf' /etc/nginx/nginx.conf; then
+        printf '\ninclude %s;\n' "${stream_root_file}" >> /etc/nginx/nginx.conf
+    fi
+
+    if [[ -f "${stream_root_file}" ]]; then
+        cp "${stream_root_file}" "${stream_root_file}.bak.$(date +%s)" 2>/dev/null || true
+    fi
+
+    cat > "${stream_root_file}" <<EOF
+stream {
+    include ${NGINX_STREAM_INCLUDE_DIR}/*.conf;
+}
+EOF
+}
+
+
+create_self_signed_cert() {
+    local cert_domains=()
+    local host=""
+    for host in "${PANEL_DOMAIN}" "${SHARED_HTTP_DOMAIN}" "${APP_DOMAIN}" "${PUBLIC_DOMAIN}"; do
+        host="$(trim_dot_domain "${host}")"
+        if [[ -z "${host}" ]]; then
+            continue
+        fi
+        if [[ " ${cert_domains[*]} " == *" ${host} "* ]]; then
+            continue
+        fi
+        cert_domains+=("${host}")
+    done
+
+    local cert_name="${SELF_SIGNED_CERT_NAME:-${PANEL_DOMAIN:-${APP_DOMAIN:-${PUBLIC_DOMAIN:-www.amd.com}}}}"
+    local primary_ip
+    primary_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    local openssl_cfg
+    openssl_cfg="$(mktemp)"
+    cat > "${openssl_cfg}" <<EOF
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+x509_extensions = v3_req
+distinguished_name = dn
+
+[dn]
+CN = ${cert_name}
+
+[v3_req]
+subjectAltName = @alt_names
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+
+[alt_names]
+DNS.1 = ${cert_name}
+DNS.2 = localhost
+IP.1 = 127.0.0.1
+EOF
+    local dns_index=3
+    for host in "${cert_domains[@]}"; do
+        if [[ "${host}" == "${cert_name}" ]]; then
+            continue
+        fi
+        echo "DNS.${dns_index} = ${host}" >> "${openssl_cfg}"
+        dns_index=$((dns_index + 1))
+    done
+    if [[ -n "${primary_ip}" ]]; then
+        echo "IP.2 = ${primary_ip}" >> "${openssl_cfg}"
+    fi
+    openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
+        -keyout "${NGINX_SSL_KEY}" \
+        -out "${NGINX_SSL_CERT}" \
+        -config "${openssl_cfg}" >/dev/null 2>&1
+    rm -f "${openssl_cfg}"
+    chmod 600 "${NGINX_SSL_KEY}"
+    chmod 644 "${NGINX_SSL_CERT}"
+    warn "Self-signed certificate created at ${NGINX_SSL_CERT}"
+}
+
+
+ensure_bootstrap_tls_cert() {
+    if [[ -s "${NGINX_SSL_CERT}" && -s "${NGINX_SSL_KEY}" ]]; then
+        return 0
+    fi
+    create_self_signed_cert
+}
+
+
+issue_or_create_cert() {
+    local cert_domains=()
+    local host=""
+    for host in "${PANEL_DOMAIN}" "${SHARED_HTTP_DOMAIN}" "${APP_DOMAIN}" "${PUBLIC_DOMAIN}"; do
+        host="$(trim_dot_domain "${host}")"
+        if [[ -z "${host}" ]]; then
+            continue
+        fi
+        if [[ " ${cert_domains[*]} " == *" ${host} "* ]]; then
+            continue
+        fi
+        cert_domains+=("${host}")
+    done
+
+    if [[ "${#cert_domains[@]}" -gt 0 && "${ENABLE_CERTBOT}" == "1" ]]; then
+        local primary_domain="${cert_domains[0]}"
+        local certbot_args=()
+        for host in "${cert_domains[@]}"; do
+            certbot_args+=("-d" "${host}")
+        done
+        # We install the nginx server block ourselves. Certbot only needs to solve
+        # the challenge and store the certificate; using `certonly` avoids
+        # "Could not automatically find a matching server block" on fresh hosts.
+        if certbot certonly --nginx "${certbot_args[@]}" -m "${LETSENCRYPT_EMAIL:-admin@${primary_domain}}" --agree-tos --non-interactive; then
+            mkdir -p /etc/nginx/ssl/vpnbot
+            rm -f /etc/nginx/ssl/vpnbot/fullchain.pem /etc/nginx/ssl/vpnbot/privkey.pem
+            ln -s "/etc/letsencrypt/live/${primary_domain}/fullchain.pem" /etc/nginx/ssl/vpnbot/fullchain.pem
+            ln -s "/etc/letsencrypt/live/${primary_domain}/privkey.pem" /etc/nginx/ssl/vpnbot/privkey.pem
+            NGINX_SSL_CERT="/etc/nginx/ssl/vpnbot/fullchain.pem"
+            NGINX_SSL_KEY="/etc/nginx/ssl/vpnbot/privkey.pem"
+            log "Let's Encrypt certificate issued for: ${cert_domains[*]}"
+            return 0
+        fi
+        warn "Let's Encrypt issuance failed; falling back to self-signed certificate"
+    fi
+
+    create_self_signed_cert
+}
+
+
+write_nginx_http_site() {
+    local panel_location_block=""
+    if is_3xui_backend; then
+        panel_location_block="$(cat <<EOF
+    location ${NGINX_PANEL_LOCATION} {
+        proxy_pass http://127.0.0.1:${XUI_PANEL_PORT};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+EOF
+)"
+    fi
+
+    cat > "${NGINX_HTTP_SITE_FILE}" <<EOF
+server {
+    listen 80;
+    server_name ${NGINX_SERVER_NAME};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 127.0.0.1:${HTTP_FRONTEND_LOCAL_PORT} ssl http2;
+    server_name ${NGINX_SERVER_NAME};
+
+    ssl_certificate ${NGINX_SSL_CERT};
+    ssl_certificate_key ${NGINX_SSL_KEY};
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:10m;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    client_max_body_size 50m;
+
+${panel_location_block}    # Dynamic shared HTTP routes are generated here.
+
+    include ${NGINX_HTTP_LOCATION_DIR}/*.conf;
+
+    location / {
+        default_type text/html;
+        return 200 '<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Service Portal</title>
+  <style>
+    body{margin:0;font-family:Verdana,Arial,sans-serif;background:#f5f7fb;color:#1f2937}
+    .wrap{max-width:760px;margin:12vh auto;padding:40px;background:white;border-radius:18px;box-shadow:0 12px 40px rgba(31,41,55,.12)}
+    h1{margin:0 0 14px;font-size:32px;font-weight:700}
+    p{font-size:16px;line-height:1.55;color:#4b5563}
+    .muted{margin-top:28px;font-size:13px;color:#9ca3af}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <h1>Service Portal</h1>
+    <p>Сайт временно обслуживается. Пожалуйста, повторите запрос позже.</p>
+    <p class="muted">Request ID: vpnbot-edge</p>
+  </main>
+</body>
+</html>';
+    }
+}
+EOF
+
+    ln -sf "${NGINX_HTTP_SITE_FILE}" /etc/nginx/sites-enabled/vpnbot_vray_http.conf
+}
+
+
+write_installer_state() {
+    local panel_base_url="http://127.0.0.1:${XUI_PANEL_PORT}/${XUI_PANEL_WEBBASEPATH}"
+    umask 077
+    PANEL_PORT="${XUI_PANEL_PORT}" \
+    PANEL_WEB_BASE_PATH="${XUI_PANEL_WEBBASEPATH}" \
+    PANEL_USERNAME="${XUI_PANEL_USERNAME}" \
+    PANEL_PASSWORD="${XUI_PANEL_PASSWORD}" \
+    PANEL_BASE_URL="${panel_base_url}" \
+    PANEL_DOMAIN_VALUE="${PANEL_DOMAIN}" \
+    APP_DOMAIN_VALUE="${APP_DOMAIN}" \
+    MT_DOMAIN_VALUE="${MT_DOMAIN}" \
+    SHARED_HTTP_DOMAIN_VALUE="${SHARED_HTTP_DOMAIN}" \
+    PUBLIC_DOMAIN_VALUE="${PUBLIC_DOMAIN}" \
+    DDNS_PROVIDER_VALUE="${DDNS_PROVIDER}" \
+    DDNS_ZONE_VALUE="${DDNS_ZONE}" \
+    DDNS_HOST_LABEL_VALUE="${DDNS_HOST_LABEL}" \
+    DDNS_LABEL_SUFFIX_VALUE="${DDNS_LABEL_SUFFIX}" \
+    VPNBOT_SERVER_ID_VALUE="${VPNBOT_SERVER_ID}" \
+    SYNC_SCRIPT_VALUE="${XUI_SYNC_SCRIPT}" \
+    SSL_CERT_VALUE="${NGINX_SSL_CERT}" \
+    SSL_KEY_VALUE="${NGINX_SSL_KEY}" \
+    HTTP_FRONTEND_LOCAL_PORT_VALUE="${HTTP_FRONTEND_LOCAL_PORT}" \
+    INSTALLER_STATE_FILE="${XUI_INSTALLER_STATE_FILE}" \
+    python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = {
+    "panel_port": int(os.environ["PANEL_PORT"]),
+    "panel_web_base_path": os.environ["PANEL_WEB_BASE_PATH"],
+    "panel_username": os.environ["PANEL_USERNAME"],
+    "panel_password": os.environ["PANEL_PASSWORD"],
+    "panel_base_url": os.environ["PANEL_BASE_URL"],
+    "panel_domain": os.environ["PANEL_DOMAIN_VALUE"],
+    "app_domain": os.environ["APP_DOMAIN_VALUE"],
+    "mt_domain": os.environ["MT_DOMAIN_VALUE"],
+    "shared_http_domain": os.environ["SHARED_HTTP_DOMAIN_VALUE"],
+    "public_domain": os.environ["PUBLIC_DOMAIN_VALUE"],
+    "ddns_provider": os.environ["DDNS_PROVIDER_VALUE"],
+    "ddns_zone": os.environ["DDNS_ZONE_VALUE"],
+    "ddns_host_label": os.environ["DDNS_HOST_LABEL_VALUE"],
+    "ddns_label_suffix": os.environ["DDNS_LABEL_SUFFIX_VALUE"],
+    "vpnbot_server_id": os.environ["VPNBOT_SERVER_ID_VALUE"],
+    "sync_script": os.environ["SYNC_SCRIPT_VALUE"],
+    "ssl_cert": os.environ["SSL_CERT_VALUE"],
+    "ssl_key": os.environ["SSL_KEY_VALUE"],
+    "http_frontend_local_port": int(os.environ["HTTP_FRONTEND_LOCAL_PORT_VALUE"]),
+}
+Path(os.environ["INSTALLER_STATE_FILE"]).write_text(
+    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+    chmod 600 "${XUI_INSTALLER_STATE_FILE}"
+}
+
+
+write_rollout_bundle() {
+    local panel_host public_dns_name server_public_ip panel_api_url mt_suggested_domain effective_mt_domain
+    panel_host="${PANEL_DOMAIN:-${SHARED_HTTP_DOMAIN:-${APP_DOMAIN:-${PUBLIC_DOMAIN:-}}}}"
+    public_dns_name="${SHARED_HTTP_DOMAIN:-${APP_DOMAIN:-${PUBLIC_DOMAIN:-}}}"
+    server_public_ip="$(get_primary_ipv4)"
+    if [[ -n "${panel_host}" ]]; then
+        panel_api_url="https://${panel_host}${NGINX_PANEL_LOCATION%/}"
+    else
+        panel_api_url=""
+    fi
+
+    if [[ "${public_dns_name}" == app.* ]]; then
+        mt_suggested_domain="mt.${public_dns_name#app.}"
+    elif [[ "${panel_host}" == panel.* ]]; then
+        mt_suggested_domain="mt.${panel_host#panel.}"
+    else
+        mt_suggested_domain=""
+    fi
+    effective_mt_domain="${MT_DOMAIN:-${mt_suggested_domain}}"
+
+    umask 077
+    PANEL_DOMAIN_VALUE="${panel_host}" \
+    APP_DOMAIN_VALUE="${public_dns_name}" \
+    MT_DOMAIN_VALUE="${effective_mt_domain}" \
+    SHARED_HTTP_DOMAIN_VALUE="${SHARED_HTTP_DOMAIN}" \
+    PUBLIC_DOMAIN_VALUE="${PUBLIC_DOMAIN}" \
+    MT_SUGGESTED_DOMAIN_VALUE="${mt_suggested_domain}" \
+    PANEL_API_URL_VALUE="${panel_api_url}" \
+    PUBLIC_IP_VALUE="${server_public_ip}" \
+    XUI_PANEL_PORT_VALUE="${XUI_PANEL_PORT}" \
+    XUI_PANEL_WEBBASEPATH_VALUE="${XUI_PANEL_WEBBASEPATH}" \
+    ROLLOUT_BUNDLE_FILE="${XUI_ROLLOUT_BUNDLE_FILE}" \
+    python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = {
+    "domain_roles": {
+        "panel_domain": str(os.environ.get("PANEL_DOMAIN_VALUE", "")).strip(),
+        "app_domain": str(os.environ.get("APP_DOMAIN_VALUE", "")).strip(),
+        "mt_domain": str(os.environ.get("MT_DOMAIN_VALUE", "")).strip(),
+        "shared_http_domain": str(os.environ.get("SHARED_HTTP_DOMAIN_VALUE", "")).strip(),
+        "public_domain_legacy_alias": str(os.environ.get("PUBLIC_DOMAIN_VALUE", "")).strip(),
+        "mt_suggested_domain": str(os.environ.get("MT_SUGGESTED_DOMAIN_VALUE", "")).strip(),
+    },
+    "panel": {
+        "api_url": str(os.environ.get("PANEL_API_URL_VALUE", "")).strip(),
+        "api_host_suggested": str(os.environ.get("PUBLIC_IP_VALUE", "")).strip(),
+        "backend_port": int(os.environ.get("XUI_PANEL_PORT_VALUE", "2053") or 2053),
+        "web_base_path": str(os.environ.get("XUI_PANEL_WEBBASEPATH_VALUE", "")).strip(),
+    },
+    "env_examples": {
+        "install_vray": {
+            "APP_DOMAIN": str(os.environ.get("APP_DOMAIN_VALUE", "")).strip(),
+            "PANEL_DOMAIN": str(os.environ.get("PANEL_DOMAIN_VALUE", "")).strip(),
+        },
+        "install_mtproxy": {
+            "MTPROXY_TLS_DOMAIN": str(os.environ.get("MT_DOMAIN_VALUE", "")).strip(),
+        },
+    },
+    "rules": [
+        "panel_domain is for 3x-ui panel and bot api_url",
+        "app_domain is the user-facing VLESS/shared HTTP domain",
+        "mt_suggested_domain is the recommended exact hostname for MTProxy ee",
+        "do not reuse the exact same hostname for panel and MTProxy ee on one shared external port",
+        "for bot runtime, prefer api_host_suggested as api_host when you want panel API to avoid domain/SNI conflicts",
+    ],
+}
+
+Path(os.environ["ROLLOUT_BUNDLE_FILE"]).write_text(
+    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+    chmod 600 "${XUI_ROLLOUT_BUNDLE_FILE}"
+}
+
+
+write_xray_core_installer_state() {
+    umask 077
+    XRAY_CORE_ROOT_VALUE="${XRAY_CORE_ROOT}" \
+    XRAY_CORE_BIN_VALUE="${XRAY_CORE_BIN}" \
+    XRAY_CORE_CONFIG_DIR_VALUE="${XRAY_CORE_CONFIG_DIR}" \
+    XRAY_CORE_SHARE_DIR_VALUE="${XRAY_CORE_SHARE_DIR}" \
+    XRAY_CORE_LOG_DIR_VALUE="${XRAY_CORE_LOG_DIR}" \
+    XRAY_CORE_MANAGED_INBOUNDS_FILE_VALUE="${XRAY_CORE_MANAGED_INBOUNDS_FILE}" \
+    XRAY_CORE_SERVICE_NAME_VALUE="${XRAY_CORE_SERVICE_NAME}" \
+    XRAY_CORE_API_SERVER_VALUE="${XRAY_CORE_API_SERVER}" \
+    XRAY_CTL_SCRIPT_VALUE="${XRAY_CTL_SCRIPT}" \
+    XRAY_ONLINE_TRACKER_SERVICE_NAME_VALUE="${XRAY_ONLINE_TRACKER_SERVICE_NAME}" \
+    XRAY_ONLINE_TRACKER_URL_VALUE="${XRAY_ONLINE_TRACKER_URL}" \
+    XRAY_ONLINE_TRACKER_WINDOW_SECONDS_VALUE="${XRAY_ONLINE_TRACKER_WINDOW_SECONDS}" \
+    XRAY_ABUSE_AUDIT_URL_VALUE="${XRAY_ABUSE_AUDIT_URL}" \
+    XRAY_ABUSE_AUDIT_WINDOW_SECONDS_VALUE="${XRAY_ABUSE_AUDIT_WINDOW_SECONDS}" \
+    XRAY_CORE_VERSION_VALUE="${XRAY_CORE_INSTALLED_VERSION}" \
+    XRAY_CORE_PUBLIC_ENDPOINT_VALUE="${XRAY_CORE_PUBLIC_ENDPOINT}" \
+    APP_DOMAIN_VALUE="${APP_DOMAIN}" \
+    PUBLIC_DOMAIN_VALUE="${PUBLIC_DOMAIN}" \
+    SHARED_HTTP_DOMAIN_VALUE="${SHARED_HTTP_DOMAIN}" \
+    DDNS_PROVIDER_VALUE="${DDNS_PROVIDER}" \
+    DDNS_ZONE_VALUE="${DDNS_ZONE}" \
+    DDNS_HOST_LABEL_VALUE="${DDNS_HOST_LABEL}" \
+    XRAY_SYNC_SCRIPT_VALUE="${XRAY_SYNC_SCRIPT}" \
+    SSL_CERT_VALUE="${NGINX_SSL_CERT}" \
+    SSL_KEY_VALUE="${NGINX_SSL_KEY}" \
+    HTTP_FRONTEND_LOCAL_PORT_VALUE="${HTTP_FRONTEND_LOCAL_PORT}" \
+    XRAY_CORE_SMOKE_ENABLE_VALUE="${XRAY_CORE_SMOKE_ENABLE}" \
+    XRAY_CORE_SMOKE_PORT_VALUE="${XRAY_CORE_SMOKE_PORT_EFFECTIVE}" \
+    XRAY_CORE_SMOKE_DOMAIN_VALUE="${XRAY_CORE_SMOKE_DOMAIN}" \
+    XRAY_CORE_SMOKE_UUID_VALUE="${XRAY_CORE_SMOKE_UUID:-}" \
+    XRAY_CORE_SMOKE_PUBLIC_KEY_VALUE="${XRAY_CORE_SMOKE_PUBLIC_KEY}" \
+    XRAY_CORE_SMOKE_SHORT_ID_VALUE="${XRAY_CORE_SMOKE_SHORT_ID}" \
+    XRAY_CORE_SMOKE_LINK_VALUE="${XRAY_CORE_SMOKE_LINK}" \
+    INSTALLER_STATE_FILE="${XRAY_CORE_INSTALLER_STATE_FILE}" \
+    python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+
+def parse_bool(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+payload = {
+    "backend_mode": "xray-core",
+    "xray_root": os.environ["XRAY_CORE_ROOT_VALUE"],
+    "xray_bin": os.environ["XRAY_CORE_BIN_VALUE"],
+    "xray_confdir": os.environ["XRAY_CORE_CONFIG_DIR_VALUE"],
+    "xray_share_dir": os.environ["XRAY_CORE_SHARE_DIR_VALUE"],
+    "xray_log_dir": os.environ["XRAY_CORE_LOG_DIR_VALUE"],
+    "managed_inbounds_file": os.environ["XRAY_CORE_MANAGED_INBOUNDS_FILE_VALUE"],
+    "service_name": os.environ["XRAY_CORE_SERVICE_NAME_VALUE"],
+    "api_server": os.environ["XRAY_CORE_API_SERVER_VALUE"],
+    "xray_ctl_script": os.environ["XRAY_CTL_SCRIPT_VALUE"],
+    "online_tracker": {
+        "service_name": os.environ["XRAY_ONLINE_TRACKER_SERVICE_NAME_VALUE"],
+        "api_url": os.environ["XRAY_ONLINE_TRACKER_URL_VALUE"],
+        "window_seconds": int(os.environ["XRAY_ONLINE_TRACKER_WINDOW_SECONDS_VALUE"]),
+        "abuse_audit_api_url": os.environ["XRAY_ABUSE_AUDIT_URL_VALUE"],
+        "abuse_audit_window_seconds": int(os.environ["XRAY_ABUSE_AUDIT_WINDOW_SECONDS_VALUE"]),
+    },
+    "xray_version": os.environ["XRAY_CORE_VERSION_VALUE"],
+    "public_endpoint": os.environ["XRAY_CORE_PUBLIC_ENDPOINT_VALUE"],
+    "app_domain": os.environ["APP_DOMAIN_VALUE"],
+    "public_domain": os.environ["PUBLIC_DOMAIN_VALUE"],
+    "shared_http_domain": os.environ["SHARED_HTTP_DOMAIN_VALUE"],
+    "ddns_provider": os.environ["DDNS_PROVIDER_VALUE"],
+    "ddns_zone": os.environ["DDNS_ZONE_VALUE"],
+    "ddns_host_label": os.environ["DDNS_HOST_LABEL_VALUE"],
+    "sync_script": os.environ["XRAY_SYNC_SCRIPT_VALUE"],
+    "ssl_cert": os.environ["SSL_CERT_VALUE"],
+    "ssl_key": os.environ["SSL_KEY_VALUE"],
+    "http_frontend_local_port": int(os.environ["HTTP_FRONTEND_LOCAL_PORT_VALUE"]),
+    "smoke_profile": {
+        "enabled": parse_bool(os.environ.get("XRAY_CORE_SMOKE_ENABLE_VALUE")),
+        "port": int(os.environ["XRAY_CORE_SMOKE_PORT_VALUE"]) if os.environ.get("XRAY_CORE_SMOKE_PORT_VALUE") else None,
+        "reality_target": os.environ["XRAY_CORE_SMOKE_DOMAIN_VALUE"],
+        "uuid": os.environ["XRAY_CORE_SMOKE_UUID_VALUE"],
+        "public_key": os.environ["XRAY_CORE_SMOKE_PUBLIC_KEY_VALUE"],
+        "short_id": os.environ["XRAY_CORE_SMOKE_SHORT_ID_VALUE"],
+        "link": os.environ["XRAY_CORE_SMOKE_LINK_VALUE"],
+    },
+}
+
+Path(os.environ["INSTALLER_STATE_FILE"]).write_text(
+    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+    chmod 600 "${XRAY_CORE_INSTALLER_STATE_FILE}"
+}
+
+
+write_xray_core_rollout_bundle() {
+    umask 077
+    APP_DOMAIN_VALUE="${APP_DOMAIN}" \
+    PUBLIC_DOMAIN_VALUE="${PUBLIC_DOMAIN}" \
+    SHARED_HTTP_DOMAIN_VALUE="${SHARED_HTTP_DOMAIN}" \
+    XRAY_CORE_PUBLIC_ENDPOINT_VALUE="${XRAY_CORE_PUBLIC_ENDPOINT}" \
+    XRAY_CORE_ROOT_VALUE="${XRAY_CORE_ROOT}" \
+    XRAY_CORE_CONFIG_DIR_VALUE="${XRAY_CORE_CONFIG_DIR}" \
+    XRAY_CORE_MANAGED_INBOUNDS_FILE_VALUE="${XRAY_CORE_MANAGED_INBOUNDS_FILE}" \
+    XRAY_CORE_SERVICE_NAME_VALUE="${XRAY_CORE_SERVICE_NAME}" \
+    XRAY_CORE_API_SERVER_VALUE="${XRAY_CORE_API_SERVER}" \
+    XRAY_CTL_SCRIPT_VALUE="${XRAY_CTL_SCRIPT}" \
+    XRAY_ONLINE_TRACKER_SERVICE_NAME_VALUE="${XRAY_ONLINE_TRACKER_SERVICE_NAME}" \
+    XRAY_ONLINE_TRACKER_URL_VALUE="${XRAY_ONLINE_TRACKER_URL}" \
+    XRAY_ABUSE_AUDIT_URL_VALUE="${XRAY_ABUSE_AUDIT_URL}" \
+    XRAY_CORE_VERSION_VALUE="${XRAY_CORE_INSTALLED_VERSION}" \
+    XRAY_CORE_SMOKE_LINK_VALUE="${XRAY_CORE_SMOKE_LINK}" \
+    XRAY_SYNC_SCRIPT_VALUE="${XRAY_SYNC_SCRIPT}" \
+    ROLLOUT_BUNDLE_FILE="${XRAY_CORE_ROLLOUT_BUNDLE_FILE}" \
+    python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = {
+    "backend_mode": "xray-core",
+    "domain_roles": {
+        "app_domain": str(os.environ.get("APP_DOMAIN_VALUE", "")).strip(),
+        "public_domain_legacy_alias": str(os.environ.get("PUBLIC_DOMAIN_VALUE", "")).strip(),
+        "shared_http_domain": str(os.environ.get("SHARED_HTTP_DOMAIN_VALUE", "")).strip(),
+        "public_endpoint": str(os.environ.get("XRAY_CORE_PUBLIC_ENDPOINT_VALUE", "")).strip(),
+    },
+    "standalone_xray": {
+        "root": str(os.environ.get("XRAY_CORE_ROOT_VALUE", "")).strip(),
+        "confdir": str(os.environ.get("XRAY_CORE_CONFIG_DIR_VALUE", "")).strip(),
+        "managed_inbounds_file": str(os.environ.get("XRAY_CORE_MANAGED_INBOUNDS_FILE_VALUE", "")).strip(),
+        "service_name": str(os.environ.get("XRAY_CORE_SERVICE_NAME_VALUE", "")).strip(),
+        "api_server": str(os.environ.get("XRAY_CORE_API_SERVER_VALUE", "")).strip(),
+        "xray_ctl_script": str(os.environ.get("XRAY_CTL_SCRIPT_VALUE", "")).strip(),
+        "online_tracker_service_name": str(os.environ.get("XRAY_ONLINE_TRACKER_SERVICE_NAME_VALUE", "")).strip(),
+        "online_tracker_api_url": str(os.environ.get("XRAY_ONLINE_TRACKER_URL_VALUE", "")).strip(),
+        "abuse_audit_api_url": str(os.environ.get("XRAY_ABUSE_AUDIT_URL_VALUE", "")).strip(),
+        "version": str(os.environ.get("XRAY_CORE_VERSION_VALUE", "")).strip(),
+        "smoke_link": str(os.environ.get("XRAY_CORE_SMOKE_LINK_VALUE", "")).strip(),
+        "sync_script": str(os.environ.get("XRAY_SYNC_SCRIPT_VALUE", "")).strip(),
+    },
+    "rules": [
+        "standalone xray-core is installed in a dedicated folder without x-ui",
+        "online/recent-activity stats are served by a local-only vpnbot-xray-online.service API",
+        "abuse triage is served by the same local-only tracker at /abuse and is built from Xray access.log",
+        "VPnBot treats the online tracker as required for xray-core online stats and does not silently fall back to direct access.log parsing",
+        "VPnBot add/remove uses vpnbot-xrayctl on the node first and falls back to legacy SSH/SFTP only while old nodes are being updated",
+        "shared 443 publication is handled through nginx stream/http route sync for managed xray inbounds",
+        "VPnBot manages this backend through SSH plus the local Xray API, not through 3x-ui panel endpoints",
+        "runtime config must set backend_type=xray-core and skip_subscription=true for standalone nodes",
+    ],
+}
+
+Path(os.environ["ROLLOUT_BUNDLE_FILE"]).write_text(
+    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+    chmod 600 "${XRAY_CORE_ROLLOUT_BUNDLE_FILE}"
+}
+
+
+write_xray_sync_assets() {
+    cat > "${XRAY_SYNC_SCRIPT}" <<EOF
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+MANAGED_INBOUNDS_FILE = Path(${XRAY_CORE_MANAGED_INBOUNDS_FILE@Q})
+HTTP_DIR = Path(${NGINX_HTTP_LOCATION_DIR@Q})
+STREAM_MAP = Path(${NGINX_STREAM_MAP_FILE@Q})
+STREAM_SERVER = Path(${NGINX_STREAM_SERVER_FILE@Q})
+HTTP_FRONTEND = f"127.0.0.1:${HTTP_FRONTEND_LOCAL_PORT}"
+INSTALLER_STATE_FILE = Path(${XRAY_CORE_INSTALLER_STATE_FILE@Q})
+DEFAULT_APP_DOMAIN = ${APP_DOMAIN@Q}
+DEFAULT_SHARED_HTTP_DOMAIN = ${SHARED_HTTP_DOMAIN@Q}
+DEFAULT_PUBLIC_DOMAIN = ${PUBLIC_DOMAIN@Q}
+STATE_DIR = Path(${XRAY_SYNC_STATE_DIR@Q})
+REPORT_FILE = STATE_DIR / "last_sync_report.txt"
+EXTRA_STREAM_ROUTES = Path("/etc/vpnbot-shared-stream-routes.json")
+
+MARK_RE = re.compile(r"\\[(?P<value>direct|shared:\\d+|\\d+)\\]", re.IGNORECASE)
+DOLLAR = "\$"
+
+
+def load_installer_state() -> dict:
+    if not INSTALLER_STATE_FILE.exists():
+        return {}
+    try:
+        payload = json.loads(INSTALLER_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+INSTALLER_STATE = load_installer_state()
+APP_DOMAIN = str(INSTALLER_STATE.get("app_domain") or DEFAULT_APP_DOMAIN or "").strip()
+SHARED_HTTP_DOMAIN = str(INSTALLER_STATE.get("shared_http_domain") or DEFAULT_SHARED_HTTP_DOMAIN or "").strip()
+PUBLIC_DOMAIN = str(INSTALLER_STATE.get("public_domain") or DEFAULT_PUBLIC_DOMAIN or "").strip()
+
+
+def parse_publication_spec(text: str) -> dict:
+    m = MARK_RE.search(text or "")
+    if not m:
+        return {"mode": "direct", "port": None}
+    raw = m.group("value").lower()
+    if raw == "direct":
+        return {"mode": "direct", "port": None}
+    if raw.startswith("shared:"):
+        try:
+            port = int(raw.split(":", 1)[1])
+        except Exception:
+            return {"mode": "direct", "port": None}
+        return {"mode": "shared", "port": port}
+    try:
+        port = int(raw)
+    except Exception:
+        return {"mode": "direct", "port": None}
+    return {"mode": "shared", "port": port}
+
+
+def normalize_inbound_rows(raw_obj) -> list[dict]:
+    if raw_obj is None:
+        return []
+    if isinstance(raw_obj, str):
+        try:
+            raw_obj = json.loads(raw_obj)
+        except Exception:
+            return []
+    if isinstance(raw_obj, list):
+        return [row for row in raw_obj if isinstance(row, dict)]
+    if isinstance(raw_obj, dict):
+        nested = raw_obj.get("inbounds")
+        if isinstance(nested, list):
+            return [row for row in nested if isinstance(row, dict)]
+        return [raw_obj]
+    return []
+
+
+def load_inbounds() -> list[dict]:
+    if not MANAGED_INBOUNDS_FILE.exists():
+        return []
+    try:
+        payload = json.loads(MANAGED_INBOUNDS_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"Failed to parse managed inbounds file {MANAGED_INBOUNDS_FILE}: {exc}") from exc
+    return normalize_inbound_rows(payload.get("inbounds"))
+
+
+def json_load(value):
+    if not value:
+        return {}
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return {}
+
+
+def ensure_dirs():
+    HTTP_DIR.mkdir(parents=True, exist_ok=True)
+    STREAM_MAP.parent.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def parse_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_extra_routes() -> list[dict]:
+    if not EXTRA_STREAM_ROUTES.exists():
+        return []
+    try:
+        payload = json.loads(EXTRA_STREAM_ROUTES.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"Failed to parse shared stream routes file {EXTRA_STREAM_ROUTES}: {exc}") from exc
+
+    if isinstance(payload, dict):
+        raw_routes = payload.get("routes") or []
+    elif isinstance(payload, list):
+        raw_routes = payload
+    else:
+        raw_routes = []
+
+    routes = []
+    for idx, item in enumerate(raw_routes, start=1):
+        if not isinstance(item, dict):
+            continue
+        route_id = str(item.get("route_id") or item.get("id") or f"route_{idx}").strip() or f"route_{idx}"
+        if not parse_bool(item.get("enabled"), default=True):
+            continue
+        domain = str(item.get("domain") or "").strip().lower()
+        backend_host = str(item.get("backend_host") or "127.0.0.1").strip() or "127.0.0.1"
+        source = str(item.get("source") or item.get("service_type") or "external").strip() or "external"
+        try:
+            shared_port = int(item.get("shared_port") or 0)
+            backend_port = int(item.get("backend_port") or 0)
+        except Exception:
+            continue
+        if not domain or shared_port <= 0 or backend_port <= 0:
+            continue
+        routes.append(
+            {
+                "route_id": route_id,
+                "domain": domain,
+                "shared_port": shared_port,
+                "backend_host": backend_host,
+                "backend_port": backend_port,
+                "source": source,
+            }
+        )
+    return routes
+
+
+def register_stream_target(
+    shared_port: int,
+    domain: str,
+    backend_target: str,
+    passthrough_by_port: dict[int, dict[str, str]],
+    source: str,
+) -> None:
+    shared_map = passthrough_by_port.setdefault(shared_port, {})
+    existing = shared_map.get(domain)
+    if existing and existing != backend_target:
+        raise SystemExit(
+            f"Shared stream conflict on port {shared_port} for domain {domain}: "
+            f"{existing} already registered, new target {backend_target} from {source}"
+        )
+    shared_map[domain] = backend_target
+
+
+def write_http_route(name: str, path: str, port: int, grpc: bool) -> None:
+    target = HTTP_DIR / f"{name}.conf"
+    if grpc:
+        body = f'''location {path} {{
+    grpc_set_header Host \$host;
+    grpc_set_header X-Real-IP \$remote_addr;
+    grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    grpc_set_header X-Forwarded-Proto https;
+    grpc_pass grpc://127.0.0.1:{port};
+}}
+'''
+    else:
+        body = f'''location {path} {{
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_pass http://127.0.0.1:{port};
+}}
+'''
+    target.write_text(body, encoding="utf-8")
+
+
+def build_stream_configs(shared_ports: list[int], shared_domains: set[str], passthrough_by_port: dict[int, dict[str, str]]) -> str:
+    blocks = []
+    for shared_port in shared_ports:
+        var_name = f"{DOLLAR}vpnbot_backend_{shared_port}"
+        explicit_routes = passthrough_by_port.get(shared_port) or {}
+        lines = [
+            f"map {DOLLAR}ssl_preread_server_name {var_name} {{",
+            "    hostnames;",
+            f"    default {HTTP_FRONTEND};",
+        ]
+        for domain in sorted(shared_domains):
+            if domain in explicit_routes:
+                continue
+            lines.append(f"    {domain} {HTTP_FRONTEND};")
+        for domain, backend_target in sorted(explicit_routes.items()):
+            lines.append(f"    {domain} {backend_target};")
+        lines.append("}")
+        lines.append("")
+        lines.append("server {")
+        lines.append(f"    listen {shared_port} reuseport;")
+        lines.append(f"    proxy_pass {var_name};")
+        lines.append("    ssl_preread on;")
+        lines.append("}")
+        lines.append("")
+        blocks.append("\\n".join(lines))
+    return "\\n".join(blocks).rstrip() + "\\n"
+
+
+def write_report(lines: list[str]) -> None:
+    REPORT_FILE.write_text("\\n".join(lines).rstrip() + "\\n", encoding="utf-8")
+
+
+def main() -> int:
+    if "--explain" in sys.argv:
+        print(
+            "vpnbot-xray-sync-routes modes:\\n"
+            "  [443] or [shared:443]   publish inbound through shared TCP/443\\n"
+            "  [8443] or [shared:8443] publish inbound through shared TCP/8443\\n"
+            "  [direct]                keep inbound on its own real port\\n"
+            "\\n"
+            "Shared port behaviour:\\n"
+            "  tls/reality on any transport -> nginx stream SNI passthrough on the chosen external port\\n"
+            "  ws/grpc/http-like without tls/reality -> nginx HTTP route behind the chosen shared port\\n"
+            "\\n"
+            "Notes:\\n"
+            "  - xray-core sync reads managed inbounds from JSON instead of x-ui DB\\n"
+            "  - if no shared marker is present, sync treats inbound as direct\\n"
+            "  - for reality/tls on any shared port, inbound must have serverNames / serverName set\\n"
+            "  - xhttp/httpupgrade/splithttp are treated as HTTP-like routes when possible\\n"
+            "  - route sync is automatic via systemd path + timer\\n"
+            f"  - sync report: {REPORT_FILE}\\n"
+        )
+        return 0
+
+    ensure_dirs()
+    for f in HTTP_DIR.glob("*.conf"):
+        f.unlink()
+
+    rows = load_inbounds()
+    shared_domains = set()
+    for host in (SHARED_HTTP_DOMAIN, APP_DOMAIN, PUBLIC_DOMAIN):
+        host = str(host or "").strip()
+        if host:
+            shared_domains.add(host)
+
+    shared_ports = set()
+    passthrough_by_port = {}
+    report_lines = [
+        "VPnBot xray-core sync report",
+        "============================",
+        "",
+        f"managed_inbounds: {MANAGED_INBOUNDS_FILE}",
+        f"shared_http_domain: {SHARED_HTTP_DOMAIN or APP_DOMAIN or PUBLIC_DOMAIN or '<none>'}",
+        "",
+    ]
+
+    for idx, row in enumerate(rows, start=1):
+        row_id = row.get("id") if row.get("id") is not None else idx
+        tag = str(row.get("tag") or "")
+        protocol = str(row.get("protocol") or "").lower()
+        port = int(row.get("port") or 0)
+
+        if not parse_bool(row.get("enable"), default=True):
+            report_lines.append(f"id={row_id} skip disabled tag={tag!r}")
+            continue
+        if port <= 0:
+            report_lines.append(f"id={row_id} skip invalid_port tag={tag!r}")
+            continue
+
+        publication = parse_publication_spec(tag)
+        if publication["mode"] != "shared" or not publication.get("port"):
+            report_lines.append(f"id={row_id} direct port={port} protocol={protocol} tag={tag!r}")
+            continue
+        shared_port = int(publication["port"])
+        shared_ports.add(shared_port)
+
+        stream = json_load(row.get("streamSettings"))
+        network = str(stream.get("network") or "").lower()
+        security = str(stream.get("security") or "").lower()
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", tag or f"inbound_{row_id}")
+
+        domains = []
+        if security == "reality":
+            reality = stream.get("realitySettings") or {}
+            domains = [str(x).strip() for x in (reality.get("serverNames") or []) if str(x).strip()]
+        elif security == "tls":
+            tls = stream.get("tlsSettings") or {}
+            raw_names = tls.get("serverNames") or []
+            if isinstance(raw_names, list):
+                domains.extend(str(x).strip() for x in raw_names if str(x).strip())
+            server_name = str(tls.get("serverName") or "").strip()
+            if server_name:
+                domains.append(server_name)
+            nested = tls.get("settings") or {}
+            nested_name = str(nested.get("serverName") or "").strip()
+            if nested_name:
+                domains.append(nested_name)
+        domains = sorted({d for d in domains if d})
+
+        if domains:
+            backend_target = f"127.0.0.1:{port}"
+            for domain in domains:
+                register_stream_target(shared_port, domain, backend_target, passthrough_by_port, f"xray inbound #{row_id}")
+            report_lines.append(
+                f"id={row_id} shared-stream external_port={shared_port} network={network or '<none>'} security={security or '<none>'} "
+                f"domains={','.join(domains)} backend_port={port} protocol={protocol} tag={tag!r}"
+            )
+            continue
+
+        if network == "ws":
+            ws = stream.get("wsSettings") or {}
+            path = str(ws.get("path") or "").strip() or f"/ws-{port}"
+            write_http_route(safe_name, path, port, grpc=False)
+            report_lines.append(
+                f"id={row_id} shared-http external_port={shared_port} network=ws security={security or '<none>'} "
+                f"path={path} backend_port={port} protocol={protocol} tag={tag!r}"
+            )
+            continue
+
+        if network == "grpc":
+            grpc = stream.get("grpcSettings") or {}
+            service_name = str(grpc.get("serviceName") or "").strip() or f"grpc-{port}"
+            write_http_route(safe_name, "/" + service_name.lstrip("/"), port, grpc=True)
+            report_lines.append(
+                f"id={row_id} shared-http external_port={shared_port} network=grpc security={security or '<none>'} "
+                f"service=/{service_name.lstrip('/')} backend_port={port} protocol={protocol} tag={tag!r}"
+            )
+            continue
+
+        httpish_path = ""
+        for key in ("xhttpSettings", "httpupgradeSettings", "splitHTTPSettings"):
+            cfg = stream.get(key) or {}
+            candidate = str(cfg.get("path") or "").strip()
+            if candidate:
+                httpish_path = candidate
+                break
+        if network in {"xhttp", "httpupgrade", "splithttp"}:
+            path = httpish_path or f"/{network}-{port}"
+            write_http_route(safe_name, path, port, grpc=False)
+            report_lines.append(
+                f"id={row_id} shared-http external_port={shared_port} network={network} security={security or '<none>'} "
+                f"path={path} backend_port={port} protocol={protocol} tag={tag!r}"
+            )
+            continue
+
+        report_lines.append(
+            f"id={row_id} unsupported_shared_port external_port={shared_port} network={network or '<none>'} security={security or '<none>'} "
+            f"backend_port={port} protocol={protocol} reason=no_sni_or_http_route tag={tag!r}"
+        )
+
+    for route in load_extra_routes():
+        shared_port = int(route["shared_port"])
+        backend_target = f'{route["backend_host"]}:{route["backend_port"]}'
+        shared_ports.add(shared_port)
+        register_stream_target(
+            shared_port,
+            route["domain"],
+            backend_target,
+            passthrough_by_port,
+            f'external route {route["route_id"]}',
+        )
+        report_lines.append(
+            f'external route_id={route["route_id"]} external_port={shared_port} '
+            f'domain={route["domain"]} backend_target={backend_target} source={route["source"]!r}'
+        )
+
+    STREAM_MAP.write_text(build_stream_configs(sorted(shared_ports), shared_domains, passthrough_by_port), encoding="utf-8")
+    STREAM_SERVER.write_text("# generated by vpnbot-xray-sync-routes\\n", encoding="utf-8")
+    write_report(report_lines)
+
+    subprocess.run(["nginx", "-t"], check=True)
+    subprocess.run(["systemctl", "reload", "nginx"], check=True)
+    print("vpnbot-xray-sync-routes: nginx config regenerated successfully")
+    print(f"vpnbot-xray-sync-routes: report written to {REPORT_FILE}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+EOF
+    chmod 755 "${XRAY_SYNC_SCRIPT}"
+
+    cat > "${XRAY_SYNC_SERVICE}" <<EOF
+[Unit]
+Description=VPnBot xray route sync
+After=network-online.target ${XRAY_CORE_SERVICE_NAME} nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${XRAY_SYNC_SCRIPT}
+EOF
+
+    cat > "${XRAY_SYNC_PATH}" <<EOF
+[Unit]
+Description=Watch xray managed inbounds changes and regenerate nginx routes
+
+[Path]
+PathChanged=${XRAY_CORE_MANAGED_INBOUNDS_FILE}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > "${XRAY_SYNC_TIMER}" <<EOF
+[Unit]
+Description=Periodic VPnBot xray route sync
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=15s
+Unit=vpnbot-xray-sync-routes.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+
+write_xui_sync_assets() {
+    cat > "${XUI_SYNC_SCRIPT}" <<EOF
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+DB_PATH = Path(${XUI_DB_PATH@Q})
+CONFIG_PATH = Path(${XUI_BIN_CONFIG@Q})
+HTTP_DIR = Path(${NGINX_HTTP_LOCATION_DIR@Q})
+STREAM_MAP = Path(${NGINX_STREAM_MAP_FILE@Q})
+STREAM_SERVER = Path(${NGINX_STREAM_SERVER_FILE@Q})
+HTTP_FRONTEND = f"127.0.0.1:${HTTP_FRONTEND_LOCAL_PORT}"
+INSTALLER_STATE_FILE = Path(${XUI_INSTALLER_STATE_FILE@Q})
+DEFAULT_PANEL_DOMAIN = ${PANEL_DOMAIN@Q}
+DEFAULT_APP_DOMAIN = ${APP_DOMAIN@Q}
+DEFAULT_SHARED_HTTP_DOMAIN = ${SHARED_HTTP_DOMAIN@Q}
+DEFAULT_PUBLIC_DOMAIN = ${PUBLIC_DOMAIN@Q}
+STATE_DIR = Path(${XUI_SYNC_STATE_DIR@Q})
+REPORT_FILE = STATE_DIR / "last_sync_report.txt"
+EXTRA_STREAM_ROUTES = Path("/etc/vpnbot-shared-stream-routes.json")
+
+MARK_RE = re.compile(r"\\[(?P<value>direct|shared:\\d+|\\d+)\\]", re.IGNORECASE)
+
+
+def load_installer_state() -> dict:
+    if not INSTALLER_STATE_FILE.exists():
+        return {}
+    try:
+        payload = json.loads(INSTALLER_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+INSTALLER_STATE = load_installer_state()
+PANEL_DOMAIN = str(INSTALLER_STATE.get("panel_domain") or DEFAULT_PANEL_DOMAIN or "").strip()
+APP_DOMAIN = str(INSTALLER_STATE.get("app_domain") or DEFAULT_APP_DOMAIN or "").strip()
+SHARED_HTTP_DOMAIN = str(INSTALLER_STATE.get("shared_http_domain") or DEFAULT_SHARED_HTTP_DOMAIN or "").strip()
+PUBLIC_DOMAIN = str(INSTALLER_STATE.get("public_domain") or DEFAULT_PUBLIC_DOMAIN or "").strip()
+
+
+def parse_publication_spec(text: str) -> dict:
+    m = MARK_RE.search(text or "")
+    if not m:
+        return {"mode": "direct", "port": None}
+    raw = m.group("value").lower()
+    if raw == "direct":
+        return {"mode": "direct", "port": None}
+    if raw.startswith("shared:"):
+        try:
+            port = int(raw.split(":", 1)[1])
+        except Exception:
+            return {"mode": "direct", "port": None}
+        return {"mode": "shared", "port": port}
+    try:
+        port = int(raw)
+    except Exception:
+        return {"mode": "direct", "port": None}
+    return {"mode": "shared", "port": port}
+
+
+def load_inbounds() -> list[dict]:
+    if not DB_PATH.exists():
+        raise SystemExit(f"3x-ui DB not found: {DB_PATH}")
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(inbounds)")}
+        select_parts = []
+        for plain in ("id", "remark", "tag", "enable", "port", "protocol", "settings", "sniffing"):
+            if plain in cols:
+                select_parts.append(plain)
+        if "streamSettings" in cols:
+            select_parts.append("streamSettings")
+        elif "stream_settings" in cols:
+            select_parts.append("stream_settings AS streamSettings")
+        q = "SELECT " + ", ".join(select_parts) + " FROM inbounds"
+        rows = [dict(r) for r in conn.execute(q)]
+        return rows
+    finally:
+        conn.close()
+
+
+def json_load(value):
+    if not value:
+        return {}
+    try:
+        return json.loads(value)
+    except Exception:
+        return {}
+
+
+def ensure_dirs():
+    HTTP_DIR.mkdir(parents=True, exist_ok=True)
+    STREAM_MAP.parent.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+DOLLAR = "\$"
+
+
+def parse_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_extra_routes() -> list[dict]:
+    if not EXTRA_STREAM_ROUTES.exists():
+        return []
+    try:
+        payload = json.loads(EXTRA_STREAM_ROUTES.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"Failed to parse shared stream routes file {EXTRA_STREAM_ROUTES}: {exc}") from exc
+
+    if isinstance(payload, dict):
+        raw_routes = payload.get("routes") or []
+    elif isinstance(payload, list):
+        raw_routes = payload
+    else:
+        raw_routes = []
+
+    routes = []
+    for idx, item in enumerate(raw_routes, start=1):
+        if not isinstance(item, dict):
+            continue
+        route_id = str(item.get("route_id") or item.get("id") or f"route_{idx}").strip() or f"route_{idx}"
+        if not parse_bool(item.get("enabled"), default=True):
+            continue
+        domain = str(item.get("domain") or "").strip().lower()
+        backend_host = str(item.get("backend_host") or "127.0.0.1").strip() or "127.0.0.1"
+        source = str(item.get("source") or item.get("service_type") or "external").strip() or "external"
+        try:
+            shared_port = int(item.get("shared_port") or 0)
+            backend_port = int(item.get("backend_port") or 0)
+        except Exception:
+            continue
+        if not domain or shared_port <= 0 or backend_port <= 0:
+            continue
+        routes.append(
+            {
+                "route_id": route_id,
+                "domain": domain,
+                "shared_port": shared_port,
+                "backend_host": backend_host,
+                "backend_port": backend_port,
+                "source": source,
+            }
+        )
+    return routes
+
+
+def register_stream_target(
+    shared_port: int,
+    domain: str,
+    backend_target: str,
+    passthrough_by_port: dict[int, dict[str, str]],
+    source: str,
+) -> None:
+    shared_map = passthrough_by_port.setdefault(shared_port, {})
+    existing = shared_map.get(domain)
+    if existing and existing != backend_target:
+        raise SystemExit(
+            f"Shared stream conflict on port {shared_port} for domain {domain}: "
+            f"{existing} already registered, new target {backend_target} from {source}"
+        )
+    shared_map[domain] = backend_target
+
+
+def write_http_route(name: str, path: str, port: int, grpc: bool) -> None:
+    target = HTTP_DIR / f"{name}.conf"
+    if grpc:
+        body = f'''location {path} {{
+    grpc_set_header Host \$host;
+    grpc_set_header X-Real-IP \$remote_addr;
+    grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    grpc_set_header X-Forwarded-Proto https;
+    grpc_pass grpc://127.0.0.1:{port};
+}}
+'''
+    else:
+        body = f'''location {path} {{
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_pass http://127.0.0.1:{port};
+}}
+'''
+    target.write_text(body, encoding="utf-8")
+
+
+def build_stream_configs(shared_ports: list[int], shared_domains: set[str], passthrough_by_port: dict[int, dict[str, str]]) -> str:
+    blocks = []
+    for shared_port in shared_ports:
+        var_name = f"{DOLLAR}vpnbot_backend_{shared_port}"
+        explicit_routes = passthrough_by_port.get(shared_port) or {}
+        lines = [
+            f"map {DOLLAR}ssl_preread_server_name {var_name} {{",
+            "    hostnames;",
+            f"    default {HTTP_FRONTEND};",
+        ]
+        for domain in sorted(shared_domains):
+            if domain in explicit_routes:
+                continue
+            lines.append(f"    {domain} {HTTP_FRONTEND};")
+        for domain, backend_target in sorted(explicit_routes.items()):
+            lines.append(f"    {domain} {backend_target};")
+        lines.append("}")
+        lines.append("")
+        lines.append("server {")
+        lines.append(f"    listen {shared_port} reuseport;")
+        lines.append(f"    proxy_pass {var_name};")
+        lines.append("    ssl_preread on;")
+        lines.append("}")
+        lines.append("")
+        blocks.append("\\n".join(lines))
+    return "\\n".join(blocks).rstrip() + "\\n"
+
+
+def write_report(lines: list[str]) -> None:
+    REPORT_FILE.write_text("\\n".join(lines).rstrip() + "\\n", encoding="utf-8")
+
+
+def main() -> int:
+    if "--explain" in sys.argv:
+        print(
+            "vpnbot-xui-sync-routes modes:\\n"
+            "  [443] or [shared:443]   publish inbound through shared TCP/443\\n"
+            "  [8443] or [shared:8443] publish inbound through shared TCP/8443\\n"
+            "  [direct]                keep inbound on its own real port\\n"
+            "\\n"
+            "Shared port behaviour:\\n"
+            "  tls/reality on any transport -> nginx stream SNI passthrough on the chosen external port\\n"
+            "  ws/grpc/http-like without tls/reality -> nginx HTTP route behind the chosen shared port\\n"
+            "\\n"
+            "Notes:\\n"
+            "  - if no shared marker is present, sync treats inbound as direct\\n"
+            "  - for reality/tls on any shared port, inbound must have serverNames / serverName set\\n"
+            "  - xhttp/httpupgrade/splithttp are treated as HTTP-like routes when possible\\n"
+            "  - route sync is automatic via systemd path + timer\\n"
+            "  - manual sync is still available: vpnbot-xui-sync-routes\\n"
+            f"  - sync report: {REPORT_FILE}\\n"
+        )
+        return 0
+
+    ensure_dirs()
+    for f in HTTP_DIR.glob("*.conf"):
+        f.unlink()
+
+    rows = load_inbounds()
+    shared_domains = set()
+    for host in (PANEL_DOMAIN, SHARED_HTTP_DOMAIN, APP_DOMAIN, PUBLIC_DOMAIN):
+        host = str(host or "").strip()
+        if host:
+            shared_domains.add(host)
+
+    shared_ports = set()
+    passthrough_by_port = {}
+    report_lines = [
+        "VPnBot x-ui sync report",
+        "=======================",
+        "",
+        f"db: {DB_PATH}",
+        f"config: {CONFIG_PATH}",
+        f"panel_domain: {PANEL_DOMAIN or SHARED_HTTP_DOMAIN or APP_DOMAIN or PUBLIC_DOMAIN or '<none>'}",
+        f"shared_http_domain: {SHARED_HTTP_DOMAIN or APP_DOMAIN or PUBLIC_DOMAIN or '<none>'}",
+        "",
+    ]
+
+    for row in rows:
+        row_id = row.get("id")
+        remark = str(row.get("remark") or "")
+        tag = str(row.get("tag") or "")
+        protocol = str(row.get("protocol") or "").lower()
+        port = int(row.get("port") or 0)
+
+        if not int(row.get("enable", 0) or 0):
+            report_lines.append(f"id={row_id} skip disabled")
+            continue
+        if port <= 0:
+            report_lines.append(f"id={row_id} skip invalid_port remark={remark!r} tag={tag!r}")
+            continue
+        publication = parse_publication_spec(remark + " " + tag)
+        if publication["mode"] != "shared" or not publication.get("port"):
+            report_lines.append(f"id={row_id} direct port={port} protocol={protocol} remark={remark!r}")
+            continue
+        shared_port = int(publication["port"])
+        shared_ports.add(shared_port)
+
+        stream = json_load(row.get("streamSettings"))
+        network = str(stream.get("network") or "").lower()
+        security = str(stream.get("security") or "").lower()
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", remark or tag or f"inbound_{row.get('id')}")
+
+        domains = []
+        if security == "reality":
+            reality = stream.get("realitySettings") or {}
+            domains = [str(x).strip() for x in (reality.get("serverNames") or []) if str(x).strip()]
+        elif security == "tls":
+            tls = stream.get("tlsSettings") or {}
+            raw_names = tls.get("serverNames") or []
+            if isinstance(raw_names, list):
+                domains.extend(str(x).strip() for x in raw_names if str(x).strip())
+            server_name = str(tls.get("serverName") or "").strip()
+            if server_name:
+                domains.append(server_name)
+            nested = tls.get("settings") or {}
+            nested_name = str(nested.get("serverName") or "").strip()
+            if nested_name:
+                domains.append(nested_name)
+        domains = sorted({d for d in domains if d})
+
+        if domains:
+            backend_target = f"127.0.0.1:{port}"
+            for domain in domains:
+                register_stream_target(shared_port, domain, backend_target, passthrough_by_port, f"x-ui inbound #{row_id}")
+            report_lines.append(
+                f"id={row_id} shared-stream external_port={shared_port} network={network or '<none>'} security={security or '<none>'} "
+                f"domains={','.join(domains)} backend_port={port} protocol={protocol} remark={remark!r}"
+            )
+            continue
+
+        if network == "ws":
+            ws = stream.get("wsSettings") or {}
+            path = str(ws.get("path") or "").strip() or f"/ws-{port}"
+            write_http_route(safe_name, path, port, grpc=False)
+            report_lines.append(f"id={row_id} shared-http external_port={shared_port} network=ws security={security or '<none>'} path={path} backend_port={port} protocol={protocol} remark={remark!r}")
+            continue
+
+        if network == "grpc":
+            grpc = stream.get("grpcSettings") or {}
+            service_name = str(grpc.get("serviceName") or "").strip() or f"grpc-{port}"
+            write_http_route(safe_name, "/" + service_name.lstrip("/"), port, grpc=True)
+            report_lines.append(f"id={row_id} shared-http external_port={shared_port} network=grpc security={security or '<none>'} service=/{service_name.lstrip('/')} backend_port={port} protocol={protocol} remark={remark!r}")
+            continue
+
+        httpish_path = ""
+        for key in ("xhttpSettings", "httpupgradeSettings", "splitHTTPSettings"):
+            cfg = stream.get(key) or {}
+            candidate = str(cfg.get("path") or "").strip()
+            if candidate:
+                httpish_path = candidate
+                break
+        if network in {"xhttp", "httpupgrade", "splithttp"}:
+            path = httpish_path or f"/{network}-{port}"
+            write_http_route(safe_name, path, port, grpc=False)
+            report_lines.append(f"id={row_id} shared-http external_port={shared_port} network={network} security={security or '<none>'} path={path} backend_port={port} protocol={protocol} remark={remark!r}")
+            continue
+
+        report_lines.append(
+            f"id={row_id} unsupported_shared_port external_port={shared_port} network={network or '<none>'} security={security or '<none>'} "
+            f"backend_port={port} protocol={protocol} reason=no_sni_or_http_route remark={remark!r}"
+        )
+
+    for route in load_extra_routes():
+        shared_port = int(route["shared_port"])
+        backend_target = f'{route["backend_host"]}:{route["backend_port"]}'
+        shared_ports.add(shared_port)
+        register_stream_target(
+            shared_port,
+            route["domain"],
+            backend_target,
+            passthrough_by_port,
+            f'external route {route["route_id"]}',
+        )
+        report_lines.append(
+            f'external route_id={route["route_id"]} external_port={shared_port} '
+            f'domain={route["domain"]} backend_target={backend_target} source={route["source"]!r}'
+        )
+
+    STREAM_MAP.write_text(build_stream_configs(sorted(shared_ports), shared_domains, passthrough_by_port), encoding="utf-8")
+    STREAM_SERVER.write_text("# generated by vpnbot-xui-sync-routes\\n", encoding="utf-8")
+    write_report(report_lines)
+
+    subprocess.run(["nginx", "-t"], check=True)
+    subprocess.run(["systemctl", "reload", "nginx"], check=True)
+    print("vpnbot-xui-sync-routes: nginx config regenerated successfully")
+    print(f"vpnbot-xui-sync-routes: report written to {REPORT_FILE}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+EOF
+    chmod 755 "${XUI_SYNC_SCRIPT}"
+
+    cat > "${XUI_SYNC_SERVICE}" <<EOF
+[Unit]
+Description=VPnBot x-ui route sync
+After=network-online.target x-ui.service nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${XUI_SYNC_SCRIPT}
+EOF
+
+    cat > "${XUI_SYNC_PATH}" <<EOF
+[Unit]
+Description=Watch x-ui config changes and regenerate nginx routes
+
+[Path]
+PathChanged=${XUI_DB_PATH}
+PathChanged=${XUI_BIN_CONFIG}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > "${XUI_SYNC_TIMER}" <<EOF
+[Unit]
+Description=Periodic VPnBot x-ui route sync
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=15s
+Unit=vpnbot-xui-sync-routes.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+
+write_preset_helper() {
+    cat > "${XUI_PRESET_HELPER}" <<EOF
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import http.cookiejar
+import json
+import random
+import re
+import socket
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+STATE_FILE = Path(${XUI_INSTALLER_STATE_FILE@Q})
+SYNC_SCRIPT = ${XUI_SYNC_SCRIPT@Q}
+DEFAULT_TLS_CERT = ${NGINX_SSL_CERT@Q}
+DEFAULT_TLS_KEY = ${NGINX_SSL_KEY@Q}
+
+REALITY_FINGERPRINT = "chrome"
+PORT_MIN = 20000
+PORT_MAX = 45000
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        raise SystemExit(f"Installer state file not found: {STATE_FILE}")
+    return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+
+
+def get_public_tls_domain(state: dict) -> str:
+    return str(state.get("public_domain") or "").strip().lower()
+
+
+def make_opener() -> tuple[urllib.request.OpenerDirector, dict]:
+    state = load_state()
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+    return opener, state
+
+
+def request_json(opener, state: dict, method: str, path: str, data: dict | None = None) -> dict:
+    url = state["panel_base_url"].rstrip("/") + path
+    body = None
+    headers = {}
+    if data is not None:
+        body = urllib.parse.urlencode(data).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
+    with opener.open(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+def login(opener, state: dict) -> None:
+    result = request_json(
+        opener,
+        state,
+        "POST",
+        "/login",
+        {
+            "username": state["panel_username"],
+            "password": state["panel_password"],
+        },
+    )
+    if not result.get("success"):
+        raise SystemExit(f"3x-ui login failed: {result}")
+
+
+def parse_json_field(value):
+    if not value:
+        return {}
+    if isinstance(value, (dict, list)):
+        return value
+    return json.loads(value)
+
+
+def normalize_inbound_rows(raw_obj) -> list[dict]:
+    if raw_obj is None:
+        return []
+    if isinstance(raw_obj, str):
+        try:
+            raw_obj = json.loads(raw_obj)
+        except Exception:
+            return []
+    if isinstance(raw_obj, list):
+        return [row for row in raw_obj if isinstance(row, dict)]
+    if isinstance(raw_obj, dict):
+        nested = raw_obj.get("inbounds")
+        if isinstance(nested, list):
+            return [row for row in nested if isinstance(row, dict)]
+        if raw_obj and all(isinstance(v, dict) for v in raw_obj.values()):
+            return list(raw_obj.values())
+        return [raw_obj]
+    return []
+
+
+def list_inbounds(opener, state: dict) -> list[dict]:
+    result = request_json(opener, state, "GET", "/panel/api/inbounds/list")
+    rows = normalize_inbound_rows(result.get("obj"))
+    for row in rows:
+        for key in ("settings", "streamSettings", "sniffing"):
+            try:
+                row[key] = parse_json_field(row.get(key))
+            except Exception:
+                row[key] = {}
+    return rows
+
+
+def get_x25519(opener, state: dict) -> dict:
+    result = request_json(opener, state, "GET", "/panel/api/server/getNewX25519Cert")
+    obj = result.get("obj") or {}
+    if not obj.get("privateKey") or not obj.get("publicKey"):
+        raise SystemExit(f"3x-ui did not return X25519 keys: {result}")
+    return obj
+
+
+def add_inbound(opener, state: dict, payload: dict) -> dict:
+    form = {}
+    for key in ("up", "down", "total", "remark", "enable", "expiryTime", "listen", "port", "protocol"):
+        form[key] = str(payload.get(key, ""))
+    for key in ("settings", "streamSettings", "sniffing", "allocate"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            form[key] = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        else:
+            form[key] = str(value)
+    result = request_json(opener, state, "POST", "/panel/api/inbounds/add", form)
+    if not result.get("success"):
+        raise SystemExit(f"3x-ui add inbound failed: {json.dumps(result, ensure_ascii=False)}")
+    return result.get("obj") or {}
+
+
+def update_inbound(opener, state: dict, inbound_id: int, payload: dict) -> dict:
+    form = {}
+    for key in ("up", "down", "total", "remark", "enable", "expiryTime", "listen", "port", "protocol"):
+        form[key] = str(payload.get(key, ""))
+    for key in ("settings", "streamSettings", "sniffing", "allocate"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            form[key] = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        else:
+            form[key] = str(value)
+    result = request_json(opener, state, "POST", f"/panel/api/inbounds/update/{int(inbound_id)}", form)
+    if not result.get("success"):
+        raise SystemExit(f"3x-ui update inbound failed: {json.dumps(result, ensure_ascii=False)}")
+    return result.get("obj") or {}
+
+
+def ensure_clients_array_on_inbound(opener, state: dict, inbound_obj: dict, payload: dict) -> dict:
+    settings = payload.get("settings")
+    if not isinstance(settings, dict):
+        return inbound_obj
+
+    clients = settings.get("clients")
+    if isinstance(clients, list):
+        updated = dict(payload)
+        updated["id"] = int(inbound_obj.get("id") or payload.get("id") or 0)
+        return update_inbound(opener, state, updated["id"], updated)
+    return inbound_obj
+
+
+def run_sync() -> None:
+    subprocess.run([SYNC_SCRIPT], check=True)
+
+
+def normalize_sni(sni: str) -> str:
+    return str(sni or "").strip().lower()
+
+
+def slugify(text: str) -> str:
+    value = re.sub(r"[^a-zA-Z0-9]+", "-", str(text or "").strip().lower()).strip("-")
+    return value or "route"
+
+
+def parse_publication_spec(text: str) -> dict:
+    m = re.search(r"\\[(?P<value>direct|shared:\\d+|\\d+)\\]", text or "", re.IGNORECASE)
+    if not m:
+        return {"mode": "direct", "port": None}
+    raw = m.group("value").lower()
+    if raw == "direct":
+        return {"mode": "direct", "port": None}
+    if raw.startswith("shared:"):
+        return {"mode": "shared", "port": int(raw.split(":", 1)[1])}
+    return {"mode": "shared", "port": int(raw)}
+
+
+def iter_existing_actual_ports(rows: list[dict]) -> set[int]:
+    return {int(row.get("port") or 0) for row in rows if isinstance(row, dict) and int(row.get("port") or 0) > 0}
+
+
+def iter_existing_shared_ports(rows: list[dict]) -> set[int]:
+    ports = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        publication = parse_publication_spec(f"{row.get('remark') or ''} {row.get('tag') or ''}")
+        if publication["mode"] == "shared" and publication.get("port"):
+            ports.add(int(publication["port"]))
+    return ports
+
+
+def extract_existing_route_keys(rows: list[dict]) -> dict[int, dict[str, set[str]]]:
+    state: dict[int, dict[str, set[str]]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        publication = parse_publication_spec(f"{row.get('remark') or ''} {row.get('tag') or ''}")
+        if publication["mode"] != "shared" or not publication.get("port"):
+            continue
+        shared_port = int(publication["port"])
+        stream = row.get("streamSettings") or {}
+        security = str(stream.get("security") or "").lower()
+        bucket = state.setdefault(shared_port, {"sni": set(), "http_paths": set()})
+        if security in {"reality", "tls"}:
+            if security == "reality":
+                reality = stream.get("realitySettings") or {}
+                names = reality.get("serverNames") or []
+                for name in names:
+                    normalized = normalize_sni(name)
+                    if normalized:
+                        bucket["sni"].add(normalized)
+            else:
+                tls = stream.get("tlsSettings") or {}
+                for candidate in list(tls.get("serverNames") or []) + [tls.get("serverName"), (tls.get("settings") or {}).get("serverName")]:
+                    normalized = normalize_sni(candidate)
+                    if normalized:
+                        bucket["sni"].add(normalized)
+        else:
+            network = str(stream.get("network") or "").lower()
+            route_path = None
+            if network == "ws":
+                route_path = str((stream.get("wsSettings") or {}).get("path") or "").strip()
+            elif network == "grpc":
+                service = str((stream.get("grpcSettings") or {}).get("serviceName") or "").strip()
+                route_path = "/" + service.lstrip("/") if service else ""
+            elif network in {"xhttp", "httpupgrade", "splithttp"}:
+                for key in ("xhttpSettings", "httpupgradeSettings", "splitHTTPSettings"):
+                    route_path = str((stream.get(key) or {}).get("path") or "").strip()
+                    if route_path:
+                        break
+            if route_path:
+                bucket["http_paths"].add(route_path)
+    return state
+
+
+def choose_random_port(inbounds: list[dict], *, forbidden: set[int] | None = None) -> int:
+    used = {int(row.get("port") or 0) for row in inbounds if int(row.get("port") or 0) > 0}
+    used.update(forbidden or set())
+    for _ in range(1000):
+        port = random.randint(PORT_MIN, PORT_MAX)
+        if port not in used:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind(("0.0.0.0", port))
+            except OSError:
+                sock.close()
+                continue
+            sock.close()
+            return port
+    raise SystemExit("Could not find a free random port in the configured range")
+
+
+def require_fixed_port(inbounds: list[dict], port: int) -> int:
+    used = {int(row.get("port") or 0) for row in inbounds if int(row.get("port") or 0) > 0}
+    if port in used:
+        raise SystemExit(f"Required fixed port {port} is already occupied by another inbound")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("0.0.0.0", int(port)))
+    except OSError:
+        sock.close()
+        raise SystemExit(f"Required fixed port {port} is already occupied by another local service")
+    sock.close()
+    return port
+
+
+def build_reality_settings(opener, state: dict, sni: str) -> dict:
+    cert = get_x25519(opener, state)
+    short_id = "".join(random.choice("0123456789abcdef") for _ in range(16))
+    return {
+        "show": False,
+        "xver": 0,
+        "dest": f"{sni}:443",
+        "serverNames": [sni],
+        "privateKey": cert["privateKey"],
+        "minClient": "",
+        "maxClient": "",
+        "maxTimediff": 0,
+        "shortIds": [short_id],
+        "settings": {
+            "publicKey": cert["publicKey"],
+            "fingerprint": REALITY_FINGERPRINT,
+            "serverName": "",
+            "spiderX": "/",
+        },
+    }
+
+
+def build_sniffing(enabled: bool) -> dict:
+    return {
+        "enabled": enabled,
+        "destOverride": ["http", "tls", "quic", "fakedns"],
+        "metadataOnly": False,
+        "routeOnly": False,
+    }
+
+
+def parse_custom_spec_line(line: str) -> dict:
+    original = line.strip()
+    if not original:
+        raise SystemExit("Пустую строку inbound'а разобрать нельзя")
+
+    tokens = original.split()
+    lower_tokens = [token.lower() for token in tokens]
+    spec = {
+        "source": original,
+        "protocol": "vless",
+        "network": None,
+        "security": None,
+        "preferred_port": None,
+        "domain": None,
+        "any_port": False,
+    }
+
+    if tokens and tokens[0].isdigit():
+        spec["preferred_port"] = int(tokens[0])
+        tokens = tokens[1:]
+        lower_tokens = lower_tokens[1:]
+
+    joined = " ".join(lower_tokens)
+    if "любой порт" in joined or "any port" in joined:
+        spec["any_port"] = True
+    if "случайный direct-порт" in joined or "random direct" in joined:
+        spec["any_port"] = True
+        spec["publication"] = "direct-random"
+    if "случайный shared-порт" in joined or "random shared" in joined:
+        spec["any_port"] = True
+        spec["publication"] = "shared-random"
+
+    for token in tokens:
+        low = token.lower()
+        if low in {"vless", "vmess", "trojan"}:
+            spec["protocol"] = low
+        elif low in {"tcp", "grpc", "xhttp", "ws", "httpupgrade", "splithttp"}:
+            spec["network"] = low
+        elif low in {"raw", "reality"}:
+            spec["security"] = "reality"
+        elif low in {"tls", "none"}:
+            spec["security"] = low
+        elif token.isdigit() and spec["preferred_port"] is None:
+            spec["preferred_port"] = int(token)
+        elif "." in token and not token.startswith("["):
+            spec["domain"] = token.lower()
+
+    if not spec["network"]:
+        raise SystemExit(f"Не удалось понять транспорт в строке: {original}")
+
+    if spec["security"] is None:
+        if spec["domain"] and spec["network"] in {"tcp", "xhttp", "grpc"}:
+            spec["security"] = "reality"
+        else:
+            spec["security"] = "none"
+
+    if spec["preferred_port"] is None and not spec["any_port"]:
+        spec["any_port"] = True
+
+    if spec["security"] in {"reality", "tls"} and not spec["domain"]:
+        raise SystemExit(f"Для reality/tls нужен домен/SNI в строке: {original}")
+
+    return spec
+
+
+def custom_http_path(spec: dict) -> str:
+    if str(spec.get("network") or "").lower() == "xhttp":
+        return "/"
+    base = slugify(spec["domain"] or f"{spec['protocol']}-{spec['network']}")
+    return f"/{base}-{spec['network']}"
+
+
+def choose_backend_port(rows: list[dict], occupied_actual_ports: set[int], occupied_shared_ports: set[int], state: dict) -> int:
+    forbidden = set(occupied_actual_ports) | set(occupied_shared_ports)
+    forbidden.update({int(state["panel_port"]), int(state["http_frontend_local_port"])})
+    return choose_random_port(rows, forbidden=forbidden)
+
+
+def assign_and_validate_custom_specs(specs: list[dict], rows: list[dict], state: dict) -> list[dict]:
+    occupied_actual_ports = set(iter_existing_actual_ports(rows))
+    occupied_shared_ports = set(iter_existing_shared_ports(rows))
+    existing_routes = extract_existing_route_keys(rows)
+    new_routes: dict[int, dict[str, set[str]]] = {}
+    preferred_counts: dict[int, int] = {}
+
+    for spec in specs:
+        preferred = spec.get("preferred_port")
+        if preferred is None:
+            continue
+        preferred_counts[int(preferred)] = preferred_counts.get(int(preferred), 0) + 1
+
+    for spec in specs:
+        spec.setdefault("resolution_notes", [])
+        preferred_port = spec.get("preferred_port")
+        if preferred_port is not None:
+            preferred_port = int(preferred_port)
+            wants_shared = (
+                preferred_counts.get(preferred_port, 0) > 1
+                or preferred_port in occupied_shared_ports
+            )
+
+            if wants_shared:
+                shared_port = preferred_port
+                spec["mode"] = "shared"
+
+                def route_conflict(candidate_port: int) -> bool:
+                    route_bucket = existing_routes.setdefault(candidate_port, {"sni": set(), "http_paths": set()})
+                    pending_bucket = new_routes.setdefault(candidate_port, {"sni": set(), "http_paths": set()})
+                    if spec["security"] in {"reality", "tls"}:
+                        sni = normalize_sni(spec["domain"])
+                        return sni in route_bucket["sni"] or sni in pending_bucket["sni"]
+                    path = custom_http_path(spec)
+                    return path in route_bucket["http_paths"] or path in pending_bucket["http_paths"]
+
+                if shared_port in occupied_actual_ports or route_conflict(shared_port):
+                    replacement = choose_backend_port(rows, occupied_actual_ports, occupied_shared_ports, state)
+                    if shared_port in occupied_actual_ports:
+                        spec["resolution_notes"].append(
+                            f"желаемый порт {preferred_port} пришлось перевести в shared и перенести на {replacement}, потому что реальный порт уже был занят"
+                        )
+                    else:
+                        spec["resolution_notes"].append(
+                            f"на shared-порту {preferred_port} уже был конфликт маршрута, назначен {replacement}"
+                        )
+                    shared_port = replacement
+                elif preferred_counts.get(preferred_port, 0) > 1:
+                    spec["resolution_notes"].append(
+                        f"порт {preferred_port} выбран несколькими inbound'ами, поэтому они будут опубликованы как shared на одном внешнем порту"
+                    )
+
+                spec["external_port"] = shared_port
+                route_bucket = existing_routes.setdefault(shared_port, {"sni": set(), "http_paths": set()})
+                pending_bucket = new_routes.setdefault(shared_port, {"sni": set(), "http_paths": set()})
+                if spec["security"] in {"reality", "tls"}:
+                    sni = normalize_sni(spec["domain"])
+                    pending_bucket["sni"].add(sni)
+                else:
+                    path = custom_http_path(spec)
+                    spec["http_path"] = path
+                    pending_bucket["http_paths"].add(path)
+                backend_port = choose_backend_port(rows, occupied_actual_ports, occupied_shared_ports, state)
+                spec["listen_port"] = backend_port
+                occupied_actual_ports.add(backend_port)
+                occupied_shared_ports.add(shared_port)
+                continue
+
+        spec["mode"] = "direct"
+        if preferred_port is not None:
+            direct_port = int(preferred_port)
+            if direct_port in occupied_actual_ports or direct_port in occupied_shared_ports:
+                replacement = choose_backend_port(rows, occupied_actual_ports, occupied_shared_ports, state)
+                spec["resolution_notes"].append(
+                    f"желаемый direct-порт {direct_port} был занят, назначен {replacement}"
+                )
+                direct_port = replacement
+            else:
+                spec["resolution_notes"].append(
+                    f"порт {direct_port} используется только одним inbound'ом, поэтому он будет опубликован как direct"
+                )
+        else:
+            direct_port = choose_backend_port(rows, occupied_actual_ports, occupied_shared_ports, state)
+            spec["resolution_notes"].append(
+                f"порт не был задан явно, назначен свободный direct-порт {direct_port}"
+            )
+        spec["listen_port"] = direct_port
+        occupied_actual_ports.add(direct_port)
+
+    return specs
+
+
+def build_payload_from_custom_spec(opener, state: dict, spec: dict) -> tuple[dict | None, str]:
+    protocol = spec["protocol"]
+    network = spec["network"]
+    security = spec["security"]
+    domain = spec.get("domain") or ""
+    listen_port = int(spec["listen_port"])
+    public_tls_domain = get_public_tls_domain(state)
+
+    if security == "tls" and public_tls_domain and domain and domain != public_tls_domain:
+        raise SystemExit(
+            "Для TLS-inbound install_vray.sh сейчас использует сертификат, выпущенный на "
+            f"{public_tls_domain}. Поэтому в строке каталога для TLS укажи именно этот домен, "
+            "либо сначала подготовь другой сертификат вручную."
+        )
+
+    existing = match_existing(
+        list_inbounds(opener, state),
+        protocol=protocol,
+        network=network,
+        security=security,
+        sni=domain if security in {"reality", "tls"} else "",
+        port=listen_port if spec["mode"] == "direct" else None,
+    )
+    if existing:
+        return None, f"reuse existing {protocol} {network} {security} for {domain or listen_port} (inbound #{existing.get('id')})"
+
+    remark_bits = []
+    if spec["mode"] == "shared":
+        remark_bits.append(f"[shared:{spec['external_port']}]")
+    else:
+        remark_bits.append("[direct]")
+    remark_bits.extend([protocol, network, security])
+    if domain:
+        remark_bits.append(domain)
+    remark = " ".join(remark_bits)
+
+    if protocol == "vless":
+        settings = {"clients": [], "decryption": "none", "fallbacks": []}
+    elif protocol == "trojan":
+        settings = {"clients": [], "fallbacks": []}
+    elif protocol == "vmess":
+        settings = {"clients": []}
+    else:
+        raise SystemExit(f"Неподдерживаемый протокол: {protocol}")
+
+    stream = {
+        "network": network,
+        "security": security,
+        "externalProxy": [],
+    }
+
+    if security == "reality":
+        stream["realitySettings"] = build_reality_settings(opener, state, domain)
+    elif security == "tls":
+        stream["tlsSettings"] = {
+            "serverName": domain,
+            "alpn": ["h2", "http/1.1"] if network == "grpc" else ["http/1.1"],
+            "minVersion": "1.2",
+            "maxVersion": "1.3",
+            "cipherSuites": "",
+            "rejectUnknownSni": False,
+            "disableSystemRoot": False,
+            "enableSessionResumption": False,
+            "certificates": [
+                {
+                    "certificateFile": DEFAULT_TLS_CERT,
+                    "keyFile": DEFAULT_TLS_KEY,
+                    "ocspStapling": 3600,
+                    "usage": "encipherment",
+                }
+            ],
+            "settings": {
+                "allowInsecure": False,
+                "fingerprint": REALITY_FINGERPRINT,
+                "serverName": domain,
+            },
+        }
+
+    if network == "tcp":
+        stream["tcpSettings"] = {"acceptProxyProtocol": False, "header": {"type": "none"}}
+    elif network == "grpc":
+        stream["grpcSettings"] = {"serviceName": slugify(domain or f"{protocol}-grpc")}
+    elif network == "xhttp":
+        stream["xhttpSettings"] = {
+            "path": custom_http_path(spec),
+            "host": "",
+            "headers": {},
+            "scMaxBufferedPosts": 30,
+            "scMaxEachPostBytes": "1000000",
+            "noSSEHeader": False,
+            "xPaddingBytes": "100-1000",
+            "mode": "auto",
+        }
+    elif network == "ws":
+        stream["wsSettings"] = {"path": custom_http_path(spec), "headers": {}}
+    elif network == "httpupgrade":
+        stream["httpupgradeSettings"] = {"path": custom_http_path(spec), "host": ""}
+    elif network == "splithttp":
+        stream["splitHTTPSettings"] = {"path": custom_http_path(spec), "host": ""}
+    else:
+        raise SystemExit(f"Неподдерживаемый транспорт: {network}")
+
+    payload = {
+        "up": 0,
+        "down": 0,
+        "total": 0,
+        "remark": remark,
+        "enable": True,
+        "expiryTime": 0,
+        "listen": "",
+        "port": listen_port,
+        "protocol": protocol,
+        "settings": settings,
+        "streamSettings": stream,
+        "sniffing": build_sniffing(security != "reality"),
+    }
+
+    human_mode = f"shared port {spec['external_port']}" if spec["mode"] == "shared" else f"direct port {listen_port}"
+    human_target = f", target={domain}:443" if domain and security == "reality" else ""
+    return payload, f"create {protocol} {network} {security} on {human_mode} backend_port={listen_port}" + (f", sni={domain}{human_target}" if domain else "")
+
+
+def collect_custom_specs_from_input() -> list[dict]:
+    print("Введи inbound'ы по одному на строку. Пустая строка завершает ввод.")
+    print("Примеры:")
+    print("  443 tcp raw web.max.ru")
+    print("  443 xhttp sosok.vk.com")
+    print("  vless grpc Reality www.nvidia.com любой порт")
+    lines = []
+    while True:
+        line = input("> ").strip()
+        if not line:
+            break
+        lines.append(line)
+    if not lines:
+        raise SystemExit("Не получено ни одной строки inbound'ов")
+    return [parse_custom_spec_line(line) for line in lines]
+
+
+def match_existing(rows: list[dict], *, protocol: str, network: str, security: str, sni: str = "", port: int | None = None) -> dict | None:
+    wanted_sni = normalize_sni(sni)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("protocol") or "").lower() != protocol:
+            continue
+        row_port = int(row.get("port") or 0)
+        if port is not None and row_port != int(port):
+            continue
+        stream = row.get("streamSettings") or {}
+        row_network = str(stream.get("network") or "").lower()
+        row_security = str(stream.get("security") or "").lower()
+        if row_network != network or row_security != security:
+            continue
+        if not wanted_sni:
+            return row
+        if security == "reality":
+            reality = stream.get("realitySettings") or {}
+            sni_values = {normalize_sni(x) for x in (reality.get("serverNames") or []) if str(x).strip()}
+        elif security == "tls":
+            tls = stream.get("tlsSettings") or {}
+            sni_values = set()
+            value = str(tls.get("serverName") or "").strip()
+            if value:
+                sni_values.add(normalize_sni(value))
+            nested = tls.get("settings") or {}
+            nested_value = str(nested.get("serverName") or "").strip()
+            if nested_value:
+                sni_values.add(normalize_sni(nested_value))
+        else:
+            sni_values = set()
+        if wanted_sni in sni_values:
+            return row
+    return None
+
+
+def make_payload_vless_xhttp_shared(opener, state: dict, rows: list[dict]) -> tuple[dict | None, str]:
+    sni = "www.amd.com"
+    existing = match_existing(rows, protocol="vless", network="xhttp", security="reality", sni=sni)
+    if existing:
+        return None, f"reuse existing VLESS XHTTP REALITY for {sni} (inbound #{existing.get('id')}, backend port {existing.get('port')}, external shared port 443)"
+    port = choose_random_port(rows, forbidden={443, int(state["panel_port"]), int(state["http_frontend_local_port"])})
+    payload = {
+        "up": 0,
+        "down": 0,
+        "total": 0,
+        "remark": "[443] vless xhttp amd",
+        "enable": True,
+        "expiryTime": 0,
+        "listen": "",
+        "port": port,
+        "protocol": "vless",
+        "settings": {"clients": [], "decryption": "none", "fallbacks": []},
+        "streamSettings": {
+            "network": "xhttp",
+            "security": "reality",
+            "externalProxy": [],
+            "realitySettings": build_reality_settings(opener, state, sni),
+            "xhttpSettings": {
+                "path": "/",
+                "host": "",
+                "headers": {},
+                "scMaxBufferedPosts": 30,
+                "scMaxEachPostBytes": "1000000",
+                "noSSEHeader": False,
+                "xPaddingBytes": "100-1000",
+                "mode": "auto",
+            },
+        },
+        "sniffing": build_sniffing(False),
+    }
+    return payload, f"create VLESS XHTTP REALITY shared port 443 via SNI {sni} (backend port {port}, target {sni}:443)"
+
+
+def make_payload_vmess_tls_direct(rows: list[dict], state: dict) -> tuple[dict | None, str]:
+    tls_domain = get_public_tls_domain(state)
+    existing = match_existing(
+        rows,
+        protocol="vmess",
+        network="tcp",
+        security="tls",
+        sni=tls_domain,
+        port=8443,
+    )
+    if existing:
+        return None, "reuse existing VMESS TCP TLS on direct port 8443"
+    try:
+        port = require_fixed_port(rows, 8443)
+        chosen_note = "create VMESS TCP TLS on direct port 8443"
+    except SystemExit:
+        port = choose_random_port(
+            rows,
+            forbidden={443, 8443, int(state["panel_port"]), int(state["http_frontend_local_port"])},
+        )
+        chosen_note = f"create VMESS TCP TLS on direct port {port} (8443 was busy)"
+    tls_alpn = ["h2", "http/1.1"] if tls_domain else ["http/1.1"]
+    remark = " ".join(part for part in ("[direct]", "vmess", "tcp", "tls", tls_domain or "selfsigned") if part)
+    payload = {
+        "up": 0,
+        "down": 0,
+        "total": 0,
+        "remark": remark,
+        "enable": True,
+        "expiryTime": 0,
+        "listen": "",
+        "port": port,
+        "protocol": "vmess",
+        "settings": {"clients": []},
+        "streamSettings": {
+            "network": "tcp",
+            "security": "tls",
+            "externalProxy": [],
+            "tlsSettings": {
+                "serverName": tls_domain,
+                "alpn": tls_alpn,
+                "minVersion": "1.2",
+                "maxVersion": "1.3",
+                "cipherSuites": "",
+                "rejectUnknownSni": False,
+                "disableSystemRoot": False,
+                "enableSessionResumption": False,
+                "certificates": [
+                    {
+                        "certificateFile": DEFAULT_TLS_CERT,
+                        "keyFile": DEFAULT_TLS_KEY,
+                        "ocspStapling": 3600,
+                        "usage": "encipherment",
+                    }
+                ],
+                "settings": {
+                    "allowInsecure": False,
+                    "fingerprint": REALITY_FINGERPRINT,
+                    "serverName": tls_domain,
+                },
+            },
+            "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}},
+        },
+        "sniffing": build_sniffing(True),
+    }
+    if tls_domain:
+        return payload, f"{chosen_note} with installer certificate for {tls_domain}"
+    return payload, f"{chosen_note} with self-signed certificate"
+
+
+def make_payload_trojan_tcp_reality(rows: list[dict], opener, state: dict) -> tuple[dict | None, str]:
+    sni = "www.oracle.com"
+    existing = match_existing(rows, protocol="trojan", network="tcp", security="reality", sni=sni)
+    if existing:
+        return None, f"reuse existing TROJAN TCP REALITY for {sni} (inbound #{existing.get('id')}, port {existing.get('port')})"
+    port = choose_random_port(rows, forbidden={443, 8443, int(state["panel_port"]), int(state["http_frontend_local_port"])})
+    payload = {
+        "up": 0,
+        "down": 0,
+        "total": 0,
+        "remark": "trojan raw oracle",
+        "enable": True,
+        "expiryTime": 0,
+        "listen": "",
+        "port": port,
+        "protocol": "trojan",
+        "settings": {"clients": [], "fallbacks": []},
+        "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "externalProxy": [],
+            "realitySettings": build_reality_settings(opener, state, sni),
+            "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}},
+        },
+        "sniffing": build_sniffing(True),
+    }
+    return payload, f"create TROJAN TCP REALITY on direct port {port} with SNI/target {sni}"
+
+
+def make_payload_vless_tcp_reality(rows: list[dict], opener, state: dict) -> tuple[dict | None, str]:
+    sni = "www.amd.com"
+    existing = match_existing(rows, protocol="vless", network="tcp", security="reality", sni=sni)
+    if existing:
+        return None, f"reuse existing VLESS TCP REALITY for {sni} (inbound #{existing.get('id')}, port {existing.get('port')})"
+    port = choose_random_port(rows, forbidden={443, 8443, int(state["panel_port"]), int(state["http_frontend_local_port"])})
+    payload = {
+        "up": 0,
+        "down": 0,
+        "total": 0,
+        "remark": "vless raw amd",
+        "enable": True,
+        "expiryTime": 0,
+        "listen": "",
+        "port": port,
+        "protocol": "vless",
+        "settings": {"clients": [], "decryption": "none", "fallbacks": []},
+        "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "externalProxy": [],
+            "realitySettings": build_reality_settings(opener, state, sni),
+            "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}},
+        },
+        "sniffing": build_sniffing(True),
+    }
+    return payload, f"create VLESS TCP REALITY on direct port {port} with SNI/target {sni}"
+
+
+CATALOG_REALITY_XHTTP_DOMAINS = [
+    "www.avito.ru",
+    "www.ozon.ru",
+    "www.gosuslugi.ru",
+    "vk.com",
+    "www.yandex.ru",
+]
+
+CATALOG_REALITY_TCP_DOMAINS = [
+    "www.yandex.ru",
+    "rutube.ru",
+    "www.wildberries.ru",
+    "www.hp.com",
+    "www.sberbank.ru",
+    "www.intel.com",
+]
+
+
+def build_catalog_group(title: str, entries: list[tuple[str, str, str]]) -> dict:
+    return {
+        "title": title,
+        "items": [
+            {"id": spec_id, "title": entry_title, "line": line}
+            for spec_id, entry_title, line in entries
+        ],
+    }
+
+
+def build_catalog_groups(state: dict) -> list[dict]:
+    tls_domain = get_public_tls_domain(state)
+    if not tls_domain:
+        tls_domain = "www.amd.com"
+
+    reality_tcp_items = []
+    for domain in CATALOG_REALITY_TCP_DOMAINS:
+        slug = slugify(domain)
+        reality_tcp_items.append((f"catalog_vless_tcp_{slug}", f"443 vless tcp raw {domain}", f"443 vless tcp raw {domain}"))
+        reality_tcp_items.append((f"catalog_trojan_tcp_{slug}", f"443 trojan tcp raw {domain}", f"443 trojan tcp raw {domain}"))
+
+    reality_xhttp_items = []
+    for domain in CATALOG_REALITY_XHTTP_DOMAINS:
+        slug = slugify(domain)
+        reality_xhttp_items.append((f"catalog_vless_xhttp_{slug}", f"443 vless xhttp raw {domain}", f"443 vless xhttp raw {domain}"))
+        reality_xhttp_items.append((f"catalog_trojan_xhttp_{slug}", f"443 trojan xhttp raw {domain}", f"443 trojan xhttp raw {domain}"))
+
+    tls_items = [
+        ("catalog_vmess_tls_8443", f"8443 vmess tcp tls {tls_domain}", f"8443 vmess tcp tls {tls_domain}"),
+        ("catalog_vless_tls_public", f"любой порт vless tcp tls {tls_domain}", f"vless tcp tls {tls_domain} любой порт"),
+        ("catalog_trojan_tls_public", f"любой порт trojan tcp tls {tls_domain}", f"trojan tcp tls {tls_domain} любой порт"),
+        ("catalog_vless_xhttp_tls_public", f"любой порт vless xhttp tls {tls_domain}", f"vless xhttp tls {tls_domain} любой порт"),
+        ("catalog_trojan_xhttp_tls_public", f"любой порт trojan xhttp tls {tls_domain}", f"trojan xhttp tls {tls_domain} любой порт"),
+        ("catalog_vmess_xhttp_tls_public", f"любой порт vmess xhttp tls {tls_domain}", f"vmess xhttp tls {tls_domain} любой порт"),
+    ]
+
+    return [
+        build_catalog_group("Reality TCP", reality_tcp_items),
+        build_catalog_group("Reality XHTTP", reality_xhttp_items),
+        build_catalog_group("TLS", tls_items),
+    ]
+
+
+def apply_custom_specs(specs: list[dict]) -> int:
+    opener, state = make_opener()
+    login(opener, state)
+    rows = list_inbounds(opener, state)
+    prepared = assign_and_validate_custom_specs(specs, rows, state)
+    created = []
+    notes = []
+    for spec in prepared:
+        payload, note = build_payload_from_custom_spec(opener, state, spec)
+        notes.append(note)
+        if payload is None:
+            continue
+        obj = add_inbound(opener, state, payload)
+        obj = ensure_clients_array_on_inbound(opener, state, obj, payload)
+        obj["streamSettings"] = parse_json_field(obj.get("streamSettings"))
+        created.append(obj)
+        rows.append(obj)
+    run_sync()
+    print("VPnBot x-ui catalog result")
+    print("==========================")
+    for note in notes:
+        print(f"- {note}")
+    for spec in prepared:
+        for resolution_note in spec.get("resolution_notes", []):
+            print(f"- auto-resolve: {resolution_note}")
+    if created:
+        print("")
+        print("Созданные inbound'ы:")
+        for obj in created:
+            stream = obj.get("streamSettings") or {}
+            network = str(stream.get("network") or "").lower()
+            security = str(stream.get("security") or "").lower()
+            remark = str(obj.get("remark") or "")
+            publication = parse_publication_spec(remark)
+            if publication["mode"] == "shared" and publication.get("port"):
+                mode = f"shared {publication['port']}"
+            else:
+                mode = "direct"
+            extra = ""
+            if security == "reality":
+                reality = stream.get("realitySettings") or {}
+                names = reality.get("serverNames") or []
+                if names:
+                    extra = f", sni={','.join(names)}, target={reality.get('dest')}"
+            print(f"  • #{obj.get('id')} {obj.get('protocol')} {network}/{security or 'none'} port={obj.get('port')} mode={mode}{extra}")
+    else:
+        print("")
+        print("Новых inbound'ов не понадобилось: подходящие уже существовали.")
+    return 0
+
+
+def menu() -> int:
+    opener, state = make_opener()
+    login(opener, state)
+    catalog_groups = build_catalog_groups(state)
+    options = []
+    print("Выбери inbound'ы для 3x-ui:")
+    for group in catalog_groups:
+        print("")
+        print(f"[{group['title']}]")
+        for item in group["items"]:
+            options.append(item)
+            print(f"  {len(options)}. {item['title']}")
+    print("")
+    raw = input("Номера или диапазоны через пробел, Enter = ничего не создавать: ").strip()
+    if not raw:
+        print("Пропускаю создание inbound'ов.")
+        return 0
+    tokens = raw.replace(",", " ").split()
+    indexes = []
+    for token in tokens:
+        if "-" in token:
+            left, sep, right = token.partition("-")
+            if not sep or not left or not right:
+                raise SystemExit("Диапазон нужно писать в виде 1-4")
+            try:
+                start = int(left)
+                end = int(right)
+            except ValueError:
+                raise SystemExit("Диапазоны должны состоять только из номеров пунктов")
+            if start > end:
+                raise SystemExit("В диапазоне левая граница должна быть меньше или равна правой")
+            values = range(start, end + 1)
+        else:
+            try:
+                values = [int(token)]
+            except ValueError:
+                raise SystemExit("Нужно ввести один или несколько номеров или диапазонов через пробел")
+
+        for idx in values:
+            if idx < 1 or idx > len(options):
+                raise SystemExit(f"Пункта {idx} в меню нет")
+            if idx not in indexes:
+                indexes.append(idx)
+
+    custom_specs = []
+    for idx in indexes:
+        line = options[idx - 1]["line"]
+        if line not in custom_specs:
+            custom_specs.append(line)
+    specs = [parse_custom_spec_line(line) for line in custom_specs]
+    return apply_custom_specs(specs)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) == 1:
+        return menu()
+    if argv[1] == "--catalog-json":
+        opener, state = make_opener()
+        login(opener, state)
+        print(json.dumps(build_catalog_groups(state), ensure_ascii=False, indent=2))
+        return 0
+    if argv[1] == "--apply-lines-json":
+        if len(argv) < 3:
+            raise SystemExit("Usage: vpnbot-xui-presets --apply-lines-json <file>")
+        payload = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise SystemExit("Expected JSON array of catalog lines")
+        custom_specs = []
+        for line in payload:
+            if not isinstance(line, str):
+                continue
+            text = line.strip()
+            if text and text not in custom_specs:
+                custom_specs.append(text)
+        specs = [parse_custom_spec_line(line) for line in custom_specs]
+        return apply_custom_specs(specs)
+    if argv[1] == "--list":
+        opener, state = make_opener()
+        login(opener, state)
+        for group in build_catalog_groups(state):
+            print(group["title"] + ":")
+            for item in group["items"]:
+                print(f"  {item['title']}")
+            print("")
+        return 0
+    raise SystemExit("Использование: vpnbot-xui-presets [--list]")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
+EOF
+    chmod 755 "${XUI_PRESET_HELPER}"
+}
+
+
+write_vless_preset_helper() {
+    cat > "${VPNBOT_VLESS_PRESET_HELPER}" <<EOF
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import random
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+BACKEND_MODE = ${VPNBOT_VLESS_BACKEND@Q}
+LEGACY_XUI_HELPER = ${XUI_PRESET_HELPER@Q}
+XRAY_STATE_FILE = Path(${XRAY_CORE_INSTALLER_STATE_FILE@Q})
+XRAY_BIN = ${XRAY_CORE_BIN@Q}
+XRAY_CONFDIR = Path(${XRAY_CORE_CONFIG_DIR@Q})
+XRAY_ASSET_DIR = Path(${XRAY_CORE_SHARE_DIR@Q})
+XRAY_MANAGED_INBOUNDS_FILE = Path(${XRAY_CORE_MANAGED_INBOUNDS_FILE@Q})
+XRAY_SERVICE_NAME = ${XRAY_CORE_SERVICE_NAME@Q}
+XRAY_SYNC_SCRIPT = ${XRAY_SYNC_SCRIPT@Q}
+DEFAULT_TLS_CERT = ${NGINX_SSL_CERT@Q}
+DEFAULT_TLS_KEY = ${NGINX_SSL_KEY@Q}
+PORT_MIN = 20000
+PORT_MAX = 45000
+REALITY_FINGERPRINT = "chrome"
+XRAY_TCP_REALITY_DOMAINS = [
+    "www.yandex.ru",
+    "rutube.ru",
+    "www.wildberries.ru",
+    "www.hp.com",
+    "www.sberbank.ru",
+    "www.intel.com",
+]
+XRAY_PROTOCOL_LABELS = [
+    ("vless", "VLESS"),
+    ("vmess", "VMESS"),
+    ("trojan", "TROJAN"),
+]
+MARK_RE = re.compile(r"\\[(?P<value>direct|shared:\\d+|\\d+)\\]", re.IGNORECASE)
+
+
+def slugify(text: str) -> str:
+    value = re.sub(r"[^a-zA-Z0-9]+", "-", str(text or "").strip().lower()).strip("-")
+    return value or "route"
+
+
+def normalize_sni(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def parse_custom_spec_line(line: str) -> dict:
+    original = line.strip()
+    if not original:
+        raise SystemExit("Пустую строку inbound'а разобрать нельзя")
+
+    tokens = original.split()
+    lower_tokens = [token.lower() for token in tokens]
+    spec = {
+        "source": original,
+        "protocol": "vless",
+        "network": None,
+        "security": None,
+        "preferred_port": None,
+        "domain": None,
+        "any_port": False,
+    }
+
+    if tokens and tokens[0].isdigit():
+        spec["preferred_port"] = int(tokens[0])
+        tokens = tokens[1:]
+        lower_tokens = lower_tokens[1:]
+
+    joined = " ".join(lower_tokens)
+    if "любой порт" in joined or "any port" in joined:
+        spec["any_port"] = True
+
+    for token in tokens:
+        low = token.lower()
+        if low in {"vless", "vmess", "trojan"}:
+            spec["protocol"] = low
+        elif low in {"tcp", "ws", "grpc", "xhttp"}:
+            spec["network"] = low
+        elif low in {"raw", "reality"}:
+            spec["security"] = "reality"
+        elif low in {"tls", "none"}:
+            spec["security"] = low
+        elif token.isdigit() and spec["preferred_port"] is None:
+            spec["preferred_port"] = int(token)
+        elif "." in token and not token.startswith("["):
+            spec["domain"] = token.lower()
+
+    if not spec["network"]:
+        raise SystemExit(f"Не удалось понять транспорт в строке: {original}")
+
+    if spec["security"] is None:
+        spec["security"] = "reality" if spec["domain"] and spec["network"] in {"tcp", "xhttp"} else "none"
+
+    if spec["preferred_port"] is None and not spec["any_port"]:
+        spec["any_port"] = True
+
+    if spec["security"] in {"reality", "tls"} and not spec["domain"]:
+        raise SystemExit(f"Для reality/tls нужен домен/SNI в строке: {original}")
+
+    return spec
+
+
+def load_xray_state() -> dict:
+    if not XRAY_STATE_FILE.exists():
+        return {}
+    try:
+        payload = json.loads(XRAY_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def get_public_tls_domain(state: dict) -> str:
+    return str(state.get("public_domain") or state.get("app_domain") or "").strip().lower()
+
+
+def parse_publication_spec(text: str) -> dict:
+    m = MARK_RE.search(text or "")
+    if not m:
+        return {"mode": "direct", "port": None}
+    raw = m.group("value").lower()
+    if raw == "direct":
+        return {"mode": "direct", "port": None}
+    if raw.startswith("shared:"):
+        return {"mode": "shared", "port": int(raw.split(":", 1)[1])}
+    return {"mode": "shared", "port": int(raw)}
+
+
+def normalize_inbound_rows(raw_obj) -> list[dict]:
+    if raw_obj is None:
+        return []
+    if isinstance(raw_obj, str):
+        try:
+            raw_obj = json.loads(raw_obj)
+        except Exception:
+            return []
+    if isinstance(raw_obj, list):
+        return [row for row in raw_obj if isinstance(row, dict)]
+    if isinstance(raw_obj, dict):
+        nested = raw_obj.get("inbounds")
+        if isinstance(nested, list):
+            return [row for row in nested if isinstance(row, dict)]
+        return [raw_obj]
+    return []
+
+
+def load_xray_inbounds() -> tuple[dict, list[dict]]:
+    if not XRAY_MANAGED_INBOUNDS_FILE.exists():
+        payload = {"inbounds": []}
+        return payload, []
+    try:
+        payload = json.loads(XRAY_MANAGED_INBOUNDS_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"Не удалось прочитать managed inbounds file {XRAY_MANAGED_INBOUNDS_FILE}: {exc}") from exc
+    if not isinstance(payload, dict):
+        payload = {"inbounds": []}
+    rows = normalize_inbound_rows(payload.get("inbounds"))
+    return payload, rows
+
+
+def save_xray_inbounds(rows: list[dict]) -> None:
+    payload = {"inbounds": rows}
+    XRAY_MANAGED_INBOUNDS_FILE.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\\n",
+        encoding="utf-8",
+    )
+
+
+def choose_random_port(rows: list[dict], *, forbidden: set[int] | None = None) -> int:
+    used = {
+        int(row.get("port") or 0)
+        for row in rows
+        if isinstance(row, dict) and int(row.get("port") or 0) > 0
+    }
+    used.update(forbidden or set())
+    for _ in range(2000):
+        port = random.randint(PORT_MIN, PORT_MAX)
+        if port in used:
+            continue
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("0.0.0.0", port))
+        except OSError:
+            sock.close()
+            continue
+        sock.close()
+        return port
+    raise SystemExit("Не удалось подобрать свободный TCP-порт для standalone Xray-core")
+
+
+def iter_existing_actual_ports(rows: list[dict]) -> set[int]:
+    return {
+        int(row.get("port") or 0)
+        for row in rows
+        if isinstance(row, dict) and int(row.get("port") or 0) > 0
+    }
+
+
+def iter_existing_shared_ports(rows: list[dict]) -> set[int]:
+    ports = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        publication = parse_publication_spec(str(row.get("tag") or ""))
+        if publication["mode"] == "shared" and publication.get("port"):
+            ports.add(int(publication["port"]))
+    return ports
+
+
+def extract_existing_route_keys(rows: list[dict]) -> dict[int, dict[str, set[str]]]:
+    state: dict[int, dict[str, set[str]]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        publication = parse_publication_spec(str(row.get("tag") or ""))
+        if publication["mode"] != "shared" or not publication.get("port"):
+            continue
+        shared_port = int(publication["port"])
+        stream = row.get("streamSettings") or {}
+        security = str(stream.get("security") or "").lower()
+        bucket = state.setdefault(shared_port, {"sni": set(), "http_paths": set()})
+        if security in {"reality", "tls"}:
+            if security == "reality":
+                reality = stream.get("realitySettings") or {}
+                for name in reality.get("serverNames") or []:
+                    normalized = normalize_sni(name)
+                    if normalized:
+                        bucket["sni"].add(normalized)
+            else:
+                tls = stream.get("tlsSettings") or {}
+                for candidate in list(tls.get("serverNames") or []) + [tls.get("serverName"), (tls.get("settings") or {}).get("serverName")]:
+                    normalized = normalize_sni(candidate)
+                    if normalized:
+                        bucket["sni"].add(normalized)
+        else:
+            network = str(stream.get("network") or "").lower()
+            route_path = ""
+            if network in {"xhttp", "httpupgrade", "splithttp"}:
+                for key in ("xhttpSettings", "httpupgradeSettings", "splitHTTPSettings"):
+                    route_path = str((stream.get(key) or {}).get("path") or "").strip()
+                    if route_path:
+                        break
+            if route_path:
+                bucket["http_paths"].add(route_path)
+    return state
+
+
+def custom_http_path(spec: dict) -> str:
+    if str(spec.get("network") or "").lower() == "xhttp":
+        return "/"
+    base = slugify(spec["domain"] or f"{spec['protocol']}-{spec['network']}")
+    return f"/{base}-{spec['network']}"
+
+
+def build_xray_catalog_groups() -> list[dict]:
+    state = load_xray_state()
+    tls_domain = get_public_tls_domain(state) or "www.amd.com"
+
+    reality_tcp_items = []
+    for domain in XRAY_TCP_REALITY_DOMAINS:
+        slug = slugify(domain)
+        for port_label, line_prefix, title_prefix, mode_suffix in (
+            ("443", "443", "443", ""),
+            ("8443", "8443", "8443", ""),
+            ("random_direct", "", "случайный direct-порт", " случайный direct-порт"),
+            ("random_shared", "", "случайный shared-порт", " случайный shared-порт"),
+        ):
+            reality_tcp_items.append(
+                {
+                    "id": f"xray_vless_tcp_reality_{slug}_{port_label}",
+                    "title": f"{title_prefix} VLESS TCP REALITY {domain}",
+                    "line": f"{line_prefix + ' ' if line_prefix else ''}vless tcp raw {domain}{mode_suffix}",
+                }
+            )
+            reality_tcp_items.append(
+                {
+                    "id": f"xray_trojan_tcp_reality_{slug}_{port_label}",
+                    "title": f"{title_prefix} TROJAN TCP REALITY {domain}",
+                    "line": f"{line_prefix + ' ' if line_prefix else ''}trojan tcp raw {domain}{mode_suffix}",
+                }
+            )
+
+    reality_xhttp_items = []
+    for domain in XRAY_TCP_REALITY_DOMAINS:
+        slug = slugify(domain)
+        for port_label, line_prefix, title_prefix, mode_suffix in (
+            ("443", "443", "443", ""),
+            ("8443", "8443", "8443", ""),
+            ("random_direct", "", "случайный direct-порт", " случайный direct-порт"),
+            ("random_shared", "", "случайный shared-порт", " случайный shared-порт"),
+        ):
+            reality_xhttp_items.append(
+                {
+                    "id": f"xray_vless_xhttp_reality_{slug}_{port_label}",
+                    "title": f"{title_prefix} VLESS XHTTP REALITY {domain}",
+                    "line": f"{line_prefix + ' ' if line_prefix else ''}vless xhttp raw {domain}{mode_suffix}",
+                }
+            )
+            reality_xhttp_items.append(
+                {
+                    "id": f"xray_trojan_xhttp_reality_{slug}_{port_label}",
+                    "title": f"{title_prefix} TROJAN XHTTP REALITY {domain}",
+                    "line": f"{line_prefix + ' ' if line_prefix else ''}trojan xhttp raw {domain}{mode_suffix}",
+                }
+            )
+
+    tls_items = [
+        {"id": "xray_vmess_tls_8443", "title": f"8443 VMESS TCP TLS {tls_domain}", "line": f"8443 vmess tcp tls {tls_domain}"},
+        {"id": "xray_vless_tls_public", "title": f"случайный direct-порт VLESS TCP TLS {tls_domain}", "line": f"vless tcp tls {tls_domain} случайный direct-порт"},
+        {"id": "xray_trojan_tls_public", "title": f"случайный direct-порт TROJAN TCP TLS {tls_domain}", "line": f"trojan tcp tls {tls_domain} случайный direct-порт"},
+        {"id": "xray_vless_xhttp_tls_public", "title": f"случайный direct-порт VLESS XHTTP TLS {tls_domain}", "line": f"vless xhttp tls {tls_domain} случайный direct-порт"},
+        {"id": "xray_trojan_xhttp_tls_public", "title": f"случайный direct-порт TROJAN XHTTP TLS {tls_domain}", "line": f"trojan xhttp tls {tls_domain} случайный direct-порт"},
+        {"id": "xray_vmess_xhttp_tls_public", "title": f"случайный direct-порт VMESS XHTTP TLS {tls_domain}", "line": f"vmess xhttp tls {tls_domain} случайный direct-порт"},
+        {"id": "xray_vless_ws_tls_public", "title": f"случайный direct-порт VLESS WS TLS {tls_domain}", "line": f"vless ws tls {tls_domain} случайный direct-порт"},
+        {"id": "xray_trojan_ws_tls_public", "title": f"случайный direct-порт TROJAN WS TLS {tls_domain}", "line": f"trojan ws tls {tls_domain} случайный direct-порт"},
+        {"id": "xray_vmess_ws_tls_public", "title": f"случайный direct-порт VMESS WS TLS {tls_domain}", "line": f"vmess ws tls {tls_domain} случайный direct-порт"},
+        {"id": "xray_vless_grpc_tls_public", "title": f"случайный direct-порт VLESS gRPC TLS {tls_domain}", "line": f"vless grpc tls {tls_domain} случайный direct-порт"},
+        {"id": "xray_trojan_grpc_tls_public", "title": f"случайный direct-порт TROJAN gRPC TLS {tls_domain}", "line": f"trojan grpc tls {tls_domain} случайный direct-порт"},
+        {"id": "xray_vmess_grpc_tls_public", "title": f"случайный direct-порт VMESS gRPC TLS {tls_domain}", "line": f"vmess grpc tls {tls_domain} случайный direct-порт"},
+    ]
+
+    items = []
+    for group_items in (reality_tcp_items, reality_xhttp_items, tls_items):
+        items.extend(group_items)
+    return [
+        {
+            "title": "Standalone Xray-core: Reality TCP",
+            "items": reality_tcp_items,
+        },
+        {
+            "title": "Standalone Xray-core: Reality XHTTP",
+            "items": reality_xhttp_items,
+        },
+        {
+            "title": "Standalone Xray-core: TLS",
+            "items": tls_items,
+        },
+    ]
+
+
+def fetch_catalog_groups() -> list[dict]:
+    if BACKEND_MODE == "3x-ui":
+        if not Path(LEGACY_XUI_HELPER).exists():
+            raise SystemExit(f"Legacy x-ui helper not found: {LEGACY_XUI_HELPER}")
+        result = subprocess.run(
+            [LEGACY_XUI_HELPER, "--catalog-json"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        payload = json.loads(result.stdout)
+        return payload if isinstance(payload, list) else []
+    return build_xray_catalog_groups()
+
+
+def select_catalog_lines(groups: list[dict]) -> list[str]:
+    options = []
+    heading = (
+        "Выбери inbound'ы для standalone Xray-core:"
+        if BACKEND_MODE == "xray-core"
+        else "Выбери inbound'ы для VLESS backend:"
+    )
+    print(heading)
+    for group in groups:
+        print("")
+        print(f"[{group['title']}]")
+        for item in group.get("items") or []:
+            options.append(item)
+            print(f"  {len(options)}. {item['title']}")
+    print("")
+    raw = input("Номера или диапазоны через пробел, Enter = ничего не создавать: ").strip()
+    if not raw:
+        print("Пропускаю создание inbound'ов.")
+        return []
+
+    tokens = raw.replace(",", " ").split()
+    indexes = []
+    for token in tokens:
+        if "-" in token:
+            left, sep, right = token.partition("-")
+            if not sep or not left or not right:
+                raise SystemExit("Диапазон нужно писать в виде 1-4")
+            try:
+                start = int(left)
+                end = int(right)
+            except ValueError:
+                raise SystemExit("Диапазоны должны состоять только из номеров пунктов")
+            if start > end:
+                raise SystemExit("В диапазоне левая граница должна быть меньше или равна правой")
+            values = range(start, end + 1)
+        else:
+            try:
+                values = [int(token)]
+            except ValueError:
+                raise SystemExit("Нужно ввести один или несколько номеров или диапазонов через пробел")
+        for idx in values:
+            if idx < 1 or idx > len(options):
+                raise SystemExit(f"Пункта {idx} в меню нет")
+            if idx not in indexes:
+                indexes.append(idx)
+
+    selected = []
+    for idx in indexes:
+        line = str(options[idx - 1].get("line") or "").strip()
+        if line and line not in selected:
+            selected.append(line)
+    return selected
+
+
+def apply_lines_via_xui(lines: list[str]) -> int:
+    if not Path(LEGACY_XUI_HELPER).exists():
+        raise SystemExit(f"Legacy x-ui helper not found: {LEGACY_XUI_HELPER}")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+        json.dump(lines, tmp, ensure_ascii=False, indent=2)
+        tmp_path = tmp.name
+    try:
+        result = subprocess.run(
+            [LEGACY_XUI_HELPER, "--apply-lines-json", tmp_path],
+            check=False,
+            text=True,
+        )
+        return int(result.returncode or 0)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def get_xray_x25519() -> tuple[str, str]:
+    result = subprocess.run(
+        [XRAY_BIN, "x25519"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    private_key = ""
+    public_key = ""
+    output = (result.stdout or "") + "\n" + (result.stderr or "")
+    for raw in output.splitlines():
+        line = raw.strip()
+        compact = line.lower().replace(" ", "").replace("_", "")
+        value = line.split(":", 1)[1].strip() if ":" in line else ""
+        if not value:
+            parts = line.split()
+            value = parts[-1].strip() if parts else ""
+        if not private_key and "privatekey" in compact:
+            private_key = value
+        if not public_key and "publickey" in compact:
+            public_key = value
+    if not private_key or not public_key:
+        raise SystemExit(f"Xray did not return a valid x25519 keypair. Output:\n{output.strip()}")
+    return private_key, public_key
+
+
+def match_existing_xray(rows: list[dict], *, protocol: str, network: str, security: str, sni: str, port: int | None = None) -> dict | None:
+    wanted_sni = normalize_sni(sni)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("protocol") or "").lower() != protocol:
+            continue
+        row_port = int(row.get("port") or 0)
+        if port is not None and row_port != int(port):
+            continue
+        stream = row.get("streamSettings") or {}
+        row_network = str(stream.get("network") or "").lower()
+        row_security = str(stream.get("security") or "").lower()
+        if row_network != network or row_security != security:
+            continue
+        if not wanted_sni:
+            return row
+        if security == "reality":
+            reality = stream.get("realitySettings") or {}
+            values = {normalize_sni(item) for item in (reality.get("serverNames") or []) if str(item).strip()}
+        elif security == "tls":
+            tls = stream.get("tlsSettings") or {}
+            values = set()
+            for candidate in list(tls.get("serverNames") or []) + [tls.get("serverName"), (tls.get("settings") or {}).get("serverName")]:
+                normalized = normalize_sni(candidate)
+                if normalized:
+                    values.add(normalized)
+        else:
+            values = set()
+        if wanted_sni in values:
+            return row
+    return None
+
+
+def prepare_xray_specs(lines: list[str], rows: list[dict]) -> list[dict]:
+    prepared = []
+    occupied_actual_ports = set(iter_existing_actual_ports(rows))
+    occupied_shared_ports = set(iter_existing_shared_ports(rows))
+    existing_routes = extract_existing_route_keys(rows)
+    new_routes: dict[int, dict[str, set[str]]] = {}
+    preferred_counts: dict[int, int] = {}
+    shared_random_groups: dict[tuple[str, str, str], list[dict]] = {}
+    shared_random_ports: dict[tuple[str, str, str], int] = {}
+
+    for line in lines:
+        spec = parse_custom_spec_line(line)
+        preferred = spec.get("preferred_port")
+        if preferred is not None:
+            preferred_counts[int(preferred)] = preferred_counts.get(int(preferred), 0) + 1
+        if spec.get("publication") == "shared-random":
+            group_key = (spec["network"], spec["security"], "random-shared")
+            shared_random_groups.setdefault(group_key, []).append(spec)
+        prepared.append(spec)
+
+    for group_key, group_specs in shared_random_groups.items():
+        if len(group_specs) > 1:
+            port = choose_random_port(rows, forbidden=occupied_actual_ports | occupied_shared_ports)
+            shared_random_ports[group_key] = port
+            occupied_shared_ports.add(port)
+
+    final_specs = []
+    for line in lines:
+        spec = parse_custom_spec_line(line)
+        if spec["protocol"] not in {"vless", "vmess", "trojan"}:
+            raise SystemExit(f"Для standalone Xray-core пока разрешены только VLESS/VMESS/TROJAN: {line}")
+        if spec["network"] not in {"tcp", "xhttp", "ws", "grpc"}:
+            raise SystemExit(f"Для standalone Xray-core сейчас разрешены TCP, WS, gRPC и XHTTP: {line}")
+        if spec["security"] not in {"reality", "tls"}:
+            raise SystemExit(f"Для standalone Xray-core сейчас разрешены только REALITY и TLS: {line}")
+        if spec["protocol"] == "vmess" and spec["security"] == "reality":
+            raise SystemExit(f"VMESS + REALITY не входит в текущий каталог возможностей installer: {line}")
+        if spec["security"] == "reality" and spec["network"] not in {"tcp", "xhttp"}:
+            raise SystemExit(f"Для standalone Xray-core REALITY сейчас разрешён только с TCP и XHTTP: {line}")
+        spec.setdefault("resolution_notes", [])
+
+        if spec.get("publication") == "shared-random":
+            group_key = (spec["network"], spec["security"], "random-shared")
+            shared_port = shared_random_ports.get(group_key)
+            if shared_port:
+                spec["mode"] = "shared"
+                spec["external_port"] = shared_port
+                spec["resolution_notes"].append(
+                    f"случайный shared-порт для группы {spec['network']}/{spec['security']}: {shared_port}"
+                )
+                pending_bucket = new_routes.setdefault(shared_port, {"sni": set(), "http_paths": set()})
+                if spec["security"] in {"reality", "tls"}:
+                    pending_bucket["sni"].add(normalize_sni(spec["domain"]))
+                else:
+                    pending_bucket["http_paths"].add(custom_http_path(spec))
+                backend_port = choose_random_port(rows, forbidden=occupied_actual_ports | occupied_shared_ports)
+                spec["listen_port"] = backend_port
+                occupied_actual_ports.add(backend_port)
+                final_specs.append(spec)
+                continue
+            spec["resolution_notes"].append(
+                "случайный shared-порт был выбран только для одного inbound; использую случайный direct-порт"
+            )
+
+        preferred_port = spec.get("preferred_port")
+        if preferred_port is not None:
+            preferred_port = int(preferred_port)
+            wants_shared = (
+                preferred_counts.get(preferred_port, 0) > 1
+                or preferred_port in occupied_shared_ports
+            )
+
+            if wants_shared:
+                shared_port = preferred_port
+                spec["mode"] = "shared"
+
+                def route_conflict(candidate_port: int) -> bool:
+                    route_bucket = existing_routes.setdefault(candidate_port, {"sni": set(), "http_paths": set()})
+                    pending_bucket = new_routes.setdefault(candidate_port, {"sni": set(), "http_paths": set()})
+                    if spec["security"] in {"reality", "tls"}:
+                        sni = normalize_sni(spec["domain"])
+                        return sni in route_bucket["sni"] or sni in pending_bucket["sni"]
+                    path = custom_http_path(spec)
+                    return path in route_bucket["http_paths"] or path in pending_bucket["http_paths"]
+
+                if shared_port in occupied_actual_ports or route_conflict(shared_port):
+                    replacement = choose_random_port(rows, forbidden=occupied_actual_ports | occupied_shared_ports)
+                    if shared_port in occupied_actual_ports:
+                        spec["resolution_notes"].append(
+                            f"желаемый порт {preferred_port} пришлось перевести в shared и перенести на {replacement}, потому что реальный порт уже был занят"
+                        )
+                    else:
+                        spec["resolution_notes"].append(
+                            f"на shared-порту {preferred_port} уже был конфликт маршрута, назначен {replacement}"
+                        )
+                    shared_port = replacement
+                elif preferred_counts.get(preferred_port, 0) > 1:
+                    spec["resolution_notes"].append(
+                        f"порт {preferred_port} выбран несколькими inbound'ами, поэтому они будут опубликованы как shared на одном внешнем порту"
+                    )
+
+                spec["external_port"] = shared_port
+                pending_bucket = new_routes.setdefault(shared_port, {"sni": set(), "http_paths": set()})
+                if spec["security"] in {"reality", "tls"}:
+                    pending_bucket["sni"].add(normalize_sni(spec["domain"]))
+                else:
+                    pending_bucket["http_paths"].add(custom_http_path(spec))
+                backend_port = choose_random_port(rows, forbidden=occupied_actual_ports | occupied_shared_ports)
+                spec["listen_port"] = backend_port
+                occupied_actual_ports.add(backend_port)
+                occupied_shared_ports.add(shared_port)
+                final_specs.append(spec)
+                continue
+
+        spec["mode"] = "direct"
+        if preferred_port is not None:
+            direct_port = int(preferred_port)
+            if direct_port in occupied_actual_ports or direct_port in occupied_shared_ports:
+                replacement = choose_random_port(rows, forbidden=occupied_actual_ports | occupied_shared_ports)
+                spec["resolution_notes"].append(
+                    f"желаемый direct-порт {direct_port} был занят, назначен {replacement}"
+                )
+                direct_port = replacement
+            else:
+                spec["resolution_notes"].append(
+                    f"порт {direct_port} используется только одним inbound'ом, поэтому он будет опубликован как direct"
+                )
+        else:
+            direct_port = choose_random_port(rows, forbidden=occupied_actual_ports | occupied_shared_ports)
+            spec["resolution_notes"].append(
+                f"порт не был задан явно, назначен свободный direct-порт {direct_port}"
+            )
+        spec["listen_port"] = direct_port
+        occupied_actual_ports.add(direct_port)
+        final_specs.append(spec)
+    return final_specs
+
+
+def build_xray_payload(spec: dict, rows: list[dict]) -> tuple[dict | None, str]:
+    protocol = spec["protocol"]
+    network = spec["network"]
+    security = spec["security"]
+    domain = str(spec.get("domain") or "").strip().lower()
+    listen_port = int(spec["listen_port"])
+    state = load_xray_state()
+    public_tls_domain = get_public_tls_domain(state)
+
+    existing = match_existing_xray(
+        rows,
+        protocol=protocol,
+        network=network,
+        security=security,
+        sni=domain,
+        port=listen_port if spec.get("mode") == "direct" else None,
+    )
+    if existing:
+        return None, (
+            f"reuse existing {protocol} {network} {security} for {domain} "
+            f"(tag={existing.get('tag') or '<no-tag>'}, port={existing.get('port')})"
+        )
+
+    private_key, public_key = get_xray_x25519()
+    short_id = "".join(random.choice("0123456789abcdef") for _ in range(16))
+    tag = f"vpnbot-{protocol}-{network}-{security}-{slugify(domain)}-{listen_port}"
+
+    if protocol == "vless":
+        settings = {"clients": [], "decryption": "none", "fallbacks": []}
+    elif protocol == "trojan":
+        settings = {"clients": [], "fallbacks": []}
+    elif protocol == "vmess":
+        settings = {"clients": []}
+    else:
+        raise SystemExit(f"Неподдерживаемый протокол для xray-core helper: {protocol}")
+
+    if security == "tls" and public_tls_domain and domain and domain != public_tls_domain:
+        raise SystemExit(
+            "Для TLS-inbound standalone xray-core installer сейчас использует сертификат, выпущенный на "
+            f"{public_tls_domain}. Поэтому для TLS в каталоге укажи именно этот домен, "
+            "либо сначала подготовь другой сертификат вручную."
+        )
+
+    publication_marker = (
+        f"[shared:{int(spec['external_port'])}]"
+        if spec.get("mode") == "shared" and spec.get("external_port")
+        else "[direct]"
+    )
+    tag = f"{publication_marker} {tag}"
+
+    stream_settings = {
+        "network": network,
+        "security": security,
+    }
+
+    if security == "reality":
+        stream_settings["realitySettings"] = {
+            "show": False,
+            "xver": 0,
+            "dest": f"{domain}:443",
+            "serverNames": [domain],
+            "privateKey": private_key,
+            "minClientVer": "",
+            "maxClientVer": "",
+            "maxTimeDiff": 0,
+            "shortIds": [short_id],
+            "settings": {
+                "publicKey": public_key,
+                "fingerprint": REALITY_FINGERPRINT,
+                "serverName": "",
+                "spiderX": "/",
+            },
+        }
+    elif security == "tls":
+        alpn = ["h2", "http/1.1"] if network == "grpc" else ["http/1.1"]
+        stream_settings["tlsSettings"] = {
+            "serverName": domain,
+            "alpn": alpn,
+            "minVersion": "1.2",
+            "maxVersion": "1.3",
+            "cipherSuites": "",
+            "rejectUnknownSni": False,
+            "disableSystemRoot": False,
+            "enableSessionResumption": False,
+            "certificates": [
+                {
+                    "certificateFile": DEFAULT_TLS_CERT,
+                    "keyFile": DEFAULT_TLS_KEY,
+                    "ocspStapling": 3600,
+                    "usage": "encipherment",
+                }
+            ],
+            "settings": {
+                "allowInsecure": False,
+                "fingerprint": REALITY_FINGERPRINT,
+                "serverName": domain,
+            },
+        }
+
+    if network == "tcp":
+        stream_settings["tcpSettings"] = {
+            "acceptProxyProtocol": False,
+            "header": {
+                "type": "none"
+            }
+        }
+    elif network == "xhttp":
+        stream_settings["xhttpSettings"] = {
+            "path": custom_http_path(spec),
+            "host": "",
+            "headers": {},
+            "scMaxBufferedPosts": 30,
+            "scMaxEachPostBytes": "1000000",
+            "noSSEHeader": False,
+            "xPaddingBytes": "100-1000",
+            "mode": "auto",
+        }
+    elif network == "ws":
+        stream_settings["wsSettings"] = {
+            "path": custom_http_path(spec),
+            "headers": {},
+        }
+    elif network == "grpc":
+        stream_settings["grpcSettings"] = {
+            "serviceName": slugify(domain or f"{protocol}-grpc"),
+            "multiMode": False,
+        }
+    else:
+        raise SystemExit(f"Неподдерживаемый транспорт для xray-core helper: {network}")
+
+    payload = {
+        "tag": tag,
+        "listen": "0.0.0.0",
+        "port": listen_port,
+        "protocol": protocol,
+        "settings": settings,
+        "streamSettings": stream_settings,
+        "sniffing": {
+            "enabled": security != "reality",
+            "destOverride": ["http", "tls", "quic"],
+            "metadataOnly": False,
+            "routeOnly": False,
+        },
+    }
+    return payload, (
+        f"create {protocol} {network} {security} on "
+        f"{'shared port ' + str(spec['external_port']) if spec.get('mode') == 'shared' else 'direct port ' + str(listen_port)} "
+        f"backend_port={listen_port}, sni/target={domain}:443"
+    )
+
+
+def validate_and_restart_xray() -> None:
+    env = {"XRAY_LOCATION_ASSET": str(XRAY_ASSET_DIR), "XRAY_LOCATION_CONFDIR": str(XRAY_CONFDIR)}
+    subprocess.run(
+        [XRAY_BIN, "run", "-confdir", str(XRAY_CONFDIR), "-dump"],
+        check=True,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    subprocess.run(["systemctl", "restart", XRAY_SERVICE_NAME], check=True)
+    subprocess.run(["systemctl", "is-active", "--quiet", XRAY_SERVICE_NAME], check=True)
+
+
+def apply_lines_via_xray(lines: list[str]) -> int:
+    _, rows = load_xray_inbounds()
+    prepared = prepare_xray_specs(lines, rows)
+    notes = []
+    created = []
+    new_rows = list(rows)
+    for spec in prepared:
+        payload, note = build_xray_payload(spec, new_rows)
+        notes.append(note)
+        if payload is None:
+            continue
+        created.append(payload)
+        new_rows.append(payload)
+
+    backup_text = ""
+    if XRAY_MANAGED_INBOUNDS_FILE.exists():
+        backup_text = XRAY_MANAGED_INBOUNDS_FILE.read_text(encoding="utf-8")
+    try:
+        save_xray_inbounds(new_rows)
+        validate_and_restart_xray()
+        subprocess.run([XRAY_SYNC_SCRIPT], check=True)
+    except Exception as exc:
+        if backup_text:
+            XRAY_MANAGED_INBOUNDS_FILE.write_text(backup_text, encoding="utf-8")
+        else:
+            XRAY_MANAGED_INBOUNDS_FILE.unlink(missing_ok=True)
+        try:
+            validate_and_restart_xray()
+            subprocess.run([XRAY_SYNC_SCRIPT], check=True)
+        except Exception:
+            pass
+        raise SystemExit(f"Не удалось применить xray-core inbound'ы, откатил managed file: {exc}") from exc
+
+    print("VPnBot standalone xray-core catalog result")
+    print("==========================================")
+    for note in notes:
+        print(f"- {note}")
+    for spec in prepared:
+        for resolution_note in spec.get("resolution_notes", []):
+            print(f"- auto-resolve: {resolution_note}")
+    if created:
+        print("")
+        print("Созданные inbound'ы:")
+        for obj in created:
+            stream = obj.get("streamSettings") or {}
+            network = str(stream.get("network") or "").lower()
+            security = str(stream.get("security") or "").lower()
+            publication = parse_publication_spec(str(obj.get("tag") or ""))
+            mode = f"shared {publication['port']}" if publication["mode"] == "shared" and publication.get("port") else "direct"
+            server_names = []
+            if security == "reality":
+                server_names = (stream.get("realitySettings") or {}).get("serverNames") or []
+            elif security == "tls":
+                tls = stream.get("tlsSettings") or {}
+                server_names = list(tls.get("serverNames") or [])
+                if not server_names and tls.get("serverName"):
+                    server_names = [tls.get("serverName")]
+            print(
+                f"  • tag={obj.get('tag')} {obj.get('protocol')} {network}/{security or 'none'} "
+                f"port={obj.get('port')} mode={mode} sni={','.join(server_names)}"
+            )
+    else:
+        print("")
+        print("Новых inbound'ов не понадобилось: подходящие уже существовали.")
+    return 0
+
+
+def list_titles(groups: list[dict]) -> int:
+    for group in groups:
+        print(group["title"] + ":")
+        for item in group.get("items") or []:
+            print(f"  {item['title']}")
+        print("")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    groups = fetch_catalog_groups()
+    if len(argv) > 1 and argv[1] == "--list":
+        return list_titles(groups)
+    if len(argv) > 1 and argv[1] == "--catalog-json":
+        print(json.dumps(groups, ensure_ascii=False, indent=2))
+        return 0
+    if len(argv) > 1 and argv[1] == "--apply-lines-json":
+        if len(argv) < 3:
+            raise SystemExit("Usage: vpnbot-vless-presets --apply-lines-json <file>")
+        payload = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise SystemExit("Expected JSON array of catalog lines")
+        lines = []
+        for item in payload:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if text and text not in lines:
+                lines.append(text)
+        if BACKEND_MODE == "3x-ui":
+            return apply_lines_via_xui(lines)
+        return apply_lines_via_xray(lines)
+    lines = select_catalog_lines(groups)
+    if not lines:
+        return 0
+    if BACKEND_MODE == "3x-ui":
+        return apply_lines_via_xui(lines)
+    return apply_lines_via_xray(lines)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
+EOF
+    chmod 755 "${VPNBOT_VLESS_PRESET_HELPER}"
+}
+
+
+write_direct_helpers() {
+    cat > "${NGINX_WS_HELPER}" <<'WS'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "Deprecated: use remark/tag markers in 3x-ui and run vpnbot-xui-sync-routes"
+echo "Marker examples:"
+echo "  [443] or [shared:443] inbound over shared TCP/443"
+echo "  [8443] or [shared:8443] inbound over shared TCP/8443"
+echo "  [direct] inbound on its own real port"
+WS
+    chmod 755 "${NGINX_WS_HELPER}"
+
+    cat > "${NGINX_GRPC_HELPER}" <<'GRPC'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "Deprecated: use remark/tag markers in 3x-ui and run vpnbot-xui-sync-routes"
+GRPC
+    chmod 755 "${NGINX_GRPC_HELPER}"
+
+    cat > "${NGINX_ROUTE_LIST_HELPER}" <<'LIST'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "HTTP routes:"
+ls -1 /etc/nginx/vpnbot-http-locations.d 2>/dev/null || true
+echo ""
+echo "Stream files:"
+ls -1 /etc/nginx/vpnbot-stream.d 2>/dev/null || true
+LIST
+    chmod 755 "${NGINX_ROUTE_LIST_HELPER}"
+}
+
+
+enable_sync() {
+    systemctl daemon-reload
+    if is_xray_core_backend; then
+        systemctl enable --now vpnbot-xray-sync-routes.path
+        systemctl enable --now vpnbot-xray-sync-routes.timer
+        systemctl start vpnbot-xray-sync-routes.service
+        return 0
+    fi
+    systemctl enable --now vpnbot-xui-sync-routes.path
+    systemctl enable --now vpnbot-xui-sync-routes.timer
+    systemctl start vpnbot-xui-sync-routes.service
+}
+
+
+run_initial_preset_flow() {
+    if [[ "${XUI_PRESET_AUTORUN}" == "none" ]]; then
+        return 0
+    fi
+
+    if [[ -t 0 && -t 1 ]]; then
+        echo ""
+        info "Inbound catalog"
+        if is_xray_core_backend; then
+            echo "  The installer can create standalone Xray-core inbound variants with direct/shared publication right now."
+        else
+            echo "  The installer can create grouped inbound variants for the current VLESS backend right now."
+        fi
+        echo "  If you skip it now, you can run: ${VPNBOT_VLESS_PRESET_HELPER}"
+        "${VPNBOT_VLESS_PRESET_HELPER}"
+    else
+        info "Non-interactive mode detected; skip inbound catalog menu. Run ${VPNBOT_VLESS_PRESET_HELPER} later if needed."
+    fi
+}
+
+
+show_xray_core_summary() {
+    local public_endpoint
+    public_endpoint="${XRAY_CORE_PUBLIC_ENDPOINT:-$(get_effective_public_endpoint_host)}"
+
+    echo ""
+    echo "==============================================="
+    echo "  Standalone Xray-core install complete"
+    echo "==============================================="
+    echo ""
+    info "Standalone Xray-core"
+    echo "  Backend mode: ${VPNBOT_VLESS_BACKEND}"
+    echo "  Version: ${XRAY_CORE_INSTALLED_VERSION:-<unknown>}"
+    echo "  Service: ${XRAY_CORE_SERVICE_NAME}"
+    echo "  Local API: ${XRAY_CORE_API_SERVER}"
+    echo "  Online tracker service: ${XRAY_ONLINE_TRACKER_SERVICE_NAME}"
+    echo "  Online tracker API: ${XRAY_ONLINE_TRACKER_URL}"
+    echo "  Abuse audit API: ${XRAY_ABUSE_AUDIT_URL}"
+    echo "  Root: ${XRAY_CORE_ROOT}"
+    echo "  Binary: ${XRAY_CORE_BIN}"
+    echo "  Config dir: ${XRAY_CORE_CONFIG_DIR}"
+    echo "  Managed inbounds file: ${XRAY_CORE_MANAGED_INBOUNDS_FILE}"
+    echo "  Assets dir: ${XRAY_CORE_SHARE_DIR}"
+    echo "  Logs dir: ${XRAY_CORE_LOG_DIR}"
+    echo ""
+    info "Public endpoint"
+    echo "  Public host/IP: ${public_endpoint:-<unknown>}"
+    if [[ -n "${APP_DOMAIN}" ]]; then
+        echo "  APP_DOMAIN: ${APP_DOMAIN}"
+    fi
+    if [[ -n "${PUBLIC_DOMAIN}" ]]; then
+        echo "  PUBLIC_DOMAIN: ${PUBLIC_DOMAIN}"
+    fi
+    echo ""
+    info "Smoke profile"
+    if [[ -n "${XRAY_CORE_SMOKE_LINK}" ]]; then
+        echo "  Smoke inbound: enabled"
+        echo "  TCP port: ${XRAY_CORE_SMOKE_PORT_EFFECTIVE}"
+        echo "  REALITY target/SNI: ${XRAY_CORE_SMOKE_DOMAIN}"
+        echo "  UUID: ${XRAY_CORE_SMOKE_UUID}"
+        echo "  Public key: ${XRAY_CORE_SMOKE_PUBLIC_KEY}"
+        echo "  Short ID: ${XRAY_CORE_SMOKE_SHORT_ID}"
+        echo "  Test link:"
+        echo "  ${XRAY_CORE_SMOKE_LINK}"
+    else
+        echo "  Smoke inbound: not created automatically"
+        echo "  Managed file currently contains:"
+        echo "  ${XRAY_CORE_MANAGED_INBOUNDS_FILE}"
+    fi
+    echo ""
+    info "State files"
+    echo "  Installer state: ${XRAY_CORE_INSTALLER_STATE_FILE}"
+    echo "  Rollout bundle: ${XRAY_CORE_ROLLOUT_BUNDLE_FILE}"
+    echo ""
+    info "What this mode does"
+    echo "  • installs official Xray-core into a dedicated folder"
+    echo "  • starts a separate systemd service without x-ui"
+    echo "  • keeps configs, assets and logs away from /usr/local/x-ui"
+    echo "  • runs a local-only online tracker service from Xray access.log"
+    echo "  • exposes a local-only abuse audit at /abuse for target-port triage"
+    echo "  • requires the online tracker for VPnBot online stats; missing tracker is an error"
+    echo "  • publishes shared ports through nginx stream/http route sync"
+    echo "  • keeps xray-managed inbounds in a separate JSON file under confdir"
+    echo ""
+    info "Important compatibility note"
+    echo "  VPnBot manages standalone Xray-core through SSH plus the local Xray API."
+    echo "  VPnBot online stats require ${XRAY_ONLINE_TRACKER_SERVICE_NAME}; missing tracker means the node is installed incorrectly."
+    echo "  Abuse checks can query: curl '${XRAY_ABUSE_AUDIT_URL}?port=49907'"
+    echo "  Do not configure it as a 3x-ui panel server in /root/vpnbotdata/config/servers.json."
+    echo "  Use backend_type=xray-core and skip_subscription=true."
+    echo ""
+    info "Shared ports"
+    echo "  Shared publication is handled by: ${XRAY_SYNC_SCRIPT}"
+    echo "  Local HTTPS frontend: 127.0.0.1:${HTTP_FRONTEND_LOCAL_PORT}"
+    echo "  nginx shared stream configs: ${NGINX_STREAM_INCLUDE_DIR}"
+    echo "  nginx shared HTTP routes: ${NGINX_HTTP_LOCATION_DIR}"
+    echo ""
+    info "Helper commands"
+    echo "  Quick install command:"
+    echo "  ${INSTALL_VRAY_CURL_COMMAND}"
+    echo ""
+    echo "  systemctl status ${XRAY_CORE_SERVICE_NAME} --no-pager"
+    echo "  journalctl -u ${XRAY_CORE_SERVICE_NAME} -n 200 --no-pager"
+    echo "  systemctl restart ${XRAY_CORE_SERVICE_NAME}"
+    echo "  systemctl status ${XRAY_ONLINE_TRACKER_SERVICE_NAME} --no-pager"
+    echo "  journalctl -u ${XRAY_ONLINE_TRACKER_SERVICE_NAME} -n 200 --no-pager"
+    echo "  curl -fsS ${XRAY_ONLINE_TRACKER_URL}"
+    echo "  ${XRAY_CORE_BIN} version"
+    echo "  XRAY_LOCATION_ASSET=${XRAY_CORE_SHARE_DIR} ${XRAY_CORE_BIN} run -confdir ${XRAY_CORE_CONFIG_DIR} -dump >/tmp/vpnbot-xray-dump.json"
+    echo "  ${VPNBOT_VLESS_PRESET_HELPER}"
+    echo "  ${VPNBOT_VLESS_PRESET_HELPER} --list"
+    echo "  ${XRAY_SYNC_SCRIPT}"
+    echo "  ${XRAY_SYNC_SCRIPT} --explain"
+    echo "  cat ${XRAY_CORE_MANAGED_INBOUNDS_FILE}"
+    echo "  cat ${XRAY_CORE_INSTALLER_STATE_FILE}"
+}
+
+
+show_summary() {
+    if is_xray_core_backend; then
+        show_xray_core_summary
+        return 0
+    fi
+
+    local panel_host panel_browser_url panel_api_url server_public_ip public_dns_name effective_mt_domain mt_suggested_domain
+    panel_host="${PANEL_DOMAIN:-${SHARED_HTTP_DOMAIN:-${APP_DOMAIN:-${PUBLIC_DOMAIN:-}}}}"
+    if [[ -z "${panel_host}" ]]; then
+        panel_host="$(get_primary_ipv4)"
+    fi
+    if [[ -n "${panel_host}" ]]; then
+        panel_browser_url="https://${panel_host}${NGINX_PANEL_LOCATION}"
+    else
+        panel_browser_url="https://<server-ip-or-domain>${NGINX_PANEL_LOCATION}"
+    fi
+    panel_api_url="${panel_browser_url%/}"
+    server_public_ip="$(get_primary_ipv4)"
+    public_dns_name="${SHARED_HTTP_DOMAIN:-${APP_DOMAIN:-${PUBLIC_DOMAIN:-}}}"
+    if [[ "${public_dns_name}" == app.* ]]; then
+        mt_suggested_domain="mt.${public_dns_name#app.}"
+    elif [[ "${panel_host}" == panel.* ]]; then
+        mt_suggested_domain="mt.${panel_host#panel.}"
+    else
+        mt_suggested_domain="mt.<base>"
+    fi
+    effective_mt_domain="${MT_DOMAIN:-${mt_suggested_domain}}"
+
+    echo ""
+    echo "==========================================="
+    echo "  3x-ui / VLESS install complete"
+    echo "==========================================="
+    echo ""
+    info "3x-ui panel access"
+    echo "  Panel URL: ${panel_browser_url}"
+    echo "  Username: ${XUI_PANEL_USERNAME}"
+    echo "  Password: ${XUI_PANEL_PASSWORD}"
+    echo "  Credentials saved to: ${XUI_INSTALLER_STATE_FILE}"
+    echo "  Rollout bundle saved to: ${XUI_ROLLOUT_BUNDLE_FILE}"
+    echo "  Note: open the panel URL with the trailing slash, not /login"
+    echo ""
+    info "Rollout block"
+    echo "  Domain for panel: ${panel_host:-<set PANEL_DOMAIN>}"
+    echo "  Domain for users: ${public_dns_name:-<set APP_DOMAIN/PUBLIC_DOMAIN>}"
+    echo "  Recommended domain for MTProxy: ${mt_suggested_domain}"
+    echo "  Active MTProxy domain: ${effective_mt_domain}"
+    echo "  Panel/API url for bot: ${panel_api_url}"
+    echo "  Recommended api_host override: ${server_public_ip:-<public-ip>}"
+    echo ""
+    info "Ready env block"
+    echo "  Use these values for the next rollout step:"
+    printf 'APP_DOMAIN=%q\n' "${public_dns_name:-}"
+    printf 'PANEL_DOMAIN=%q\n' "${panel_host:-}"
+    printf 'MTPROXY_TLS_DOMAIN=%q\n' "${effective_mt_domain:-}"
+    echo ""
+    info "3x-ui panel backend"
+    echo "  Backend port: ${XUI_PANEL_PORT}"
+    echo "  WebBasePath: ${XUI_PANEL_WEBBASEPATH}"
+    echo "  Xray access log: ${XUI_XRAY_ACCESS_LOG}"
+    echo "  Xray error log: ${XUI_XRAY_ERROR_LOG}"
+    echo "  Xray loglevel: ${XUI_XRAY_LOGLEVEL} (clientIps needs access log enabled)"
+    echo ""
+    info "Shared TCP port mode"
+    echo "  Panel domain: ${PANEL_DOMAIN:-${SHARED_HTTP_DOMAIN:-${APP_DOMAIN:-${PUBLIC_DOMAIN:-<set APP_DOMAIN/PUBLIC_DOMAIN>}}}}"
+    echo "  Shared HTTP domain: ${SHARED_HTTP_DOMAIN:-${APP_DOMAIN:-${PUBLIC_DOMAIN:-<set APP_DOMAIN/PUBLIC_DOMAIN>}}}"
+    echo "  Server public IPv4: ${server_public_ip:-<unknown>}"
+    if [[ -n "${DDNS_ZONE}" ]]; then
+        echo "  Dynv6 zone: ${DDNS_ZONE}"
+        echo "  Dynv6 hostname: ${PUBLIC_DOMAIN}"
+        echo "  Dynv6 host label: ${DDNS_HOST_LABEL:-<auto>}"
+        if [[ -n "${VPNBOT_SERVER_ID}" ]]; then
+            echo "  Derived from server_id: ${VPNBOT_SERVER_ID}"
+        fi
+        echo "  Saved Dynv6 defaults: ${XUI_INSTALLER_DEFAULTS_FILE}"
+    fi
+    echo "  nginx public shared TCP ports -> stream mux"
+    echo "  local HTTPS frontend: 127.0.0.1:${HTTP_FRONTEND_LOCAL_PORT}"
+    echo ""
+    info "Publication markers"
+    echo "  [443] or [shared:443]     -> publish through shared TCP/443"
+    echo "  [8443] or [shared:8443]   -> publish through shared TCP/8443"
+    echo "  [direct]                  -> keep the inbound on its own real external port"
+    echo ""
+    info "Bot Runtime Hint"
+    echo "  If you add this server to /root/vpnbotdata/config/servers.json:"
+    echo "  • DNS name for VLESS/TLS users: ${public_dns_name:-<set APP_DOMAIN/PUBLIC_DOMAIN>}"
+    echo "  • Panel/API host for the bot: ${panel_host:-<set PANEL_DOMAIN>}"
+    echo "  • Server public IPv4: ${server_public_ip:-<unknown>}"
+    echo "  • api_url: ${panel_api_url}"
+    echo "  • api_user: ${XUI_PANEL_USERNAME}"
+    echo "  • api_password: ${XUI_PANEL_PASSWORD}"
+    echo "  • For VLESS 'domain' use the app/shared domain above."
+    echo "  • Do not confuse panel URL and user-facing domain: panel URL is for the bot/admin API, domain is what clients import in keys."
+    echo ""
+    info "Ready JSON for Bot"
+    echo "  Paste this block into /root/vpnbotdata/config/servers.json on the bot host:"
+    BOT_SERVER_ID_VALUE="${VPNBOT_SERVER_ID:-server_id_here}" \
+    BOT_SERVER_NAME_VALUE="${VPNBOT_SERVER_ID:-FLAG Server Description}" \
+    BOT_PUBLIC_DOMAIN_VALUE="${public_dns_name:-${server_public_ip}}" \
+    BOT_PUBLIC_IP_VALUE="${server_public_ip}" \
+    BOT_API_HOST_VALUE="${server_public_ip}" \
+    BOT_PANEL_API_URL_VALUE="${panel_api_url}" \
+    BOT_PANEL_USER_VALUE="${XUI_PANEL_USERNAME}" \
+    BOT_PANEL_PASSWORD_VALUE="${XUI_PANEL_PASSWORD}" \
+    BOT_PUBLIC_PORT_VALUE="${BOT_PUBLIC_PORT_VALUE:-443}" \
+    BOT_SUB_PORT_VALUE="2096" \
+    BOT_SUB_SCHEME_VALUE="http" \
+    python3 - <<'PY'
+import json
+import os
+
+server_id = str(os.environ.get("BOT_SERVER_ID_VALUE", "")).strip().lower() or "server_id_here"
+server_name = str(os.environ.get("BOT_SERVER_NAME_VALUE", "")).strip() or "FLAG Server Description"
+public_domain = str(os.environ.get("BOT_PUBLIC_DOMAIN_VALUE", "")).strip()
+public_ip = str(os.environ.get("BOT_PUBLIC_IP_VALUE", "")).strip()
+api_host = str(os.environ.get("BOT_API_HOST_VALUE", "")).strip()
+api_url = str(os.environ.get("BOT_PANEL_API_URL_VALUE", "")).strip()
+api_user = str(os.environ.get("BOT_PANEL_USER_VALUE", "")).strip()
+api_password = str(os.environ.get("BOT_PANEL_PASSWORD_VALUE", "")).strip()
+public_port = int(os.environ.get("BOT_PUBLIC_PORT_VALUE", "443") or 443)
+sub_port = int(os.environ.get("BOT_SUB_PORT_VALUE", "2096") or 2096)
+sub_scheme = str(os.environ.get("BOT_SUB_SCHEME_VALUE", "http") or "http").strip()
+
+payload = {
+    server_id: {
+        "name": server_name,
+        "domain": public_domain,
+        "port": public_port,
+        "location": "Country, City",
+        "api_url": api_url,
+        "api_host": api_host,
+        "api_user": api_user,
+        "api_password": api_password,
+        "allowed_levels": ["vless_max"],
+        "enabled": True,
+        "sub_port": sub_port,
+        "sub_scheme": sub_scheme,
+    }
+}
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+PY
+    echo "  Note: field 'port' above is the user-facing public port, not the backend x-ui panel port."
+    echo ""
+    info "Ready Rollout Bundle"
+    echo "  Use this as structured context for the next AI / operator when rolling out linked services on the same host:"
+    PANEL_DOMAIN_VALUE="${panel_host}" \
+    APP_DOMAIN_VALUE="${public_dns_name}" \
+    SHARED_HTTP_DOMAIN_VALUE="${SHARED_HTTP_DOMAIN:-${APP_DOMAIN:-${PUBLIC_DOMAIN:-}}}" \
+    PUBLIC_DOMAIN_VALUE="${PUBLIC_DOMAIN}" \
+    MT_SUGGESTED_DOMAIN_VALUE="$(python3 - <<'PY'
+import os
+panel = str(os.environ.get("PANEL_DOMAIN_VALUE", "")).strip()
+app = str(os.environ.get("APP_DOMAIN_VALUE", "")).strip()
+if panel.startswith("panel."):
+    print("mt." + panel[len("panel."):])
+elif app.startswith("app."):
+    print("mt." + app[len("app."):])
+elif panel:
+    print("mt." + panel)
+elif app:
+    print("mt." + app)
+else:
+    print("")
+PY
+)" \
+    python3 - <<'PY'
+import json
+import os
+
+payload = {
+    "domain_scheme": {
+        "panel_domain": str(os.environ.get("PANEL_DOMAIN_VALUE", "")).strip(),
+        "app_domain": str(os.environ.get("APP_DOMAIN_VALUE", "")).strip(),
+        "shared_http_domain": str(os.environ.get("SHARED_HTTP_DOMAIN_VALUE", "")).strip(),
+        "public_domain_legacy_alias": str(os.environ.get("PUBLIC_DOMAIN_VALUE", "")).strip(),
+        "mt_suggested_domain": str(os.environ.get("MT_SUGGESTED_DOMAIN_VALUE", "")).strip(),
+    },
+    "rules": [
+        "panel_domain is for 3x-ui panel and api_url used by the bot/admin API",
+        "app_domain is the user-facing VLESS/shared HTTP hostname",
+        "mt_suggested_domain should be used for MTProxy ee on shared external 443",
+        "do not reuse the exact same hostname for panel and MTProxy ee on one shared 443",
+    ],
+}
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+PY
+    echo "  Note: api_host is the direct IP override for panel API requests when you want the bot to avoid domain/SNI problems."
+    echo ""
+    info "What happens automatically"
+    echo "  • tls/reality + [shared-port] on any transport -> nginx stream SNI route on that shared port"
+    echo "  • ws/grpc/http-like without tls/reality + [shared-port] -> nginx HTTP route on that shared port"
+    echo "  • [direct] -> no shared mux, inbound keeps its own port"
+    echo "  • x-ui DB/config changes trigger vpnbot-xui-sync-routes.path"
+    echo "  • periodic safety sync runs via vpnbot-xui-sync-routes.timer"
+    echo ""
+    info "Helper commands"
+    echo "  Quick install command:"
+    echo "  ${INSTALL_VRAY_CURL_COMMAND}"
+    echo ""
+    echo "  vpnbot-xui-sync-routes"
+    echo "  vpnbot-xui-sync-routes --explain"
+    echo "  ${VPNBOT_VLESS_PRESET_HELPER}"
+    echo "  ${VPNBOT_VLESS_PRESET_HELPER} --list"
+    echo "  ${XUI_PRESET_HELPER} --catalog-json"
+    echo "  vpnbot-nginx-list-routes"
+    echo "  systemctl status vpnbot-xui-sync-routes.path --no-pager"
+    echo "  systemctl status vpnbot-xui-sync-routes.timer --no-pager"
+    echo "  cat ${XUI_SYNC_STATE_DIR}/last_sync_report.txt"
+    echo "  cat ${XUI_INSTALLER_STATE_FILE}"
+    echo "  cat ${XUI_INSTALLER_DEFAULTS_FILE}"
+    echo "  Example DDNS env: DDNS_PROVIDER=dynv6 DDNS_ZONE=myvpn.dynv6.net DDNS_TOKEN=<ddclient-password> VPNBOT_SERVER_ID=de-bmv4-ultra-u2"
+    echo "  Or pass full Dynv6 text: DDNS_PROVIDER=dynv6 DDNS_INSTRUCTIONS_TEXT=\$'protocol=dyndns2\\nserver=dynv6.com\\nlogin=none\\npassword=...\\nmyvpn.dynv6.net'"
+    echo "  Optional override: DDNS_HOST_LABEL=de-bmv4-manual-tls or DDNS_LABEL_SUFFIX=vmess"
+    echo ""
+    info "Cheat sheet"
+    echo "  1. Run ${VPNBOT_VLESS_PRESET_HELPER}"
+    echo "  2. Select one or several inbound lines from the catalog"
+    echo "  3. The helper will parse protocol/transport/security/SNI from the selected lines"
+    echo "  4. If a direct or shared port is busy, the helper will try to auto-resolve it and print what changed"
+    echo "  5. Sync then rebuilds nginx routes automatically"
+    echo "  6. If you want to force it immediately: vpnbot-xui-sync-routes"
+    echo "  7. If something was not published through shared port, read last_sync_report.txt"
+    echo "  8. The catalog is grouped into Reality TCP, Reality XHTTP and TLS."
+    echo ""
+    info "Architecture notes"
+    echo "  • AWG should keep UDP/443."
+    echo "  • Shared VLESS/TLS mux can own multiple TCP ports, not only 443."
+    echo "  • Direct-mode inbound ports are still real ports."
+    echo "  • For tls/reality shared mode, set proper serverNames in the inbound."
+    echo "  • Shared ports remove external port collisions, but tls/reality still need unique SNI per route."
+}
+
+
+main() {
+    check_root
+    load_installer_defaults
+    normalize_vless_backend_mode
+    prompt_vless_backend_mode_if_needed
+    normalize_dynv6_credentials
+    collect_interactive_defaults
+    sync_domain_aliases
+    install_dependencies
+    configure_dynv6_domain
+    normalize_inputs
+    validate_configured_public_hosts
+    if is_xray_core_backend; then
+        install_standalone_xray_core
+        write_xrayctl_assets
+        write_xray_online_tracker_assets
+        ensure_nginx_layout
+        ensure_bootstrap_tls_cert
+        write_nginx_http_site
+        issue_or_create_cert
+        write_nginx_http_site
+        write_xray_core_installer_state
+        write_xray_core_rollout_bundle
+        write_xray_sync_assets
+        write_vless_preset_helper
+        write_direct_helpers
+        enable_sync
+    else
+        install_3xui_noninteractive
+        configure_xray_minimal_logging
+        write_xray_logrotate_config
+        panel_direct_access_local_only
+        ensure_nginx_layout
+        ensure_bootstrap_tls_cert
+        write_nginx_http_site
+        issue_or_create_cert
+        write_nginx_http_site
+        write_installer_state
+        write_rollout_bundle
+        write_xui_sync_assets
+        write_preset_helper
+        write_vless_preset_helper
+        write_direct_helpers
+        enable_sync
+    fi
+    run_initial_preset_flow
+    show_summary
+}
+
+main "$@"
