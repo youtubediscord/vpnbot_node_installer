@@ -6,7 +6,7 @@ set -euo pipefail
 # script fetch its own helper assets.
 
 VPNBOT_NODE_INSTALLER_REF="${VPNBOT_NODE_INSTALLER_REF:-main}"
-VPNBOT_NODE_INSTALLER_BASE_URL="${VPNBOT_NODE_INSTALLER_BASE_URL:-https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/${VPNBOT_NODE_INSTALLER_REF}}"
+VPNBOT_NODE_INSTALLER_BASE_URL="${VPNBOT_NODE_INSTALLER_BASE_URL:-https://github.com/youtubediscord/vpnbot_node_installer/raw/${VPNBOT_NODE_INSTALLER_REF}}"
 
 tmp_dir="$(mktemp -d)"
 cleanup() {

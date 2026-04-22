@@ -5,9 +5,9 @@ set -euo pipefail
 # Source of truth:
 #   https://github.com/youtubediscord/vpnbot_node_installer
 # Usage:
-#   bash <(curl -fsSL "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/main/install.sh?ts=$(date +%s)")
+#   bash <(curl -fsSL "https://github.com/youtubediscord/vpnbot_node_installer/raw/main/install.sh?ts=$(date +%s)")
 #
-# Important: all raw.githubusercontent.com downloads use a cache-busting query.
+# Important: all github.com/.../raw downloads use a cache-busting query.
 # Supported backend modes:
 # - 3x-ui    -> current panel-based workflow for VPnBot
 # - xray-core -> standalone official Xray-core in a dedicated folder, without x-ui
@@ -27,7 +27,7 @@ set -euo pipefail
 # - ws / grpc / http-like -> local HTTPS frontend behind nginx http
 
 VPNBOT_NODE_INSTALLER_REF="${VPNBOT_NODE_INSTALLER_REF:-main}"
-VPNBOT_NODE_INSTALLER_BASE_URL="${VPNBOT_NODE_INSTALLER_BASE_URL:-https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/${VPNBOT_NODE_INSTALLER_REF}}"
+VPNBOT_NODE_INSTALLER_BASE_URL="${VPNBOT_NODE_INSTALLER_BASE_URL:-https://github.com/youtubediscord/vpnbot_node_installer/raw/${VPNBOT_NODE_INSTALLER_REF}}"
 
 XUI_UPSTREAM_INSTALL_URL="${XUI_UPSTREAM_INSTALL_URL:-https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh}"
 XUI_MAIN_FOLDER="${XUI_MAIN_FOLDER:-/usr/local/x-ui}"
@@ -139,7 +139,7 @@ XRAY_CORE_SMOKE_PORT_EFFECTIVE=""
 XRAY_CORE_SMOKE_PUBLIC_KEY=""
 XRAY_CORE_SMOKE_SHORT_ID=""
 XRAY_CORE_SMOKE_LINK=""
-INSTALL_VRAY_CURL_COMMAND='bash <(curl -fsSL "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/main/install.sh?ts=$(date +%s)")'
+INSTALL_VRAY_CURL_COMMAND='bash <(curl -fsSL "https://github.com/youtubediscord/vpnbot_node_installer/raw/main/install.sh?ts=$(date +%s)")'
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
