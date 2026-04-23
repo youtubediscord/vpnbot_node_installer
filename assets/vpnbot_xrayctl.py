@@ -391,9 +391,24 @@ class _FileLock:
             self.fh.close()
 
 
+def _compact_inbound_for_listing(inbound: dict[str, Any]) -> dict[str, Any]:
+    compact = json.loads(json.dumps(inbound, ensure_ascii=False))
+    settings = compact.get("settings")
+    if not isinstance(settings, dict):
+        settings = {}
+        compact["settings"] = settings
+    clients = settings.get("clients", [])
+    client_count = len(clients) if isinstance(clients, list) else 0
+    settings["clients"] = []
+    compact["client_count"] = client_count
+    return compact
+
+
 def cmd_list_inbounds(ns: argparse.Namespace) -> dict[str, Any]:
     payload = _load_payload(Path(ns.managed_file))
     inbounds = [_normalize_inbound(raw) for raw in payload.get("inbounds") or [] if isinstance(raw, dict)]
+    if ns.compact:
+        inbounds = [_compact_inbound_for_listing(inbound) for inbound in inbounds]
     return {"ok": True, "inbounds": inbounds, "count": len(inbounds)}
 
 
@@ -583,7 +598,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lock-file", default="")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("list-inbounds")
+    list_inbounds = subparsers.add_parser("list-inbounds")
+    list_inbounds.add_argument("--compact", action="store_true")
 
     ensure = subparsers.add_parser("ensure-client")
     ensure.add_argument("--inbound-id", required=True, type=int)
