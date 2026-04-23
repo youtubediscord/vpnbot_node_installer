@@ -2671,6 +2671,7 @@ panel_direct_access_local_only() {
 ensure_nginx_layout() {
     local stream_root_file="${NGINX_STREAM_ROOT_FILE}"
     local legacy_stream_root_file="/etc/nginx/stream_vpnbot_mux.conf"
+    local existing_stream_include="${NGINX_STREAM_INCLUDE_DIR}/*.conf"
 
     mkdir -p /etc/nginx/ssl/vpnbot
     mkdir -p "${NGINX_HTTP_LOCATION_DIR}"
@@ -2680,19 +2681,59 @@ ensure_nginx_layout() {
     if grep -q 'stream_vpnbot_mux.conf' /etc/nginx/nginx.conf; then
         stream_root_file="${legacy_stream_root_file}"
         sed -i '\|include /etc/nginx/vpnbot-stream-root.conf;|d' /etc/nginx/nginx.conf
+    elif grep -Eq '^[[:space:]]*stream[[:space:]]*\{' /etc/nginx/nginx.conf; then
+        sed -i '\|include /etc/nginx/vpnbot-stream-root.conf;|d' /etc/nginx/nginx.conf
+        EXISTING_STREAM_INCLUDE="${existing_stream_include}" python3 - <<'PY'
+from pathlib import Path
+import os
+import re
+
+path = Path('/etc/nginx/nginx.conf')
+text = path.read_text(encoding='utf-8')
+include_line = f"    include {os.environ['EXISTING_STREAM_INCLUDE']};"
+if os.environ['EXISTING_STREAM_INCLUDE'] in text:
+    raise SystemExit(0)
+
+start = re.search(r'(?m)^[ \t]*stream[ \t]*\{', text)
+if not start:
+    raise SystemExit(0)
+
+brace_depth = 0
+end_index = None
+for index in range(start.start(), len(text)):
+    char = text[index]
+    if char == '{':
+        brace_depth += 1
+    elif char == '}':
+        brace_depth -= 1
+        if brace_depth == 0:
+            end_index = index
+            break
+
+if end_index is None:
+    raise SystemExit(0)
+
+before = text[:end_index].rstrip('\n')
+after = text[end_index:]
+updated = before + '\n' + include_line + '\n' + after
+path.write_text(updated, encoding='utf-8')
+PY
+        stream_root_file=""
     elif ! grep -q 'vpnbot-stream-root.conf' /etc/nginx/nginx.conf; then
         printf '\ninclude %s;\n' "${stream_root_file}" >> /etc/nginx/nginx.conf
     fi
 
-    if [[ -f "${stream_root_file}" ]]; then
+    if [[ -n "${stream_root_file}" && -f "${stream_root_file}" ]]; then
         cp "${stream_root_file}" "${stream_root_file}.bak.$(date +%s)" 2>/dev/null || true
     fi
 
-    cat > "${stream_root_file}" <<EOF
+    if [[ -n "${stream_root_file}" ]]; then
+        cat > "${stream_root_file}" <<EOF
 stream {
     include ${NGINX_STREAM_INCLUDE_DIR}/*.conf;
 }
 EOF
+    fi
 }
 
 
