@@ -1186,7 +1186,7 @@ ensure_nginx_runtime_limits() {
     mkdir -p /etc/systemd/system/nginx.service.d
     cat > /etc/systemd/system/nginx.service.d/limits.conf <<'EOF'
 [Service]
-LimitNOFILE=65535
+LimitNOFILE=1048576
 EOF
 
     python3 - <<'PY'
@@ -1201,13 +1201,15 @@ text = path.read_text(encoding='utf-8')
 original = text
 
 if 'worker_rlimit_nofile' not in text:
-    text = text.replace('worker_processes auto;\n', 'worker_processes auto;\nworker_rlimit_nofile 65535;\n', 1)
+    text = text.replace('worker_processes auto;\n', 'worker_processes auto;\nworker_rlimit_nofile 1048576;\n', 1)
+else:
+    text = re.sub(r'(^\s*worker_rlimit_nofile\s+)(\d+)(;)', lambda m: f"{m.group(1)}{max(int(m.group(2)), 1048576)}{m.group(3)}", text, flags=re.MULTILINE)
 
 match = re.search(r'(^\s*worker_connections\s+)(\d+)(;)', text, re.MULTILINE)
 if match:
     current = int(match.group(2))
-    if current < 4096:
-        text = text[:match.start()] + f"{match.group(1)}4096{match.group(3)}" + text[match.end():]
+    if current < 65535:
+        text = text[:match.start()] + f"{match.group(1)}65535{match.group(3)}" + text[match.end():]
 
 if text != original:
     path.write_text(text, encoding='utf-8')
@@ -1236,7 +1238,7 @@ install_dependencies() {
 
 
 configure_vpnbot_network_limits() {
-    local raw_target target current effective
+    local raw_target target current effective tmp written
     raw_target="${VPNBOT_NF_CONNTRACK_MAX:-1048576}"
     if [[ ! "${raw_target}" =~ ^[0-9]+$ ]]; then
         warn "Invalid VPNBOT_NF_CONNTRACK_MAX=${raw_target}; using 1048576"
@@ -1248,30 +1250,81 @@ configure_vpnbot_network_limits() {
         target=262144
     fi
 
-    if [[ ! -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
-        info "nf_conntrack sysctl is not available on this kernel yet; skipping VPnBot conntrack tuning"
-        return 0
-    fi
-
-    current="$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || printf '0')"
     effective="${target}"
-    if [[ "${current}" =~ ^[0-9]+$ ]] && (( current > effective )); then
-        effective="${current}"
+    if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+        current="$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || printf '0')"
+        if [[ "${current}" =~ ^[0-9]+$ ]] && (( current > effective )); then
+            effective="${current}"
+        fi
     fi
 
     mkdir -p "$(dirname "${VPNBOT_NETWORK_SYSCTL_FILE}")"
-    cat > "${VPNBOT_NETWORK_SYSCTL_FILE}" <<EOF
+    tmp="$(mktemp)"
+    written=0
+    cat > "${tmp}" <<EOF
 # VPnBot VPN nodes can keep many simultaneous client flows.
 # Keep conntrack headroom so user traffic cannot starve SSH/control-plane access.
-net.netfilter.nf_conntrack_max = ${effective}
 EOF
+
+    append_vpnbot_sysctl_setting() {
+        local target_file="$1"
+        local key="$2"
+        local value="$3"
+        local proc_path="/proc/sys/${key//./\/}"
+        if [[ ! -e "${proc_path}" ]]; then
+            info "sysctl ${key} is not available on this kernel; skipping"
+            return 1
+        fi
+        printf '%s = %s\n' "${key}" "${value}" >> "${target_file}"
+        return 0
+    }
+
+    append_vpnbot_sysctl_setting "${tmp}" "fs.file-max" "2097152" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.core.somaxconn" "65535" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.core.netdev_max_backlog" "250000" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_max_syn_backlog" "65535" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.ip_local_port_range" "1024 65535" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_fin_timeout" "15" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_tw_reuse" "1" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_keepalive_time" "600" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_keepalive_intvl" "60" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_keepalive_probes" "5" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_max" "${effective}" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_tcp_timeout_established" "86400" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_tcp_timeout_close" "10" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_tcp_timeout_close_wait" "60" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_tcp_timeout_fin_wait" "120" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_tcp_timeout_time_wait" "120" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_tcp_timeout_last_ack" "30" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_tcp_timeout_syn_sent" "120" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_tcp_timeout_syn_recv" "60" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_tcp_timeout_unacknowledged" "300" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_udp_timeout" "30" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_udp_timeout_stream" "180" && written=$((written + 1))
+
+    if (( written == 0 )); then
+        info "No supported VPnBot network sysctl settings were found on this kernel; skipping"
+        rm -f "${tmp}"
+        return 0
+    fi
+
+    install -m 644 "${tmp}" "${VPNBOT_NETWORK_SYSCTL_FILE}"
+    rm -f "${tmp}"
     chmod 644 "${VPNBOT_NETWORK_SYSCTL_FILE}" 2>/dev/null || true
 
-    if sysctl -w "net.netfilter.nf_conntrack_max=${effective}" >/dev/null 2>&1; then
-        log "Applied VPnBot network sysctl: nf_conntrack_max=${effective}"
-    else
-        warn "Could not apply nf_conntrack_max=${effective} immediately; persisted ${VPNBOT_NETWORK_SYSCTL_FILE}"
-    fi
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ -n "${line}" && "${line}" != \#* ]] || continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="${key//[[:space:]]/}"
+        value="$(printf '%s' "${value}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [[ -n "${key}" ]] || continue
+        if ! sysctl -w "${key}=${value}" >/dev/null 2>&1; then
+            warn "Could not apply ${key}=${value} immediately; persisted ${VPNBOT_NETWORK_SYSCTL_FILE}"
+        fi
+    done < "${VPNBOT_NETWORK_SYSCTL_FILE}"
+
+    log "Applied VPnBot network sysctl profile (${written} settings, conntrack target=${effective})"
 }
 
 
