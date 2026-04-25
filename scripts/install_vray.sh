@@ -108,6 +108,7 @@ XRAY_CORE_INSTALLER_STATE_FILE="${XRAY_CORE_INSTALLER_STATE_FILE:-/etc/vpnbot-xr
 XRAY_CORE_ROLLOUT_BUNDLE_FILE="${XRAY_CORE_ROLLOUT_BUNDLE_FILE:-/etc/vpnbot-xray-rollout-bundle.json}"
 XRAY_CORE_API_SERVER="${XRAY_CORE_API_SERVER:-127.0.0.1:10085}"
 XRAY_CTL_SCRIPT="${XRAY_CTL_SCRIPT:-/usr/local/bin/vpnbot-xrayctl}"
+XRAY_RESERVED_PORTS_SCRIPT="${XRAY_RESERVED_PORTS_SCRIPT:-/usr/local/bin/vpnbot-xray-reserve-ports}"
 XRAY_ONLINE_TRACKER_SCRIPT="${XRAY_ONLINE_TRACKER_SCRIPT:-/usr/local/bin/vpnbot-xray-online-tracker}"
 XRAY_ONLINE_TRACKER_SERVICE_NAME="${XRAY_ONLINE_TRACKER_SERVICE_NAME:-vpnbot-xray-online.service}"
 XRAY_ONLINE_TRACKER_SERVICE_FILE="${XRAY_ONLINE_TRACKER_SERVICE_FILE:-/etc/systemd/system/${XRAY_ONLINE_TRACKER_SERVICE_NAME}}"
@@ -142,6 +143,7 @@ XRAY_CORE_SMOKE_SHORT_ID=""
 XRAY_CORE_SMOKE_LINK=""
 INSTALL_VRAY_CURL_COMMAND='bash <(curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/refs/heads/main/install.sh?ts=$(date +%s)")'
 VPNBOT_NETWORK_SYSCTL_FILE="${VPNBOT_NETWORK_SYSCTL_FILE:-/etc/sysctl.d/99-vpnbot-network.conf}"
+VPNBOT_XRAY_RESERVED_PORTS_SYSCTL_FILE="${VPNBOT_XRAY_RESERVED_PORTS_SYSCTL_FILE:-/etc/sysctl.d/99-vpnbot-xray-reserved-ports.conf}"
 VPNBOT_NF_CONNTRACK_MAX="${VPNBOT_NF_CONNTRACK_MAX:-1048576}"
 
 RED='\033[0;31m'
@@ -1858,6 +1860,7 @@ User=root
 WorkingDirectory=${XRAY_CORE_ROOT}
 Environment=XRAY_LOCATION_ASSET=${XRAY_CORE_SHARE_DIR}
 Environment=XRAY_LOCATION_CONFDIR=${XRAY_CORE_CONFIG_DIR}
+ExecStartPre=${XRAY_RESERVED_PORTS_SCRIPT}
 ExecStart=${XRAY_CORE_BIN} run -confdir ${XRAY_CORE_CONFIG_DIR}
 Restart=on-failure
 RestartSec=2s
@@ -1866,6 +1869,92 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+
+write_xray_reserved_ports_helper() {
+    cat > "${XRAY_RESERVED_PORTS_SCRIPT}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+managed_file=${XRAY_CORE_MANAGED_INBOUNDS_FILE@Q}
+sysctl_file=${VPNBOT_XRAY_RESERVED_PORTS_SYSCTL_FILE@Q}
+
+ports="\$(python3 - "\${managed_file}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(0)
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+rows = payload.get("inbounds") if isinstance(payload, dict) else []
+ports = set()
+if isinstance(rows, list):
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            port = int(row.get("port") or 0)
+        except Exception:
+            continue
+        if 1 <= port <= 65535:
+            ports.add(port)
+print(",".join(str(port) for port in sorted(ports)))
+PY
+)"
+
+if [[ -z "\${ports}" ]]; then
+    exit 0
+fi
+
+mkdir -p "\$(dirname "\${sysctl_file}")"
+{
+    echo "# VPnBot standalone Xray-core managed inbound ports."
+    echo "# These ports must not be reused as ephemeral source ports by nginx, MTProxy, or other local clients."
+    echo "net.ipv4.ip_local_reserved_ports=\${ports}"
+} > "\${sysctl_file}"
+
+current="\$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)"
+merged="\$(python3 - "\${current}" "\${ports}" <<'PY'
+import sys
+
+def parse(raw: str) -> set[int]:
+    result = set()
+    for chunk in str(raw or "").replace(" ", "").split(","):
+        if not chunk:
+            continue
+        if "-" in chunk:
+            left, _, right = chunk.partition("-")
+            try:
+                start = int(left)
+                end = int(right)
+            except Exception:
+                continue
+            if start > end:
+                start, end = end, start
+            result.update(range(max(1, start), min(65535, end) + 1))
+            continue
+        try:
+            value = int(chunk)
+        except Exception:
+            continue
+        if 1 <= value <= 65535:
+            result.add(value)
+    return result
+
+ports = parse(sys.argv[1]) | parse(sys.argv[2])
+print(",".join(str(port) for port in sorted(ports)))
+PY
+)"
+
+sysctl -w "net.ipv4.ip_local_reserved_ports=\${merged}" >/dev/null
+EOF
+    chmod 755 "${XRAY_RESERVED_PORTS_SCRIPT}"
 }
 
 
@@ -2651,6 +2740,7 @@ PY
     fi
 
     write_xray_core_smoke_inbound_if_missing
+    write_xray_reserved_ports_helper
     write_xray_core_service_unit
 
     XRAY_LOCATION_ASSET="${XRAY_CORE_SHARE_DIR}" \
@@ -3351,6 +3441,7 @@ DEFAULT_PUBLIC_DOMAIN = ${PUBLIC_DOMAIN@Q}
 STATE_DIR = Path(${XRAY_SYNC_STATE_DIR@Q})
 REPORT_FILE = STATE_DIR / "last_sync_report.txt"
 EXTRA_STREAM_ROUTES = Path("/etc/vpnbot-shared-stream-routes.json")
+RESERVED_PORTS_SYSCTL_FILE = Path(${VPNBOT_XRAY_RESERVED_PORTS_SYSCTL_FILE@Q})
 
 MARK_RE = re.compile(r"\\[(?P<value>direct|shared:\\d+|\\d+)\\]", re.IGNORECASE)
 DOLLAR = "\$"
@@ -3573,6 +3664,91 @@ def write_report(lines: list[str]) -> None:
     REPORT_FILE.write_text("\\n".join(lines).rstrip() + "\\n", encoding="utf-8")
 
 
+def parse_reserved_ports(raw: str) -> set[int]:
+    ports: set[int] = set()
+    for chunk in str(raw or "").replace(" ", "").split(","):
+        if not chunk:
+            continue
+        if "-" in chunk:
+            left, _, right = chunk.partition("-")
+            try:
+                start = int(left)
+                end = int(right)
+            except Exception:
+                continue
+            if start > end:
+                start, end = end, start
+            for value in range(max(1, start), min(65535, end) + 1):
+                ports.add(value)
+            continue
+        try:
+            value = int(chunk)
+        except Exception:
+            continue
+        if 1 <= value <= 65535:
+            ports.add(value)
+    return ports
+
+
+def format_reserved_ports(ports: set[int]) -> str:
+    return ",".join(str(port) for port in sorted(ports))
+
+
+def current_reserved_ports() -> set[int]:
+    result = subprocess.run(
+        ["sysctl", "-n", "net.ipv4.ip_local_reserved_ports"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return set()
+    return parse_reserved_ports(result.stdout.strip())
+
+
+def managed_inbound_ports(rows: list[dict]) -> set[int]:
+    ports: set[int] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            port = int(row.get("port") or 0)
+        except Exception:
+            continue
+        if 1 <= port <= 65535:
+            ports.add(port)
+    return ports
+
+
+def sync_xray_reserved_ports(rows: list[dict], report_lines: list[str] | None = None) -> None:
+    ports = managed_inbound_ports(rows)
+    if not ports:
+        return
+
+    RESERVED_PORTS_SYSCTL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    RESERVED_PORTS_SYSCTL_FILE.write_text(
+        "# VPnBot standalone Xray-core managed inbound ports.\\n"
+        "# These ports must not be reused as ephemeral source ports by nginx, MTProxy, or other local clients.\\n"
+        f"net.ipv4.ip_local_reserved_ports={format_reserved_ports(ports)}\\n",
+        encoding="utf-8",
+    )
+
+    merged = current_reserved_ports() | ports
+    value = format_reserved_ports(merged)
+    result = subprocess.run(
+        ["sysctl", "-w", f"net.ipv4.ip_local_reserved_ports={value}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "").strip()
+        raise SystemExit(f"Failed to reserve xray inbound ports via sysctl: {message}")
+
+    if report_lines is not None:
+        report_lines.append(f"reserved_xray_ports: {format_reserved_ports(ports)}")
+
+
 def main() -> int:
     if "--explain" in sys.argv:
         print(
@@ -3734,6 +3910,8 @@ def main() -> int:
             f'external route_id={route["route_id"]} external_port={shared_port} '
             f'domain={route["domain"]} backend_target={backend_target} source={route["source"]!r}'
         )
+
+    sync_xray_reserved_ports(rows, report_lines)
 
     STREAM_MAP.write_text(build_stream_configs(sorted(shared_ports), shared_domains, passthrough_by_port), encoding="utf-8")
     STREAM_SERVER.write_text("# generated by vpnbot-xray-sync-routes\\n", encoding="utf-8")
@@ -5280,6 +5458,7 @@ XRAY_ASSET_DIR = Path(${XRAY_CORE_SHARE_DIR@Q})
 XRAY_MANAGED_INBOUNDS_FILE = Path(${XRAY_CORE_MANAGED_INBOUNDS_FILE@Q})
 XRAY_SERVICE_NAME = ${XRAY_CORE_SERVICE_NAME@Q}
 XRAY_SYNC_SCRIPT = ${XRAY_SYNC_SCRIPT@Q}
+XRAY_RESERVED_PORTS_SYSCTL_FILE = Path(${VPNBOT_XRAY_RESERVED_PORTS_SYSCTL_FILE@Q})
 DEFAULT_TLS_CERT = ${NGINX_SSL_CERT@Q}
 DEFAULT_TLS_KEY = ${NGINX_SSL_KEY@Q}
 PORT_MIN = 20000
@@ -5430,6 +5609,83 @@ def save_xray_inbounds(rows: list[dict]) -> None:
         json.dumps(payload, ensure_ascii=False, indent=2) + "\\n",
         encoding="utf-8",
     )
+
+
+def parse_reserved_ports(raw: str) -> set[int]:
+    ports: set[int] = set()
+    for chunk in str(raw or "").replace(" ", "").split(","):
+        if not chunk:
+            continue
+        if "-" in chunk:
+            left, _, right = chunk.partition("-")
+            try:
+                start = int(left)
+                end = int(right)
+            except Exception:
+                continue
+            if start > end:
+                start, end = end, start
+            for value in range(max(1, start), min(65535, end) + 1):
+                ports.add(value)
+            continue
+        try:
+            value = int(chunk)
+        except Exception:
+            continue
+        if 1 <= value <= 65535:
+            ports.add(value)
+    return ports
+
+
+def format_reserved_ports(ports: set[int]) -> str:
+    return ",".join(str(port) for port in sorted(ports))
+
+
+def current_reserved_ports() -> set[int]:
+    result = subprocess.run(
+        ["sysctl", "-n", "net.ipv4.ip_local_reserved_ports"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return set()
+    return parse_reserved_ports(result.stdout.strip())
+
+
+def sync_xray_reserved_ports(rows: list[dict]) -> None:
+    ports: set[int] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            port = int(row.get("port") or 0)
+        except Exception:
+            continue
+        if 1 <= port <= 65535:
+            ports.add(port)
+    if not ports:
+        return
+
+    XRAY_RESERVED_PORTS_SYSCTL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    XRAY_RESERVED_PORTS_SYSCTL_FILE.write_text(
+        "# VPnBot standalone Xray-core managed inbound ports.\\n"
+        "# These ports must not be reused as ephemeral source ports by nginx, MTProxy, or other local clients.\\n"
+        f"net.ipv4.ip_local_reserved_ports={format_reserved_ports(ports)}\\n",
+        encoding="utf-8",
+    )
+
+    merged = current_reserved_ports() | ports
+    value = format_reserved_ports(merged)
+    result = subprocess.run(
+        ["sysctl", "-w", f"net.ipv4.ip_local_reserved_ports={value}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "").strip()
+        raise SystemExit(f"Не удалось зарезервировать xray inbound-порты через sysctl: {message}")
 
 
 def choose_random_port(rows: list[dict], *, forbidden: set[int] | None = None) -> int:
@@ -6073,6 +6329,7 @@ def apply_lines_via_xray(lines: list[str]) -> int:
         backup_text = XRAY_MANAGED_INBOUNDS_FILE.read_text(encoding="utf-8")
     try:
         save_xray_inbounds(new_rows)
+        sync_xray_reserved_ports(new_rows)
         validate_and_restart_xray()
         subprocess.run([XRAY_SYNC_SCRIPT], check=True)
     except Exception as exc:
@@ -6081,6 +6338,7 @@ def apply_lines_via_xray(lines: list[str]) -> int:
         else:
             XRAY_MANAGED_INBOUNDS_FILE.unlink(missing_ok=True)
         try:
+            sync_xray_reserved_ports(rows)
             validate_and_restart_xray()
             subprocess.run([XRAY_SYNC_SCRIPT], check=True)
         except Exception:
