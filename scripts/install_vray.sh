@@ -1239,6 +1239,20 @@ install_dependencies() {
 
 configure_vpnbot_network_limits() {
     local raw_target target current effective tmp written
+
+    if [[ ! -e /proc/sys/net/netfilter/nf_conntrack_max ]] && command -v modprobe >/dev/null 2>&1; then
+        if modprobe nf_conntrack >/dev/null 2>&1; then
+            info "Loaded nf_conntrack module for conntrack sysctl"
+        else
+            info "nf_conntrack module could not be loaded; conntrack sysctl may be unavailable"
+        fi
+    fi
+
+    if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+        mkdir -p /etc/modules-load.d
+        printf '%s\n' "nf_conntrack" > /etc/modules-load.d/vpnbot-conntrack.conf
+    fi
+
     raw_target="${VPNBOT_NF_CONNTRACK_MAX:-1048576}"
     if [[ ! "${raw_target}" =~ ^[0-9]+$ ]]; then
         warn "Invalid VPNBOT_NF_CONNTRACK_MAX=${raw_target}; using 1048576"
