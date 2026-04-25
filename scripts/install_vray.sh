@@ -141,6 +141,8 @@ XRAY_CORE_SMOKE_PUBLIC_KEY=""
 XRAY_CORE_SMOKE_SHORT_ID=""
 XRAY_CORE_SMOKE_LINK=""
 INSTALL_VRAY_CURL_COMMAND='bash <(curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/refs/heads/main/install.sh?ts=$(date +%s)")'
+VPNBOT_NETWORK_SYSCTL_FILE="${VPNBOT_NETWORK_SYSCTL_FILE:-/etc/sysctl.d/99-vpnbot-network.conf}"
+VPNBOT_NF_CONNTRACK_MAX="${VPNBOT_NF_CONNTRACK_MAX:-1048576}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1230,6 +1232,46 @@ install_dependencies() {
         curl ca-certificates openssl tar nginx libnginx-mod-stream certbot python3 python3-certbot-nginx iptables jq sqlite3
     ensure_nginx_runtime_limits
     log "Base packages installed for 3x-ui mode"
+}
+
+
+configure_vpnbot_network_limits() {
+    local raw_target target current effective
+    raw_target="${VPNBOT_NF_CONNTRACK_MAX:-1048576}"
+    if [[ ! "${raw_target}" =~ ^[0-9]+$ ]]; then
+        warn "Invalid VPNBOT_NF_CONNTRACK_MAX=${raw_target}; using 1048576"
+        raw_target="1048576"
+    fi
+
+    target="${raw_target}"
+    if (( target < 262144 )); then
+        target=262144
+    fi
+
+    if [[ ! -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+        info "nf_conntrack sysctl is not available on this kernel yet; skipping VPnBot conntrack tuning"
+        return 0
+    fi
+
+    current="$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || printf '0')"
+    effective="${target}"
+    if [[ "${current}" =~ ^[0-9]+$ ]] && (( current > effective )); then
+        effective="${current}"
+    fi
+
+    mkdir -p "$(dirname "${VPNBOT_NETWORK_SYSCTL_FILE}")"
+    cat > "${VPNBOT_NETWORK_SYSCTL_FILE}" <<EOF
+# VPnBot VPN nodes can keep many simultaneous client flows.
+# Keep conntrack headroom so user traffic cannot starve SSH/control-plane access.
+net.netfilter.nf_conntrack_max = ${effective}
+EOF
+    chmod 644 "${VPNBOT_NETWORK_SYSCTL_FILE}" 2>/dev/null || true
+
+    if sysctl -w "net.netfilter.nf_conntrack_max=${effective}" >/dev/null 2>&1; then
+        log "Applied VPnBot network sysctl: nf_conntrack_max=${effective}"
+    else
+        warn "Could not apply nf_conntrack_max=${effective} immediately; persisted ${VPNBOT_NETWORK_SYSCTL_FILE}"
+    fi
 }
 
 
@@ -6465,6 +6507,7 @@ main() {
     collect_interactive_defaults
     sync_domain_aliases
     install_dependencies
+    configure_vpnbot_network_limits
     configure_dynv6_domain
     normalize_inputs
     validate_configured_public_hosts
