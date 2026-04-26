@@ -77,6 +77,7 @@ LOCK = threading.RLock()
 CLIENTS: dict[str, dict] = {}
 ABUSE_EVENTS: list[dict] = []
 MULTI_IP_HISTORY: dict[str, dict] = {"users": {}}
+USER_TRAFFIC: dict[str, dict] = {}
 HISTORY_DIRTY = False
 LAST_HISTORY_SAVE_AT = 0.0
 LAST_LINE_AT = 0.0
@@ -675,6 +676,7 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
     with LOCK:
         client_items = [(email, dict(entry)) for email, entry in CLIENTS.items()]
         history_users = json.loads(json.dumps(MULTI_IP_HISTORY.get("users") or {}, ensure_ascii=False))
+        traffic_by_email = json.loads(json.dumps(USER_TRAFFIC, ensure_ascii=False))
         abuse_events = [
             dict(item)
             for item in ABUSE_EVENTS
@@ -713,6 +715,7 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
         ]
         event_windows = _event_stats_by_window(email_events, now, windows)
         event_info = event_windows.get(main_window) or {}
+        traffic = traffic_by_email.get(email) if isinstance(traffic_by_email.get(email), dict) else {}
         event_count = int(event_info.get("event_count") or 0)
         target_count = int(event_info.get("target_count") or 0)
         port_count = int(event_info.get("port_count") or 0)
@@ -788,6 +791,18 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
                 "event_count": event_count,
                 "target_count": target_count,
                 "port_count": port_count,
+                "traffic": {
+                    "traffic_source": str(traffic.get("traffic_source") or ""),
+                    "traffic_up_bytes": int(traffic.get("traffic_up_bytes") or 0),
+                    "traffic_down_bytes": int(traffic.get("traffic_down_bytes") or 0),
+                    "traffic_total_bytes": int(traffic.get("traffic_total_bytes") or 0),
+                    "load_bps": (
+                        int(traffic.get("load_bps"))
+                        if traffic.get("load_bps") is not None
+                        else None
+                    ),
+                    "stats_checked_at": str(traffic.get("stats_checked_at") or ""),
+                },
                 "last_seen_at": utc_iso(last_seen) if last_seen else "",
                 "last_seen_age_seconds": max(0, int(now - last_seen)) if last_seen else -1,
                 "reasons": reasons,
@@ -860,6 +875,78 @@ def extract_traffic_totals(payload: dict, *, prefix: str) -> dict:
     }
 
 
+def extract_user_traffic(payload: dict) -> dict[str, dict]:
+    users: dict[str, dict] = {}
+    stats = payload.get("stat")
+    if not isinstance(stats, list):
+        return users
+
+    for item in stats:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        if not name.startswith("user>>>") or ">>>traffic>>>" not in name:
+            continue
+        parts = name.split(">>>")
+        if len(parts) < 4:
+            continue
+        email = str(parts[1] or "").strip()
+        direction = str(parts[-1] or "").strip().lower()
+        if not email:
+            continue
+        try:
+            value = int(item.get("value") or 0)
+        except Exception:
+            value = 0
+        if value < 0:
+            value = 0
+
+        entry = users.setdefault(
+            email,
+            {
+                "traffic_up_bytes": 0,
+                "traffic_down_bytes": 0,
+                "traffic_total_bytes": 0,
+            },
+        )
+        if direction == "uplink":
+            entry["traffic_up_bytes"] += value
+        elif direction == "downlink":
+            entry["traffic_down_bytes"] += value
+
+    for entry in users.values():
+        entry["traffic_total_bytes"] = int(entry.get("traffic_up_bytes") or 0) + int(
+            entry.get("traffic_down_bytes") or 0
+        )
+    return users
+
+
+def update_user_traffic(user_totals: dict[str, dict], now: float) -> None:
+    with LOCK:
+        for email, totals in user_totals.items():
+            new_total = int(totals.get("traffic_total_bytes") or 0)
+            new_up = int(totals.get("traffic_up_bytes") or 0)
+            new_down = int(totals.get("traffic_down_bytes") or 0)
+            previous = USER_TRAFFIC.get(email) or {}
+            previous_total = int(previous.get("traffic_total_bytes") or 0)
+            previous_checked_at = float(previous.get("_checked_at_ts") or 0.0)
+            load_bps = None
+            if previous_checked_at > 0 and new_total >= previous_total:
+                delta_seconds = max(0.001, now - previous_checked_at)
+                if delta_seconds >= max(5.0, STATS_INTERVAL * 0.5):
+                    load_bps = int(((new_total - previous_total) * 8) / delta_seconds)
+
+            USER_TRAFFIC[email] = {
+                "traffic_source": "xray_stats_user",
+                "traffic_up_bytes": new_up,
+                "traffic_down_bytes": new_down,
+                "traffic_total_bytes": new_total,
+                "load_bps": load_bps,
+                "stats_checked_at": utc_iso(now),
+                "_checked_at_ts": now,
+            }
+
+
 def query_xray_stats(pattern: str) -> dict:
     proc = subprocess.run(
         [
@@ -886,10 +973,19 @@ def poll_xray_stats_once() -> None:
     source = "xray_stats_inbound"
     payload = query_xray_stats("inbound>>>")
     totals = extract_traffic_totals(payload, prefix="inbound>>>")
+    user_payload = None
     if int(totals.get("traffic_total_bytes") or 0) <= 0:
         source = "xray_stats_user_fallback"
-        payload = query_xray_stats("user>>>")
-        totals = extract_traffic_totals(payload, prefix="user>>>")
+        user_payload = query_xray_stats("user>>>")
+        totals = extract_traffic_totals(user_payload, prefix="user>>>")
+    else:
+        try:
+            user_payload = query_xray_stats("user>>>")
+        except Exception:
+            user_payload = None
+
+    if isinstance(user_payload, dict):
+        update_user_traffic(extract_user_traffic(user_payload), now)
 
     with LOCK:
         previous_total = int(TRAFFIC.get("traffic_total_bytes") or 0)
@@ -939,6 +1035,7 @@ def snapshot(window_seconds: int | None = None) -> dict:
         last_line_at = LAST_LINE_AT
         last_error = LAST_ERROR
         traffic = dict(TRAFFIC)
+        user_traffic = json.loads(json.dumps(USER_TRAFFIC, ensure_ascii=False))
         abuse_events_kept = len(ABUSE_EVENTS)
         traffic.pop("_checked_at_ts", None)
 
@@ -960,6 +1057,7 @@ def snapshot(window_seconds: int | None = None) -> dict:
         details[email] = {
             "email": email,
             "ips": ips,
+            "traffic": user_traffic.get(email) if isinstance(user_traffic.get(email), dict) else {},
             "last_seen": last_seen,
             "last_seen_at": utc_iso(last_seen),
             "last_seen_age_seconds": max(0, int(now - last_seen)),
