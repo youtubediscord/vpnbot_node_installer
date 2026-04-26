@@ -21,6 +21,7 @@ STATE_DIR = Path(os.environ.get("XRAY_SYNC_STATE_DIR", "/var/lib/vpnbot-xray-syn
 REPORT_FILE = STATE_DIR / "last_sync_report.txt"
 EXTRA_STREAM_ROUTES = Path("/etc/vpnbot-shared-stream-routes.json")
 RESERVED_PORTS_SYSCTL_FILE = Path(os.environ.get("VPNBOT_XRAY_RESERVED_PORTS_SYSCTL_FILE", "/etc/sysctl.d/99-vpnbot-xray-reserved-ports.conf"))
+NGINX_AUTOSTART = str(os.environ.get("VPNBOT_NGINX_AUTOSTART", "1")).strip().lower() not in {"0", "false", "no", "off"}
 
 MARK_RE = re.compile(r"\[(?P<value>direct|shared:\d+|\d+)\]", re.IGNORECASE)
 DOLLAR = "$"
@@ -133,6 +134,8 @@ def apply_nginx_config_if_needed(before: dict[str, bytes]) -> str:
 
     active = subprocess.run(["systemctl", "is-active", "--quiet", "nginx"]).returncode == 0
     if not active:
+        if not NGINX_AUTOSTART:
+            return "nginx was inactive; autostart skipped"
         subprocess.run(["systemctl", "start", "nginx"], check=True)
         return "nginx was inactive; started"
     if changed:

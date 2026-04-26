@@ -50,6 +50,11 @@ files to stay readable and testable as normal files:
 - `assets/vpnbot_xui_sync_routes.py` - nginx route sync helper for legacy
   3x-ui inbounds.
 
+For a side-by-side smoke test on a legacy node where another service already
+owns public HTTP/TCP ports, set `VPNBOT_NGINX_AUTOSTART=0`. Route sync will
+still validate and write generated files, but it will not try to start nginx.
+Leave the default `VPNBOT_NGINX_AUTOSTART=1` for normal fresh installs.
+
 ## Latest Policy
 
 This repository intentionally uses `main` as latest. New installs always fetch

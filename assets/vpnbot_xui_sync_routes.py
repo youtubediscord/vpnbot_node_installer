@@ -23,6 +23,7 @@ DEFAULT_PUBLIC_DOMAIN = os.environ.get("PUBLIC_DOMAIN", "")
 STATE_DIR = Path(os.environ.get("XUI_SYNC_STATE_DIR", "/var/lib/vpnbot-xui-sync"))
 REPORT_FILE = STATE_DIR / "last_sync_report.txt"
 EXTRA_STREAM_ROUTES = Path("/etc/vpnbot-shared-stream-routes.json")
+NGINX_AUTOSTART = str(os.environ.get("VPNBOT_NGINX_AUTOSTART", "1")).strip().lower() not in {"0", "false", "no", "off"}
 
 MARK_RE = re.compile(r"\[(?P<value>direct|shared:\d+|\d+)\]", re.IGNORECASE)
 
@@ -119,6 +120,8 @@ def apply_nginx_config_if_needed(before: dict[str, bytes]) -> str:
 
     active = subprocess.run(["systemctl", "is-active", "--quiet", "nginx"]).returncode == 0
     if not active:
+        if not NGINX_AUTOSTART:
+            return "nginx was inactive; autostart skipped"
         subprocess.run(["systemctl", "start", "nginx"], check=True)
         return "nginx was inactive; started"
     if changed:
