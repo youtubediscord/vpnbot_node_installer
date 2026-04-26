@@ -9,10 +9,15 @@ import sys
 from pathlib import Path
 
 MANAGED_INBOUNDS_FILE = Path(os.environ.get("XRAY_CORE_MANAGED_INBOUNDS_FILE", "/opt/vpnbot/xray-core/config/50_vpnbot_managed_inbounds.json"))
+XRAY_CORE_CONFIG_DIR = Path(os.environ.get("XRAY_CORE_CONFIG_DIR", str(MANAGED_INBOUNDS_FILE.parent)))
+XRAY_CORE_BIN = os.environ.get("XRAY_CORE_BIN", "/opt/vpnbot/xray-core/bin/xray")
+XRAY_CORE_SHARE_DIR = os.environ.get("XRAY_CORE_SHARE_DIR", "/opt/vpnbot/xray-core/share")
+XRAY_CORE_SERVICE_NAME = os.environ.get("XRAY_CORE_SERVICE_NAME", "vpnbot-xray.service")
 HTTP_DIR = Path(os.environ.get("NGINX_HTTP_LOCATION_DIR", "/etc/nginx/vpnbot-http-locations.d"))
 STREAM_MAP = Path(os.environ.get("NGINX_STREAM_MAP_FILE", "/etc/nginx/vpnbot-stream.d/vpnbot_stream_map.conf"))
 STREAM_SERVER = Path(os.environ.get("NGINX_STREAM_SERVER_FILE", "/etc/nginx/vpnbot-stream.d/vpnbot_stream_server.conf"))
 HTTP_FRONTEND = f"127.0.0.1:{os.environ.get('HTTP_FRONTEND_LOCAL_PORT', '10443')}"
+HTTP_FRONTEND_PROXY = f"127.0.0.1:{os.environ.get('HTTP_FRONTEND_PROXY_LOCAL_PORT', '10444')}"
 INSTALLER_STATE_FILE = Path(os.environ.get("XRAY_CORE_INSTALLER_STATE_FILE", "/etc/vpnbot-xray-installer-state.json"))
 DEFAULT_APP_DOMAIN = os.environ.get("APP_DOMAIN", "")
 DEFAULT_SHARED_HTTP_DOMAIN = os.environ.get("SHARED_HTTP_DOMAIN", "")
@@ -178,6 +183,7 @@ def load_extra_routes() -> list[dict]:
         default_route = parse_bool(item.get("default"), default=False) or domain in {"default", "__default__", "*", "_"}
         backend_host = str(item.get("backend_host") or "127.0.0.1").strip() or "127.0.0.1"
         source = str(item.get("source") or item.get("service_type") or "external").strip() or "external"
+        proxy_protocol = parse_bool(item.get("proxy_protocol"), default=False)
         try:
             shared_port = int(item.get("shared_port") or 0)
             backend_port = int(item.get("backend_port") or 0)
@@ -194,6 +200,7 @@ def load_extra_routes() -> list[dict]:
                 "backend_host": backend_host,
                 "backend_port": backend_port,
                 "source": source,
+                "proxy_protocol": proxy_protocol,
             }
         )
     return routes
@@ -262,12 +269,15 @@ def build_stream_configs(
     shared_domains: set[str],
     passthrough_by_port: dict[int, dict[str, str]],
     default_by_port: dict[int, str],
+    proxy_protocol_ports: set[int],
 ) -> str:
     blocks = []
     for shared_port in shared_ports:
+        use_proxy_protocol = shared_port in proxy_protocol_ports
         var_name = f"{DOLLAR}vpnbot_backend_{shared_port}"
         explicit_routes = passthrough_by_port.get(shared_port) or {}
-        default_target = default_by_port.get(shared_port, HTTP_FRONTEND)
+        fallback_target = HTTP_FRONTEND_PROXY if use_proxy_protocol else HTTP_FRONTEND
+        default_target = default_by_port.get(shared_port, fallback_target)
         lines = [
             f"map {DOLLAR}ssl_preread_server_name {var_name} {{",
             "    hostnames;",
@@ -276,7 +286,7 @@ def build_stream_configs(
         for domain in sorted(shared_domains):
             if domain in explicit_routes:
                 continue
-            lines.append(f"    {domain} {HTTP_FRONTEND};")
+            lines.append(f"    {domain} {fallback_target};")
         for domain, backend_target in sorted(explicit_routes.items()):
             lines.append(f"    {domain} {backend_target};")
         lines.append("}")
@@ -284,11 +294,91 @@ def build_stream_configs(
         lines.append("server {")
         lines.append(f"    listen {shared_port} reuseport;")
         lines.append(f"    proxy_pass {var_name};")
+        if use_proxy_protocol:
+            lines.append("    proxy_protocol on;")
         lines.append("    ssl_preread on;")
         lines.append("}")
         lines.append("")
         blocks.append("\n".join(lines))
     return "\n".join(blocks).rstrip() + "\n"
+
+
+def validate_and_restart_xray(report_lines: list[str]) -> None:
+    env = os.environ.copy()
+    env.setdefault("XRAY_LOCATION_ASSET", XRAY_CORE_SHARE_DIR)
+    result = subprocess.run(
+        [XRAY_CORE_BIN, "run", "-test", "-confdir", str(XRAY_CORE_CONFIG_DIR)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            "Xray config validation failed after proxy protocol sync:\n"
+            + (result.stdout or "")
+            + (result.stderr or "")
+        )
+    subprocess.run(["systemctl", "restart", XRAY_CORE_SERVICE_NAME], check=True)
+    report_lines.append(f"xray_restart: {XRAY_CORE_SERVICE_NAME} restarted after proxy_protocol config sync")
+
+
+def sync_xray_proxy_protocol_settings(
+    rows: list[dict],
+    proxy_protocol_ports: set[int],
+    report_lines: list[str],
+) -> None:
+    changed = False
+    enabled = 0
+    disabled = 0
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        tag = str(row.get("tag") or "")
+        remark = str(row.get("remark") or "")
+        publication, _publication_source = resolve_publication_spec(tag, remark)
+        if publication["mode"] != "shared" or not publication.get("port"):
+            continue
+
+        shared_port = int(publication["port"])
+        desired = shared_port in proxy_protocol_ports
+        stream = row.get("streamSettings")
+        if not isinstance(stream, dict):
+            stream = {}
+            row["streamSettings"] = stream
+
+        sockopt = stream.get("sockopt")
+        if not isinstance(sockopt, dict):
+            sockopt = {}
+            stream["sockopt"] = sockopt
+        current_sockopt = bool(sockopt.get("acceptProxyProtocol"))
+        if current_sockopt != desired:
+            sockopt["acceptProxyProtocol"] = desired
+            changed = True
+            enabled += 1 if desired else 0
+            disabled += 0 if desired else 1
+
+        if str(stream.get("network") or "").lower() == "tcp":
+            tcp = stream.get("tcpSettings")
+            if not isinstance(tcp, dict):
+                tcp = {"header": {"type": "none"}}
+                stream["tcpSettings"] = tcp
+            current_tcp = bool(tcp.get("acceptProxyProtocol"))
+            if current_tcp != desired:
+                tcp["acceptProxyProtocol"] = desired
+                changed = True
+
+    if not changed:
+        report_lines.append("proxy_protocol_xray: already in sync")
+        return
+
+    payload = {"inbounds": rows}
+    MANAGED_INBOUNDS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    report_lines.append(
+        f"proxy_protocol_xray: updated managed inbounds enabled={enabled} disabled={disabled}"
+    )
+    validate_and_restart_xray(report_lines)
 
 
 def write_report(lines: list[str]) -> None:
@@ -418,6 +508,8 @@ def main() -> int:
     shared_ports = set()
     passthrough_by_port = {}
     default_by_port = {}
+    xray_stream_ports: set[int] = set()
+    proxy_protocol_blocked_ports: set[int] = set()
     report_lines = [
         "VPnBot xray-core sync report",
         "============================",
@@ -475,6 +567,7 @@ def main() -> int:
 
         if domains:
             backend_target = f"127.0.0.1:{port}"
+            xray_stream_ports.add(shared_port)
             for domain in domains:
                 register_stream_target(shared_port, domain, backend_target, passthrough_by_port, f"xray inbound #{row_id}")
             report_lines.append(
@@ -486,6 +579,7 @@ def main() -> int:
 
         if security in {"tls", "reality"}:
             backend_target = f"127.0.0.1:{port}"
+            xray_stream_ports.add(shared_port)
             register_default_stream_target(
                 shared_port,
                 backend_target,
@@ -548,6 +642,8 @@ def main() -> int:
         shared_port = int(route["shared_port"])
         backend_target = f'{route["backend_host"]}:{route["backend_port"]}'
         shared_ports.add(shared_port)
+        if not route.get("proxy_protocol"):
+            proxy_protocol_blocked_ports.add(shared_port)
         if route.get("default"):
             register_default_stream_target(
                 shared_port,
@@ -557,7 +653,8 @@ def main() -> int:
             )
             report_lines.append(
                 f'external route_id={route["route_id"]} external_port={shared_port} '
-                f'domain=<default> backend_target={backend_target} source={route["source"]!r}'
+                f'domain=<default> backend_target={backend_target} source={route["source"]!r} '
+                f'proxy_protocol={bool(route.get("proxy_protocol"))}'
             )
         else:
             register_stream_target(
@@ -569,12 +666,31 @@ def main() -> int:
             )
             report_lines.append(
                 f'external route_id={route["route_id"]} external_port={shared_port} '
-                f'domain={route["domain"]} backend_target={backend_target} source={route["source"]!r}'
+                f'domain={route["domain"]} backend_target={backend_target} source={route["source"]!r} '
+                f'proxy_protocol={bool(route.get("proxy_protocol"))}'
             )
 
+    proxy_protocol_ports = set(xray_stream_ports) - set(proxy_protocol_blocked_ports)
+    if proxy_protocol_ports:
+        report_lines.append(f"proxy_protocol_ports: {','.join(str(p) for p in sorted(proxy_protocol_ports))}")
+    if proxy_protocol_blocked_ports:
+        report_lines.append(
+            "proxy_protocol_disabled_ports_due_external_routes: "
+            + ",".join(str(p) for p in sorted(proxy_protocol_blocked_ports))
+        )
+    sync_xray_proxy_protocol_settings(rows, proxy_protocol_ports, report_lines)
     sync_xray_reserved_ports(rows, report_lines)
 
-    STREAM_MAP.write_text(build_stream_configs(sorted(shared_ports), shared_domains, passthrough_by_port, default_by_port), encoding="utf-8")
+    STREAM_MAP.write_text(
+        build_stream_configs(
+            sorted(shared_ports),
+            shared_domains,
+            passthrough_by_port,
+            default_by_port,
+            proxy_protocol_ports,
+        ),
+        encoding="utf-8",
+    )
     STREAM_SERVER.write_text("# generated by vpnbot-xray-sync-routes\n", encoding="utf-8")
     write_report(report_lines)
 

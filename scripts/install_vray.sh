@@ -64,6 +64,7 @@ DDNS_WAIT_INTERVAL="${DDNS_WAIT_INTERVAL:-5}"
 VPNBOT_SERVER_ID="${VPNBOT_SERVER_ID:-}"
 SHARED_HTTP_DOMAIN="${SHARED_HTTP_DOMAIN:-}"
 HTTP_FRONTEND_LOCAL_PORT="${HTTP_FRONTEND_LOCAL_PORT:-10443}"
+HTTP_FRONTEND_PROXY_LOCAL_PORT="${HTTP_FRONTEND_PROXY_LOCAL_PORT:-10444}"
 NGINX_SERVER_NAME="${NGINX_SERVER_NAME:-}"
 NGINX_PANEL_LOCATION="${NGINX_PANEL_LOCATION:-}"
 NGINX_SSL_CERT="${NGINX_SSL_CERT:-/etc/nginx/ssl/vpnbot/fullchain.pem}"
@@ -2448,8 +2449,11 @@ server {
 
 server {
     listen 127.0.0.1:${HTTP_FRONTEND_LOCAL_PORT} ssl${http2_listen_suffix};
+    listen 127.0.0.1:${HTTP_FRONTEND_PROXY_LOCAL_PORT} ssl${http2_listen_suffix} proxy_protocol;
 ${http2_directive}
     server_name ${NGINX_SERVER_NAME};
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
 
     ssl_certificate ${NGINX_SSL_CERT};
     ssl_certificate_key ${NGINX_SSL_KEY};
@@ -2517,6 +2521,7 @@ write_installer_state() {
     SSL_CERT_VALUE="${NGINX_SSL_CERT}" \
     SSL_KEY_VALUE="${NGINX_SSL_KEY}" \
     HTTP_FRONTEND_LOCAL_PORT_VALUE="${HTTP_FRONTEND_LOCAL_PORT}" \
+    HTTP_FRONTEND_PROXY_LOCAL_PORT_VALUE="${HTTP_FRONTEND_PROXY_LOCAL_PORT}" \
     INSTALLER_STATE_FILE="${XUI_INSTALLER_STATE_FILE}" \
     python3 - <<'PY'
 import json
@@ -2543,6 +2548,7 @@ payload = {
     "ssl_cert": os.environ["SSL_CERT_VALUE"],
     "ssl_key": os.environ["SSL_KEY_VALUE"],
     "http_frontend_local_port": int(os.environ["HTTP_FRONTEND_LOCAL_PORT_VALUE"]),
+    "http_frontend_proxy_local_port": int(os.environ["HTTP_FRONTEND_PROXY_LOCAL_PORT_VALUE"]),
 }
 Path(os.environ["INSTALLER_STATE_FILE"]).write_text(
     json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
@@ -2660,6 +2666,7 @@ write_xray_core_installer_state() {
     SSL_CERT_VALUE="${NGINX_SSL_CERT}" \
     SSL_KEY_VALUE="${NGINX_SSL_KEY}" \
     HTTP_FRONTEND_LOCAL_PORT_VALUE="${HTTP_FRONTEND_LOCAL_PORT}" \
+    HTTP_FRONTEND_PROXY_LOCAL_PORT_VALUE="${HTTP_FRONTEND_PROXY_LOCAL_PORT}" \
     XRAY_CORE_SMOKE_ENABLE_VALUE="${XRAY_CORE_SMOKE_ENABLE}" \
     XRAY_CORE_SMOKE_PORT_VALUE="${XRAY_CORE_SMOKE_PORT_EFFECTIVE}" \
     XRAY_CORE_SMOKE_DOMAIN_VALUE="${XRAY_CORE_SMOKE_DOMAIN}" \
@@ -2708,6 +2715,7 @@ payload = {
     "ssl_cert": os.environ["SSL_CERT_VALUE"],
     "ssl_key": os.environ["SSL_KEY_VALUE"],
     "http_frontend_local_port": int(os.environ["HTTP_FRONTEND_LOCAL_PORT_VALUE"]),
+    "http_frontend_proxy_local_port": int(os.environ["HTTP_FRONTEND_PROXY_LOCAL_PORT_VALUE"]),
     "smoke_profile": {
         "enabled": parse_bool(os.environ.get("XRAY_CORE_SMOKE_ENABLE_VALUE")),
         "port": int(os.environ["XRAY_CORE_SMOKE_PORT_VALUE"]) if os.environ.get("XRAY_CORE_SMOKE_PORT_VALUE") else None,
@@ -2804,10 +2812,15 @@ write_xray_sync_assets() {
 #!/usr/bin/env bash
 set -euo pipefail
 export XRAY_CORE_MANAGED_INBOUNDS_FILE=${XRAY_CORE_MANAGED_INBOUNDS_FILE@Q}
+export XRAY_CORE_CONFIG_DIR=${XRAY_CORE_CONFIG_DIR@Q}
+export XRAY_CORE_BIN=${XRAY_CORE_BIN@Q}
+export XRAY_CORE_SHARE_DIR=${XRAY_CORE_SHARE_DIR@Q}
+export XRAY_CORE_SERVICE_NAME=${XRAY_CORE_SERVICE_NAME@Q}
 export NGINX_HTTP_LOCATION_DIR=${NGINX_HTTP_LOCATION_DIR@Q}
 export NGINX_STREAM_MAP_FILE=${NGINX_STREAM_MAP_FILE@Q}
 export NGINX_STREAM_SERVER_FILE=${NGINX_STREAM_SERVER_FILE@Q}
 export HTTP_FRONTEND_LOCAL_PORT=${HTTP_FRONTEND_LOCAL_PORT@Q}
+export HTTP_FRONTEND_PROXY_LOCAL_PORT=${HTTP_FRONTEND_PROXY_LOCAL_PORT@Q}
 export XRAY_CORE_INSTALLER_STATE_FILE=${XRAY_CORE_INSTALLER_STATE_FILE@Q}
 export APP_DOMAIN=${APP_DOMAIN@Q}
 export SHARED_HTTP_DOMAIN=${SHARED_HTTP_DOMAIN@Q}
@@ -3123,6 +3136,7 @@ show_xray_core_summary() {
     info "Shared ports"
     echo "  Shared publication is handled by: ${XRAY_SYNC_SCRIPT}"
     echo "  Local HTTPS frontend: 127.0.0.1:${HTTP_FRONTEND_LOCAL_PORT}"
+    echo "  Local HTTPS frontend (PROXY protocol): 127.0.0.1:${HTTP_FRONTEND_PROXY_LOCAL_PORT}"
     echo "  nginx shared stream configs: ${NGINX_STREAM_INCLUDE_DIR}"
     echo "  nginx shared HTTP routes: ${NGINX_HTTP_LOCATION_DIR}"
     echo ""
@@ -3224,6 +3238,7 @@ show_summary() {
     fi
     echo "  nginx public shared TCP ports -> stream mux"
     echo "  local HTTPS frontend: 127.0.0.1:${HTTP_FRONTEND_LOCAL_PORT}"
+    echo "  local HTTPS frontend (PROXY protocol): 127.0.0.1:${HTTP_FRONTEND_PROXY_LOCAL_PORT}"
     echo ""
     info "Publication markers"
     echo "  [443] or [shared:443]     -> publish through shared TCP/443"

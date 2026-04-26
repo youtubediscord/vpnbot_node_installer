@@ -931,11 +931,14 @@ def build_xray_payload(spec: dict, rows: list[dict]) -> tuple[dict | None, str]:
     if spec.get("no_flow"):
         publication_marker = f"{publication_marker} no-flow"
     tag = f"{publication_marker} {tag}"
+    use_proxy_protocol = bool(spec.get("mode") == "shared" and spec.get("external_port"))
 
     stream_settings = {
         "network": network,
         "security": security,
     }
+    if use_proxy_protocol:
+        stream_settings["sockopt"] = {"acceptProxyProtocol": True}
 
     if security == "reality":
         server_names = reality_server_names(domain)
@@ -984,7 +987,7 @@ def build_xray_payload(spec: dict, rows: list[dict]) -> tuple[dict | None, str]:
 
     if network == "tcp":
         stream_settings["tcpSettings"] = {
-            "acceptProxyProtocol": False,
+            "acceptProxyProtocol": use_proxy_protocol,
             "header": {
                 "type": "none"
             }
