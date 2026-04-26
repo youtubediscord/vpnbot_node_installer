@@ -42,10 +42,43 @@ ABUSE_MULTI_IP_CRITICAL_IPS = max(
 )
 ABUSE_MULTI_IP_MIN_PREFIXES = max(1, int(os.environ.get("XRAY_ABUSE_MULTI_IP_MIN_PREFIXES", "3")))
 ABUSE_MULTI_IP_TOP_LIMIT = max(5, min(int(os.environ.get("XRAY_ABUSE_MULTI_IP_TOP_LIMIT", "30")), 100))
+ABUSE_MULTI_IP_WINDOWS = sorted(
+    {
+        max(10, min(int(item.strip()), 3600))
+        for item in os.environ.get("XRAY_ABUSE_MULTI_IP_WINDOWS", "30,60,180").split(",")
+        if item.strip().isdigit()
+    }
+    or {30, 60, 180}
+)
+ABUSE_MULTI_IP_HISTORY_FILE = Path(
+    os.environ.get(
+        "XRAY_ABUSE_MULTI_IP_HISTORY_FILE",
+        "/var/lib/vpnbot-xray-online/multi_ip_history.json",
+    )
+)
+ABUSE_MULTI_IP_KNOWN_IP_TTL_SECONDS = max(
+    3600,
+    min(int(os.environ.get("XRAY_ABUSE_MULTI_IP_KNOWN_IP_TTL_SECONDS", str(14 * 86400))), 90 * 86400),
+)
+ABUSE_MULTI_IP_REPEAT_WINDOW_SECONDS = max(
+    300,
+    min(int(os.environ.get("XRAY_ABUSE_MULTI_IP_REPEAT_WINDOW_SECONDS", "86400")), 7 * 86400),
+)
+ABUSE_MULTI_IP_RISK_EVENT_MIN_INTERVAL_SECONDS = max(
+    30,
+    min(int(os.environ.get("XRAY_ABUSE_MULTI_IP_RISK_EVENT_MIN_INTERVAL_SECONDS", "120")), 3600),
+)
+ABUSE_MULTI_IP_HISTORY_SAVE_INTERVAL_SECONDS = max(
+    5.0,
+    min(float(os.environ.get("XRAY_ABUSE_MULTI_IP_HISTORY_SAVE_INTERVAL_SECONDS", "30")), 300.0),
+)
 
 LOCK = threading.RLock()
 CLIENTS: dict[str, dict] = {}
 ABUSE_EVENTS: list[dict] = []
+MULTI_IP_HISTORY: dict[str, dict] = {"users": {}}
+HISTORY_DIRTY = False
+LAST_HISTORY_SAVE_AT = 0.0
 LAST_LINE_AT = 0.0
 LAST_ERROR = ""
 TRAFFIC = {
@@ -61,6 +94,126 @@ TRAFFIC = {
 
 def utc_iso(ts: float | None = None) -> str:
     return datetime.fromtimestamp(ts or time.time(), timezone.utc).isoformat()
+
+
+def load_multi_ip_history() -> None:
+    global MULTI_IP_HISTORY
+    try:
+        payload = json.loads(ABUSE_MULTI_IP_HISTORY_FILE.read_text(encoding="utf-8") or "{}")
+    except FileNotFoundError:
+        payload = {}
+    except Exception:
+        payload = {}
+
+    if not isinstance(payload, dict):
+        payload = {}
+    users = payload.get("users")
+    if not isinstance(users, dict):
+        users = {}
+    MULTI_IP_HISTORY = {"users": users}
+
+
+def save_multi_ip_history(force: bool = False) -> None:
+    global HISTORY_DIRTY, LAST_HISTORY_SAVE_AT
+
+    now = time.time()
+    if not force and (not HISTORY_DIRTY or now - LAST_HISTORY_SAVE_AT < ABUSE_MULTI_IP_HISTORY_SAVE_INTERVAL_SECONDS):
+        return
+
+    with LOCK:
+        payload = json.loads(json.dumps(MULTI_IP_HISTORY, ensure_ascii=False))
+        HISTORY_DIRTY = False
+        LAST_HISTORY_SAVE_AT = now
+
+    try:
+        ABUSE_MULTI_IP_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = ABUSE_MULTI_IP_HISTORY_FILE.with_name(
+            f".{ABUSE_MULTI_IP_HISTORY_FILE.name}.{os.getpid()}.tmp"
+        )
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
+        os.replace(tmp, ABUSE_MULTI_IP_HISTORY_FILE)
+    except Exception:
+        with LOCK:
+            HISTORY_DIRTY = True
+
+
+def _history_user(email: str) -> dict:
+    users = MULTI_IP_HISTORY.setdefault("users", {})
+    entry = users.setdefault(email, {"ips": {}, "risk_events": []})
+    if not isinstance(entry.get("ips"), dict):
+        entry["ips"] = {}
+    if not isinstance(entry.get("risk_events"), list):
+        entry["risk_events"] = []
+    return entry
+
+
+def remember_multi_ip_history(email: str, ts: float, source_ip: str | None) -> None:
+    global HISTORY_DIRTY
+    if not source_ip:
+        return
+
+    entry = _history_user(email)
+    ips = entry.setdefault("ips", {})
+    item = ips.setdefault(source_ip, {"first_seen": float(ts), "last_seen": 0.0, "count": 0})
+    try:
+        item["first_seen"] = min(float(item.get("first_seen") or ts), float(ts))
+    except Exception:
+        item["first_seen"] = float(ts)
+    item["last_seen"] = max(float(item.get("last_seen") or 0.0), float(ts))
+    item["count"] = int(item.get("count") or 0) + 1
+    entry["last_seen"] = max(float(entry.get("last_seen") or 0.0), float(ts))
+    HISTORY_DIRTY = True
+
+
+def record_multi_ip_risk_event(
+    email: str,
+    now: float,
+    *,
+    risk_level: str,
+    ip_count: int,
+    prefix_count: int,
+    new_ip_count: int,
+    burst_score: int,
+) -> dict:
+    global HISTORY_DIRTY
+
+    entry = _history_user(email)
+    events = entry.setdefault("risk_events", [])
+    cutoff = now - ABUSE_MULTI_IP_REPEAT_WINDOW_SECONDS
+    events[:] = [
+        item
+        for item in events
+        if isinstance(item, dict) and float(item.get("ts") or 0.0) >= cutoff
+    ]
+
+    risk_level = str(risk_level or "normal")
+    if risk_level in {"suspicious", "high", "critical"}:
+        last_event_ts = float(entry.get("last_risk_event_at") or 0.0)
+        if now - last_event_ts >= ABUSE_MULTI_IP_RISK_EVENT_MIN_INTERVAL_SECONDS:
+            events.append(
+                {
+                    "ts": float(now),
+                    "risk_level": risk_level,
+                    "ip_count": int(ip_count),
+                    "prefix_count": int(prefix_count),
+                    "new_ip_count": int(new_ip_count),
+                    "burst_score": int(burst_score),
+                }
+            )
+            entry["last_risk_event_at"] = float(now)
+            HISTORY_DIRTY = True
+
+    level_counts: dict[str, int] = {}
+    for item in events:
+        level = str(item.get("risk_level") or "")
+        if level:
+            level_counts[level] = int(level_counts.get(level, 0)) + 1
+
+    return {
+        "repeat_count": len(events),
+        "repeat_level_counts": level_counts,
+        "last_risk_seen_at": utc_iso(float(events[-1].get("ts"))) if events else "",
+    }
 
 
 def parse_xray_ts(value: str) -> float | None:
@@ -241,15 +394,37 @@ def process_line(raw: str) -> None:
             if len(ips) > MAX_IPS_PER_USER * 2:
                 for ip, _ in sorted(ips.items(), key=lambda item: float(item[1]))[:-MAX_IPS_PER_USER]:
                     ips.pop(ip, None)
+            remember_multi_ip_history(email, ts, source_ip)
         remember_abuse_event(email, ts, source_ip, target)
         LAST_LINE_AT = now
 
 
 def purge_stale(now: float | None = None) -> None:
+    global HISTORY_DIRTY
     now = now or time.time()
     cutoff = now - WINDOW_SECONDS
     abuse_cutoff = now - ABUSE_AUDIT_WINDOW_SECONDS
     with LOCK:
+        history_users = MULTI_IP_HISTORY.setdefault("users", {})
+        history_ip_cutoff = now - ABUSE_MULTI_IP_KNOWN_IP_TTL_SECONDS
+        history_event_cutoff = now - ABUSE_MULTI_IP_REPEAT_WINDOW_SECONDS
+        for email in list(history_users.keys()):
+            history_entry = history_users.get(email) or {}
+            history_ips = history_entry.get("ips") if isinstance(history_entry.get("ips"), dict) else {}
+            for ip, item in list(history_ips.items()):
+                if not isinstance(item, dict) or float(item.get("last_seen") or 0.0) < history_ip_cutoff:
+                    history_ips.pop(ip, None)
+                    HISTORY_DIRTY = True
+            events = history_entry.get("risk_events") if isinstance(history_entry.get("risk_events"), list) else []
+            history_entry["risk_events"] = [
+                item
+                for item in events
+                if isinstance(item, dict) and float(item.get("ts") or 0.0) >= history_event_cutoff
+            ]
+            if not history_ips and not history_entry["risk_events"]:
+                history_users.pop(email, None)
+                HISTORY_DIRTY = True
+
         for email in list(CLIENTS.keys()):
             entry = CLIENTS.get(email) or {}
             if float(entry.get("last_seen") or 0.0) < cutoff:
@@ -407,42 +582,104 @@ def _multi_ip_risk_score(ip_count: int, prefix_count: int, event_count: int) -> 
     return int(score)
 
 
+def _window_ip_stats(ips_raw: dict, now: float, windows: list[int], history_ips: dict) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for window in windows:
+        cutoff = now - int(window)
+        ips = [
+            ip
+            for ip, seen in sorted(ips_raw.items(), key=lambda item: float(item[1]), reverse=True)
+            if float(seen) >= cutoff
+        ][:MAX_IPS_PER_USER]
+        prefixes = sorted({prefix for ip in ips for prefix in [ip_prefix(ip)] if prefix})
+        new_ips = []
+        known_ips = []
+        for ip in ips:
+            history_item = history_ips.get(ip) if isinstance(history_ips, dict) else None
+            first_seen = float((history_item or {}).get("first_seen") or 0.0) if isinstance(history_item, dict) else 0.0
+            if first_seen >= cutoff:
+                new_ips.append(ip)
+            else:
+                known_ips.append(ip)
+        out[str(window)] = {
+            "window_seconds": int(window),
+            "ip_count": len(ips),
+            "prefix_count": len(prefixes),
+            "new_ip_count": len(new_ips),
+            "known_ip_count": len(known_ips),
+            "ips": ips,
+            "new_ips": new_ips,
+            "prefixes": prefixes,
+        }
+    return out
+
+
+def _event_stats_by_window(events: list[dict], now: float, windows: list[int]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for window in windows:
+        cutoff = now - int(window)
+        filtered = [
+            item
+            for item in events
+            if float(item.get("ts") or 0.0) >= cutoff
+        ]
+        targets = set()
+        ports = set()
+        for item in filtered:
+            host = str(item.get("host") or "").strip()
+            port = int(item.get("port") or 0)
+            if host or port:
+                targets.add(f"{host}:{port}" if port else host)
+            if port:
+                ports.add(port)
+        out[str(window)] = {
+            "window_seconds": int(window),
+            "event_count": len(filtered),
+            "target_count": len(targets),
+            "port_count": len(ports),
+        }
+    return out
+
+
+def _burst_score(
+    *,
+    ip_count: int,
+    prefix_count: int,
+    new_ip_count: int,
+    event_count: int,
+    short_ip_count: int,
+    repeat_count: int,
+) -> int:
+    score = ip_count * 8 + prefix_count * 8 + new_ip_count * 14 + short_ip_count * 10
+    if event_count >= 500:
+        score += 35
+    elif event_count >= 100:
+        score += 20
+    elif event_count >= 30:
+        score += 10
+    if repeat_count >= 3:
+        score += 25
+    elif repeat_count >= 1:
+        score += 10
+    return int(score)
+
+
 def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
     now = time.time()
     window = max(10, min(int(window_seconds or WINDOW_SECONDS), 3600))
-    cutoff = now - window
+    windows = sorted({*ABUSE_MULTI_IP_WINDOWS, window})
+    main_window = str(window)
+    history_cutoff = now - max(windows)
     purge_stale(now)
 
     with LOCK:
         client_items = [(email, dict(entry)) for email, entry in CLIENTS.items()]
+        history_users = json.loads(json.dumps(MULTI_IP_HISTORY.get("users") or {}, ensure_ascii=False))
         abuse_events = [
             dict(item)
             for item in ABUSE_EVENTS
-            if float(item.get("ts") or 0.0) >= cutoff
+            if float(item.get("ts") or 0.0) >= history_cutoff
         ]
-
-    events_by_email: dict[str, dict] = {}
-    for item in abuse_events:
-        email = str(item.get("email") or "").strip()
-        if not email:
-            continue
-        entry = events_by_email.setdefault(
-            email,
-            {
-                "event_count": 0,
-                "targets": set(),
-                "ports": set(),
-                "last_seen": 0.0,
-            },
-        )
-        entry["event_count"] += 1
-        host = str(item.get("host") or "").strip()
-        port = int(item.get("port") or 0)
-        if host or port:
-            entry["targets"].add(f"{host}:{port}" if port else host)
-        if port:
-            entry["ports"].add(port)
-        entry["last_seen"] = max(float(entry.get("last_seen") or 0.0), float(item.get("ts") or 0.0))
 
     users = []
     counters = {"observe": 0, "suspicious": 0, "high": 0, "critical": 0}
@@ -452,32 +689,76 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
             last_seen = float(entry.get("last_seen") or 0.0)
         except Exception:
             continue
-        if last_seen < cutoff:
+        if last_seen < now - window:
             continue
 
         ips_raw = entry.get("ips") if isinstance(entry.get("ips"), dict) else {}
-        recent_ips = [
-            ip
-            for ip, seen in sorted(ips_raw.items(), key=lambda item: float(item[1]), reverse=True)
-            if float(seen) >= cutoff
-        ][:MAX_IPS_PER_USER]
+        history_entry = history_users.get(email) if isinstance(history_users.get(email), dict) else {}
+        history_ips = history_entry.get("ips") if isinstance(history_entry.get("ips"), dict) else {}
+        window_stats = _window_ip_stats(ips_raw, now, windows, history_ips)
+        recent_window = window_stats.get(main_window) or {}
+        recent_ips = list(recent_window.get("ips") or [])
         ip_count = len(recent_ips)
         if ip_count < ABUSE_MULTI_IP_OBSERVE_IPS:
             continue
 
-        prefixes = sorted({prefix for ip in recent_ips for prefix in [ip_prefix(ip)] if prefix})
-        prefix_count = len(prefixes)
-        event_info = events_by_email.get(email) or {}
+        prefixes = list(recent_window.get("prefixes") or [])
+        prefix_count = int(recent_window.get("prefix_count") or 0)
+        new_ip_count = int(recent_window.get("new_ip_count") or 0)
+        known_ip_count = int(recent_window.get("known_ip_count") or 0)
+        email_events = [
+            item
+            for item in abuse_events
+            if str(item.get("email") or "").strip() == email
+        ]
+        event_windows = _event_stats_by_window(email_events, now, windows)
+        event_info = event_windows.get(main_window) or {}
         event_count = int(event_info.get("event_count") or 0)
-        target_count = len(event_info.get("targets") or set())
-        port_count = len(event_info.get("ports") or set())
+        target_count = int(event_info.get("target_count") or 0)
+        port_count = int(event_info.get("port_count") or 0)
         risk_level = _multi_ip_risk_level(ip_count, prefix_count)
+        short_window_key = str(min(windows))
+        short_ip_count = int((window_stats.get(short_window_key) or {}).get("ip_count") or 0)
+        history_summary = record_multi_ip_risk_event(
+            email,
+            now,
+            risk_level="normal",
+            ip_count=ip_count,
+            prefix_count=prefix_count,
+            new_ip_count=new_ip_count,
+            burst_score=0,
+        )
+        repeat_count = int(history_summary.get("repeat_count") or 0)
+        burst_score = _burst_score(
+            ip_count=ip_count,
+            prefix_count=prefix_count,
+            new_ip_count=new_ip_count,
+            event_count=event_count,
+            short_ip_count=short_ip_count,
+            repeat_count=repeat_count,
+        )
+        history_summary = record_multi_ip_risk_event(
+            email,
+            now,
+            risk_level=risk_level,
+            ip_count=ip_count,
+            prefix_count=prefix_count,
+            new_ip_count=new_ip_count,
+            burst_score=burst_score,
+        )
+        repeat_count = int(history_summary.get("repeat_count") or repeat_count)
         if risk_level in counters:
             counters[risk_level] += 1
 
         reasons = [f"{ip_count} IP за {window} секунд"]
+        if short_ip_count >= ABUSE_MULTI_IP_SUSPICIOUS_IPS:
+            reasons.append(f"{short_ip_count} IP уже за {short_window_key} секунд")
+        if new_ip_count >= ABUSE_MULTI_IP_SUSPICIOUS_IPS:
+            reasons.append(f"{new_ip_count} новых IP за {window} секунд")
         if prefix_count:
             reasons.append(f"{prefix_count} разных подсетей")
+        if repeat_count >= 2:
+            reasons.append(f"{repeat_count} повторов риска за {ABUSE_MULTI_IP_REPEAT_WINDOW_SECONDS // 3600 or 1} ч")
         if event_count >= 30:
             reasons.append(f"{event_count} подключений/записей access.log")
         if target_count >= 10:
@@ -491,10 +772,19 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
                 "risk_level": risk_level,
                 "evidence_strength": "strong" if prefix_count >= ABUSE_MULTI_IP_MIN_PREFIXES else "medium",
                 "risk_score": _multi_ip_risk_score(ip_count, prefix_count, event_count),
+                "burst_score": burst_score,
                 "ip_count": ip_count,
                 "prefix_count": prefix_count,
+                "new_ip_count": new_ip_count,
+                "known_ip_count": known_ip_count,
                 "prefixes": prefixes[:ABUSE_AUDIT_TOP_LIMIT],
                 "ips": recent_ips,
+                "new_ips": list(recent_window.get("new_ips") or [])[:ABUSE_AUDIT_TOP_LIMIT],
+                "window_ip_counts": window_stats,
+                "window_event_counts": event_windows,
+                "repeat_count": repeat_count,
+                "repeat_level_counts": history_summary.get("repeat_level_counts") or {},
+                "last_risk_seen_at": str(history_summary.get("last_risk_seen_at") or ""),
                 "event_count": event_count,
                 "target_count": target_count,
                 "port_count": port_count,
@@ -508,11 +798,13 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
     users.sort(
         key=lambda item: (
             risk_order.get(str(item.get("risk_level") or ""), 0),
+            int(item.get("burst_score") or 0),
             int(item.get("risk_score") or 0),
             int(item.get("ip_count") or 0),
         ),
         reverse=True,
     )
+    save_multi_ip_history()
 
     return {
         "ok": True,
@@ -526,6 +818,9 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
             "high_ips": ABUSE_MULTI_IP_HIGH_IPS,
             "critical_ips": ABUSE_MULTI_IP_CRITICAL_IPS,
             "min_prefixes": ABUSE_MULTI_IP_MIN_PREFIXES,
+            "windows": windows,
+            "repeat_window_seconds": ABUSE_MULTI_IP_REPEAT_WINDOW_SECONDS,
+            "known_ip_ttl_seconds": ABUSE_MULTI_IP_KNOWN_IP_TTL_SECONDS,
         },
         "counts": counters,
         "suspect_count": len(users),
@@ -747,6 +1042,7 @@ def tail_access_log() -> None:
                 continue
 
             purge_stale()
+            save_multi_ip_history()
             time.sleep(POLL_INTERVAL)
         except Exception as exc:
             with LOCK:
@@ -827,6 +1123,7 @@ STARTED_AT = utc_iso()
 
 
 def main() -> None:
+    load_multi_ip_history()
     worker = threading.Thread(target=tail_access_log, name="xray-access-log-tail", daemon=True)
     worker.start()
     stats = threading.Thread(target=stats_worker, name="xray-stats-poll", daemon=True)
