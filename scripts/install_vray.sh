@@ -4781,6 +4781,29 @@ def has_no_flow_marker(text: str) -> bool:
     return "no flow" in value or "no-flow" in value or "noflow" in value
 
 
+def reality_server_names(primary: str) -> list[str]:
+    names: list[str] = []
+    for raw in [
+        primary,
+        *globals().get("CATALOG_REALITY_TCP_DOMAINS", []),
+        *globals().get("CATALOG_REALITY_XHTTP_DOMAINS", []),
+        *globals().get("XRAY_TCP_REALITY_DOMAINS", []),
+    ]:
+        normalized = normalize_sni(raw)
+        if normalized and normalized not in names:
+            names.append(normalized)
+    return names or [normalize_sni(primary)]
+
+
+def spec_route_sni_values(spec: dict) -> set[str]:
+    if spec.get("security") == "reality":
+        return set(reality_server_names(str(spec.get("domain") or "")))
+    if spec.get("security") == "tls":
+        normalized = normalize_sni(str(spec.get("domain") or ""))
+        return {normalized} if normalized else set()
+    return set()
+
+
 def iter_existing_actual_ports(rows: list[dict]) -> set[int]:
     return {int(row.get("port") or 0) for row in rows if isinstance(row, dict) and int(row.get("port") or 0) > 0}
 
@@ -4874,11 +4897,12 @@ def require_fixed_port(inbounds: list[dict], port: int) -> int:
 def build_reality_settings(opener, state: dict, sni: str) -> dict:
     cert = get_x25519(opener, state)
     short_id = "".join(random.choice("0123456789abcdef") for _ in range(16))
+    server_names = reality_server_names(sni)
     return {
         "show": False,
         "xver": 0,
         "dest": f"{sni}:443",
-        "serverNames": [sni],
+        "serverNames": server_names,
         "privateKey": cert["privateKey"],
         "minClient": "",
         "maxClient": "",
@@ -5016,8 +5040,8 @@ def assign_and_validate_custom_specs(specs: list[dict], rows: list[dict], state:
                     route_bucket = existing_routes.setdefault(candidate_port, {"sni": set(), "http_paths": set()})
                     pending_bucket = new_routes.setdefault(candidate_port, {"sni": set(), "http_paths": set()})
                     if spec["security"] in {"reality", "tls"}:
-                        sni = normalize_sni(spec["domain"])
-                        return sni in route_bucket["sni"] or sni in pending_bucket["sni"]
+                        sni_values = spec_route_sni_values(spec)
+                        return bool(sni_values & route_bucket["sni"] or sni_values & pending_bucket["sni"])
                     path = custom_http_path(spec)
                     return path in route_bucket["http_paths"] or path in pending_bucket["http_paths"]
 
@@ -5041,8 +5065,7 @@ def assign_and_validate_custom_specs(specs: list[dict], rows: list[dict], state:
                 route_bucket = existing_routes.setdefault(shared_port, {"sni": set(), "http_paths": set()})
                 pending_bucket = new_routes.setdefault(shared_port, {"sni": set(), "http_paths": set()})
                 if spec["security"] in {"reality", "tls"}:
-                    sni = normalize_sni(spec["domain"])
-                    pending_bucket["sni"].add(sni)
+                    pending_bucket["sni"].update(spec_route_sni_values(spec))
                 else:
                     path = custom_http_path(spec)
                     spec["http_path"] = path
@@ -5436,11 +5459,16 @@ def make_payload_vless_tcp_reality(rows: list[dict], opener, state: dict) -> tup
 
 
 CATALOG_REALITY_XHTTP_DOMAINS = [
+    "www.yandex.ru",
+    "rutube.ru",
+    "www.wildberries.ru",
+    "www.hp.com",
+    "www.sberbank.ru",
+    "www.intel.com",
     "www.avito.ru",
     "www.ozon.ru",
     "www.gosuslugi.ru",
     "vk.com",
-    "www.yandex.ru",
 ]
 
 CATALOG_REALITY_TCP_DOMAINS = [
@@ -5450,6 +5478,10 @@ CATALOG_REALITY_TCP_DOMAINS = [
     "www.hp.com",
     "www.sberbank.ru",
     "www.intel.com",
+    "www.avito.ru",
+    "www.ozon.ru",
+    "www.gosuslugi.ru",
+    "vk.com",
 ]
 
 
@@ -5679,6 +5711,10 @@ XRAY_TCP_REALITY_DOMAINS = [
     "www.hp.com",
     "www.sberbank.ru",
     "www.intel.com",
+    "www.avito.ru",
+    "www.ozon.ru",
+    "www.gosuslugi.ru",
+    "vk.com",
 ]
 XRAY_PROTOCOL_LABELS = [
     ("vless", "VLESS"),
@@ -5691,6 +5727,29 @@ MARK_RE = re.compile(r"\\[(?P<value>direct|shared:\\d+|\\d+)\\]", re.IGNORECASE)
 def has_no_flow_marker(text: str) -> bool:
     value = str(text or "").lower()
     return "no flow" in value or "no-flow" in value or "noflow" in value
+
+
+def reality_server_names(primary: str) -> list[str]:
+    names: list[str] = []
+    for raw in [
+        primary,
+        *globals().get("CATALOG_REALITY_TCP_DOMAINS", []),
+        *globals().get("CATALOG_REALITY_XHTTP_DOMAINS", []),
+        *globals().get("XRAY_TCP_REALITY_DOMAINS", []),
+    ]:
+        normalized = normalize_sni(raw)
+        if normalized and normalized not in names:
+            names.append(normalized)
+    return names or [normalize_sni(primary)]
+
+
+def spec_route_sni_values(spec: dict) -> set[str]:
+    if spec.get("security") == "reality":
+        return set(reality_server_names(str(spec.get("domain") or "")))
+    if spec.get("security") == "tls":
+        normalized = normalize_sni(str(spec.get("domain") or ""))
+        return {normalized} if normalized else set()
+    return set()
 
 
 def slugify(text: str) -> str:
@@ -6325,8 +6384,8 @@ def prepare_xray_specs(lines: list[str], rows: list[dict]) -> list[dict]:
                     route_bucket = existing_routes.setdefault(candidate_port, {"sni": set(), "http_paths": set()})
                     pending_bucket = new_routes.setdefault(candidate_port, {"sni": set(), "http_paths": set()})
                     if spec["security"] in {"reality", "tls"}:
-                        sni = normalize_sni(spec["domain"])
-                        return sni in route_bucket["sni"] or sni in pending_bucket["sni"]
+                        sni_values = spec_route_sni_values(spec)
+                        return bool(sni_values & route_bucket["sni"] or sni_values & pending_bucket["sni"])
                     path = custom_http_path(spec)
                     return path in route_bucket["http_paths"] or path in pending_bucket["http_paths"]
 
@@ -6349,7 +6408,7 @@ def prepare_xray_specs(lines: list[str], rows: list[dict]) -> list[dict]:
                 spec["external_port"] = shared_port
                 pending_bucket = new_routes.setdefault(shared_port, {"sni": set(), "http_paths": set()})
                 if spec["security"] in {"reality", "tls"}:
-                    pending_bucket["sni"].add(normalize_sni(spec["domain"]))
+                    pending_bucket["sni"].update(spec_route_sni_values(spec))
                 else:
                     pending_bucket["http_paths"].add(custom_http_path(spec))
                 backend_port = choose_random_port(rows, forbidden=occupied_actual_ports | occupied_shared_ports)
@@ -6442,11 +6501,12 @@ def build_xray_payload(spec: dict, rows: list[dict]) -> tuple[dict | None, str]:
     }
 
     if security == "reality":
+        server_names = reality_server_names(domain)
         stream_settings["realitySettings"] = {
             "show": False,
             "xver": 0,
             "dest": f"{domain}:443",
-            "serverNames": [domain],
+            "serverNames": server_names,
             "privateKey": private_key,
             "minClientVer": "",
             "maxClientVer": "",
