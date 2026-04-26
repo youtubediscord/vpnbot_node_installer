@@ -44,7 +44,7 @@ files to stay readable and testable as normal files:
 - `assets/reality_sni_pool.json` - shared REALITY SNI pool used by both preset
   helpers.
 - `assets/vpnbot_xray_online_tracker.py` - local Xray-core online/recent
-  activity and abuse-audit HTTP service.
+  activity, abuse-audit and multi-IP scoring HTTP service.
 - `assets/vpnbot_xray_sync_routes.py` - nginx route sync helper for standalone
   Xray-core managed inbounds.
 - `assets/vpnbot_xui_sync_routes.py` - nginx route sync helper for legacy

@@ -27,6 +27,21 @@ STATS_INTERVAL = max(5.0, min(float(os.environ.get("XRAY_ONLINE_STATS_INTERVAL_S
 ABUSE_AUDIT_WINDOW_SECONDS = max(60, min(int(os.environ.get("XRAY_ABUSE_AUDIT_WINDOW_SECONDS", "86400")), 7 * 86400))
 ABUSE_AUDIT_MAX_EVENTS = max(1000, min(int(os.environ.get("XRAY_ABUSE_AUDIT_MAX_EVENTS", "50000")), 500000))
 ABUSE_AUDIT_TOP_LIMIT = max(5, min(int(os.environ.get("XRAY_ABUSE_AUDIT_TOP_LIMIT", "20")), 100))
+ABUSE_MULTI_IP_OBSERVE_IPS = max(2, int(os.environ.get("XRAY_ABUSE_MULTI_IP_OBSERVE_IPS", "2")))
+ABUSE_MULTI_IP_SUSPICIOUS_IPS = max(
+    ABUSE_MULTI_IP_OBSERVE_IPS,
+    int(os.environ.get("XRAY_ABUSE_MULTI_IP_SUSPICIOUS_IPS", "4")),
+)
+ABUSE_MULTI_IP_HIGH_IPS = max(
+    ABUSE_MULTI_IP_SUSPICIOUS_IPS,
+    int(os.environ.get("XRAY_ABUSE_MULTI_IP_HIGH_IPS", "8")),
+)
+ABUSE_MULTI_IP_CRITICAL_IPS = max(
+    ABUSE_MULTI_IP_HIGH_IPS,
+    int(os.environ.get("XRAY_ABUSE_MULTI_IP_CRITICAL_IPS", "12")),
+)
+ABUSE_MULTI_IP_MIN_PREFIXES = max(1, int(os.environ.get("XRAY_ABUSE_MULTI_IP_MIN_PREFIXES", "3")))
+ABUSE_MULTI_IP_TOP_LIMIT = max(5, min(int(os.environ.get("XRAY_ABUSE_MULTI_IP_TOP_LIMIT", "30")), 100))
 
 LOCK = threading.RLock()
 CLIENTS: dict[str, dict] = {}
@@ -86,6 +101,20 @@ def normalize_ip(value: str) -> str | None:
         except Exception:
             continue
     return None
+
+
+def ip_prefix(value: str) -> str | None:
+    try:
+        ip = ipaddress.ip_address(str(value or "").strip())
+    except Exception:
+        return None
+
+    try:
+        if ip.version == 4:
+            return str(ipaddress.ip_network(f"{ip}/24", strict=False))
+        return str(ipaddress.ip_network(f"{ip}/56", strict=False))
+    except Exception:
+        return None
 
 
 def extract_source_ip(line: str) -> str | None:
@@ -357,6 +386,154 @@ def build_abuse_audit(
     }
 
 
+def _multi_ip_risk_level(ip_count: int, prefix_count: int) -> str:
+    if ip_count >= ABUSE_MULTI_IP_CRITICAL_IPS:
+        return "critical"
+    if ip_count >= ABUSE_MULTI_IP_HIGH_IPS:
+        return "high"
+    if ip_count >= ABUSE_MULTI_IP_SUSPICIOUS_IPS:
+        return "suspicious"
+    if ip_count >= ABUSE_MULTI_IP_OBSERVE_IPS:
+        return "observe"
+    return "normal"
+
+
+def _multi_ip_risk_score(ip_count: int, prefix_count: int, event_count: int) -> int:
+    score = ip_count * 10 + prefix_count * 8
+    if event_count >= 100:
+        score += 20
+    elif event_count >= 30:
+        score += 10
+    return int(score)
+
+
+def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
+    now = time.time()
+    window = max(10, min(int(window_seconds or WINDOW_SECONDS), 3600))
+    cutoff = now - window
+    purge_stale(now)
+
+    with LOCK:
+        client_items = [(email, dict(entry)) for email, entry in CLIENTS.items()]
+        abuse_events = [
+            dict(item)
+            for item in ABUSE_EVENTS
+            if float(item.get("ts") or 0.0) >= cutoff
+        ]
+
+    events_by_email: dict[str, dict] = {}
+    for item in abuse_events:
+        email = str(item.get("email") or "").strip()
+        if not email:
+            continue
+        entry = events_by_email.setdefault(
+            email,
+            {
+                "event_count": 0,
+                "targets": set(),
+                "ports": set(),
+                "last_seen": 0.0,
+            },
+        )
+        entry["event_count"] += 1
+        host = str(item.get("host") or "").strip()
+        port = int(item.get("port") or 0)
+        if host or port:
+            entry["targets"].add(f"{host}:{port}" if port else host)
+        if port:
+            entry["ports"].add(port)
+        entry["last_seen"] = max(float(entry.get("last_seen") or 0.0), float(item.get("ts") or 0.0))
+
+    users = []
+    counters = {"observe": 0, "suspicious": 0, "high": 0, "critical": 0}
+
+    for email, entry in client_items:
+        try:
+            last_seen = float(entry.get("last_seen") or 0.0)
+        except Exception:
+            continue
+        if last_seen < cutoff:
+            continue
+
+        ips_raw = entry.get("ips") if isinstance(entry.get("ips"), dict) else {}
+        recent_ips = [
+            ip
+            for ip, seen in sorted(ips_raw.items(), key=lambda item: float(item[1]), reverse=True)
+            if float(seen) >= cutoff
+        ][:MAX_IPS_PER_USER]
+        ip_count = len(recent_ips)
+        if ip_count < ABUSE_MULTI_IP_OBSERVE_IPS:
+            continue
+
+        prefixes = sorted({prefix for ip in recent_ips for prefix in [ip_prefix(ip)] if prefix})
+        prefix_count = len(prefixes)
+        event_info = events_by_email.get(email) or {}
+        event_count = int(event_info.get("event_count") or 0)
+        target_count = len(event_info.get("targets") or set())
+        port_count = len(event_info.get("ports") or set())
+        risk_level = _multi_ip_risk_level(ip_count, prefix_count)
+        if risk_level in counters:
+            counters[risk_level] += 1
+
+        reasons = [f"{ip_count} IP за {window} секунд"]
+        if prefix_count:
+            reasons.append(f"{prefix_count} разных подсетей")
+        if event_count >= 30:
+            reasons.append(f"{event_count} подключений/записей access.log")
+        if target_count >= 10:
+            reasons.append(f"{target_count} разных целей")
+        if risk_level in {"high", "critical"} and prefix_count < ABUSE_MULTI_IP_MIN_PREFIXES:
+            reasons.append("много IP, но мало разных подсетей: проверьте вручную")
+
+        users.append(
+            {
+                "email": email,
+                "risk_level": risk_level,
+                "evidence_strength": "strong" if prefix_count >= ABUSE_MULTI_IP_MIN_PREFIXES else "medium",
+                "risk_score": _multi_ip_risk_score(ip_count, prefix_count, event_count),
+                "ip_count": ip_count,
+                "prefix_count": prefix_count,
+                "prefixes": prefixes[:ABUSE_AUDIT_TOP_LIMIT],
+                "ips": recent_ips,
+                "event_count": event_count,
+                "target_count": target_count,
+                "port_count": port_count,
+                "last_seen_at": utc_iso(last_seen) if last_seen else "",
+                "last_seen_age_seconds": max(0, int(now - last_seen)) if last_seen else -1,
+                "reasons": reasons,
+            }
+        )
+
+    risk_order = {"critical": 4, "high": 3, "suspicious": 2, "observe": 1, "normal": 0}
+    users.sort(
+        key=lambda item: (
+            risk_order.get(str(item.get("risk_level") or ""), 0),
+            int(item.get("risk_score") or 0),
+            int(item.get("ip_count") or 0),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "ok": True,
+        "source": "vpnbot_xray_multi_ip_abuse",
+        "is_recent_activity": True,
+        "access_log": str(ACCESS_LOG),
+        "window_seconds": window,
+        "thresholds": {
+            "observe_ips": ABUSE_MULTI_IP_OBSERVE_IPS,
+            "suspicious_ips": ABUSE_MULTI_IP_SUSPICIOUS_IPS,
+            "high_ips": ABUSE_MULTI_IP_HIGH_IPS,
+            "critical_ips": ABUSE_MULTI_IP_CRITICAL_IPS,
+            "min_prefixes": ABUSE_MULTI_IP_MIN_PREFIXES,
+        },
+        "counts": counters,
+        "suspect_count": len(users),
+        "top_limit": ABUSE_MULTI_IP_TOP_LIMIT,
+        "users": users[:ABUSE_MULTI_IP_TOP_LIMIT],
+    }
+
+
 def extract_traffic_totals(payload: dict, *, prefix: str) -> dict:
     uplink = 0
     downlink = 0
@@ -507,6 +684,7 @@ def snapshot(window_seconds: int | None = None) -> dict:
         "max_last_seen_age_seconds": max_age,
         "abuse_audit": {
             "endpoint": "/abuse",
+            "multi_ip_endpoint": "/abuse/multi-ip",
             "window_seconds": ABUSE_AUDIT_WINDOW_SECONDS,
             "events_kept": abuse_events_kept,
         },
@@ -631,6 +809,16 @@ class Handler(BaseHTTPRequestHandler):
             email = query.get("email", [""])[0]
             target = query.get("target", [""])[0]
             self._send_json(200, build_abuse_audit(window, email, port, target))
+            return
+        if parsed.path == "/abuse/multi-ip":
+            query = parse_qs(parsed.query)
+            window = None
+            if "window" in query and query["window"]:
+                try:
+                    window = int(query["window"][0])
+                except Exception:
+                    window = None
+            self._send_json(200, build_multi_ip_abuse(window))
             return
         self._send_json(404, {"ok": False, "error": "not_found"})
 

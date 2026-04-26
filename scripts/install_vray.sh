@@ -127,6 +127,13 @@ XRAY_ABUSE_AUDIT_WINDOW_SECONDS="${XRAY_ABUSE_AUDIT_WINDOW_SECONDS:-86400}"
 XRAY_ABUSE_AUDIT_MAX_EVENTS="${XRAY_ABUSE_AUDIT_MAX_EVENTS:-50000}"
 XRAY_ABUSE_AUDIT_TOP_LIMIT="${XRAY_ABUSE_AUDIT_TOP_LIMIT:-20}"
 XRAY_ABUSE_AUDIT_URL="${XRAY_ABUSE_AUDIT_URL:-http://${XRAY_ONLINE_TRACKER_BIND}:${XRAY_ONLINE_TRACKER_PORT}/abuse}"
+XRAY_ABUSE_MULTI_IP_OBSERVE_IPS="${XRAY_ABUSE_MULTI_IP_OBSERVE_IPS:-2}"
+XRAY_ABUSE_MULTI_IP_SUSPICIOUS_IPS="${XRAY_ABUSE_MULTI_IP_SUSPICIOUS_IPS:-4}"
+XRAY_ABUSE_MULTI_IP_HIGH_IPS="${XRAY_ABUSE_MULTI_IP_HIGH_IPS:-8}"
+XRAY_ABUSE_MULTI_IP_CRITICAL_IPS="${XRAY_ABUSE_MULTI_IP_CRITICAL_IPS:-12}"
+XRAY_ABUSE_MULTI_IP_MIN_PREFIXES="${XRAY_ABUSE_MULTI_IP_MIN_PREFIXES:-3}"
+XRAY_ABUSE_MULTI_IP_TOP_LIMIT="${XRAY_ABUSE_MULTI_IP_TOP_LIMIT:-30}"
+XRAY_ABUSE_MULTI_IP_URL="${XRAY_ABUSE_MULTI_IP_URL:-http://${XRAY_ONLINE_TRACKER_BIND}:${XRAY_ONLINE_TRACKER_PORT}/abuse/multi-ip}"
 XRAY_SYNC_SCRIPT="${XRAY_SYNC_SCRIPT:-/usr/local/bin/vpnbot-xray-sync-routes}"
 XRAY_SYNC_SERVICE="${XRAY_SYNC_SERVICE:-/etc/systemd/system/vpnbot-xray-sync-routes.service}"
 XRAY_SYNC_PATH="${XRAY_SYNC_PATH:-/etc/systemd/system/vpnbot-xray-sync-routes.path}"
@@ -2029,6 +2036,12 @@ Environment=XRAY_ONLINE_XRAY_API_SERVER=${XRAY_CORE_API_SERVER}
 Environment=XRAY_ABUSE_AUDIT_WINDOW_SECONDS=${XRAY_ABUSE_AUDIT_WINDOW_SECONDS}
 Environment=XRAY_ABUSE_AUDIT_MAX_EVENTS=${XRAY_ABUSE_AUDIT_MAX_EVENTS}
 Environment=XRAY_ABUSE_AUDIT_TOP_LIMIT=${XRAY_ABUSE_AUDIT_TOP_LIMIT}
+Environment=XRAY_ABUSE_MULTI_IP_OBSERVE_IPS=${XRAY_ABUSE_MULTI_IP_OBSERVE_IPS}
+Environment=XRAY_ABUSE_MULTI_IP_SUSPICIOUS_IPS=${XRAY_ABUSE_MULTI_IP_SUSPICIOUS_IPS}
+Environment=XRAY_ABUSE_MULTI_IP_HIGH_IPS=${XRAY_ABUSE_MULTI_IP_HIGH_IPS}
+Environment=XRAY_ABUSE_MULTI_IP_CRITICAL_IPS=${XRAY_ABUSE_MULTI_IP_CRITICAL_IPS}
+Environment=XRAY_ABUSE_MULTI_IP_MIN_PREFIXES=${XRAY_ABUSE_MULTI_IP_MIN_PREFIXES}
+Environment=XRAY_ABUSE_MULTI_IP_TOP_LIMIT=${XRAY_ABUSE_MULTI_IP_TOP_LIMIT}
 ExecStart=${XRAY_ONLINE_TRACKER_SCRIPT}
 Restart=always
 RestartSec=2s
@@ -2654,6 +2667,12 @@ write_xray_core_installer_state() {
     XRAY_ONLINE_TRACKER_WINDOW_SECONDS_VALUE="${XRAY_ONLINE_TRACKER_WINDOW_SECONDS}" \
     XRAY_ABUSE_AUDIT_URL_VALUE="${XRAY_ABUSE_AUDIT_URL}" \
     XRAY_ABUSE_AUDIT_WINDOW_SECONDS_VALUE="${XRAY_ABUSE_AUDIT_WINDOW_SECONDS}" \
+    XRAY_ABUSE_MULTI_IP_URL_VALUE="${XRAY_ABUSE_MULTI_IP_URL}" \
+    XRAY_ABUSE_MULTI_IP_OBSERVE_IPS_VALUE="${XRAY_ABUSE_MULTI_IP_OBSERVE_IPS}" \
+    XRAY_ABUSE_MULTI_IP_SUSPICIOUS_IPS_VALUE="${XRAY_ABUSE_MULTI_IP_SUSPICIOUS_IPS}" \
+    XRAY_ABUSE_MULTI_IP_HIGH_IPS_VALUE="${XRAY_ABUSE_MULTI_IP_HIGH_IPS}" \
+    XRAY_ABUSE_MULTI_IP_CRITICAL_IPS_VALUE="${XRAY_ABUSE_MULTI_IP_CRITICAL_IPS}" \
+    XRAY_ABUSE_MULTI_IP_MIN_PREFIXES_VALUE="${XRAY_ABUSE_MULTI_IP_MIN_PREFIXES}" \
     XRAY_CORE_VERSION_VALUE="${XRAY_CORE_INSTALLED_VERSION}" \
     XRAY_CORE_PUBLIC_ENDPOINT_VALUE="${XRAY_CORE_PUBLIC_ENDPOINT}" \
     APP_DOMAIN_VALUE="${APP_DOMAIN}" \
@@ -2702,6 +2721,14 @@ payload = {
         "window_seconds": int(os.environ["XRAY_ONLINE_TRACKER_WINDOW_SECONDS_VALUE"]),
         "abuse_audit_api_url": os.environ["XRAY_ABUSE_AUDIT_URL_VALUE"],
         "abuse_audit_window_seconds": int(os.environ["XRAY_ABUSE_AUDIT_WINDOW_SECONDS_VALUE"]),
+        "multi_ip_abuse_api_url": os.environ["XRAY_ABUSE_MULTI_IP_URL_VALUE"],
+        "multi_ip_thresholds": {
+            "observe_ips": int(os.environ["XRAY_ABUSE_MULTI_IP_OBSERVE_IPS_VALUE"]),
+            "suspicious_ips": int(os.environ["XRAY_ABUSE_MULTI_IP_SUSPICIOUS_IPS_VALUE"]),
+            "high_ips": int(os.environ["XRAY_ABUSE_MULTI_IP_HIGH_IPS_VALUE"]),
+            "critical_ips": int(os.environ["XRAY_ABUSE_MULTI_IP_CRITICAL_IPS_VALUE"]),
+            "min_prefixes": int(os.environ["XRAY_ABUSE_MULTI_IP_MIN_PREFIXES_VALUE"]),
+        },
     },
     "xray_version": os.environ["XRAY_CORE_VERSION_VALUE"],
     "public_endpoint": os.environ["XRAY_CORE_PUBLIC_ENDPOINT_VALUE"],
@@ -2751,6 +2778,7 @@ write_xray_core_rollout_bundle() {
     XRAY_ONLINE_TRACKER_SERVICE_NAME_VALUE="${XRAY_ONLINE_TRACKER_SERVICE_NAME}" \
     XRAY_ONLINE_TRACKER_URL_VALUE="${XRAY_ONLINE_TRACKER_URL}" \
     XRAY_ABUSE_AUDIT_URL_VALUE="${XRAY_ABUSE_AUDIT_URL}" \
+    XRAY_ABUSE_MULTI_IP_URL_VALUE="${XRAY_ABUSE_MULTI_IP_URL}" \
     XRAY_CORE_VERSION_VALUE="${XRAY_CORE_INSTALLED_VERSION}" \
     XRAY_CORE_SMOKE_LINK_VALUE="${XRAY_CORE_SMOKE_LINK}" \
     XRAY_SYNC_SCRIPT_VALUE="${XRAY_SYNC_SCRIPT}" \
@@ -2778,6 +2806,7 @@ payload = {
         "online_tracker_service_name": str(os.environ.get("XRAY_ONLINE_TRACKER_SERVICE_NAME_VALUE", "")).strip(),
         "online_tracker_api_url": str(os.environ.get("XRAY_ONLINE_TRACKER_URL_VALUE", "")).strip(),
         "abuse_audit_api_url": str(os.environ.get("XRAY_ABUSE_AUDIT_URL_VALUE", "")).strip(),
+        "multi_ip_abuse_api_url": str(os.environ.get("XRAY_ABUSE_MULTI_IP_URL_VALUE", "")).strip(),
         "version": str(os.environ.get("XRAY_CORE_VERSION_VALUE", "")).strip(),
         "smoke_link": str(os.environ.get("XRAY_CORE_SMOKE_LINK_VALUE", "")).strip(),
         "sync_script": str(os.environ.get("XRAY_SYNC_SCRIPT_VALUE", "")).strip(),
@@ -3080,6 +3109,7 @@ show_xray_core_summary() {
     echo "  Online tracker service: ${XRAY_ONLINE_TRACKER_SERVICE_NAME}"
     echo "  Online tracker API: ${XRAY_ONLINE_TRACKER_URL}"
     echo "  Abuse audit API: ${XRAY_ABUSE_AUDIT_URL}"
+    echo "  Multi-IP abuse API: ${XRAY_ABUSE_MULTI_IP_URL}"
     echo "  Root: ${XRAY_CORE_ROOT}"
     echo "  Binary: ${XRAY_CORE_BIN}"
     echo "  Config dir: ${XRAY_CORE_CONFIG_DIR}"
@@ -3122,6 +3152,7 @@ show_xray_core_summary() {
     echo "  • keeps configs, assets and logs away from /usr/local/x-ui"
     echo "  • runs a local-only online tracker service from Xray access.log"
     echo "  • exposes a local-only abuse audit at /abuse for target-port triage"
+    echo "  • exposes local-only multi-IP scoring at /abuse/multi-ip"
     echo "  • requires the online tracker for VPnBot online stats; missing tracker is an error"
     echo "  • publishes shared ports through nginx stream/http route sync"
     echo "  • keeps xray-managed inbounds in a separate JSON file under confdir"
@@ -3130,6 +3161,7 @@ show_xray_core_summary() {
     echo "  VPnBot manages standalone Xray-core through SSH plus the local Xray API."
     echo "  VPnBot online stats require ${XRAY_ONLINE_TRACKER_SERVICE_NAME}; missing tracker means the node is installed incorrectly."
     echo "  Abuse checks can query: curl '${XRAY_ABUSE_AUDIT_URL}?port=49907'"
+    echo "  Multi-IP scoring can query: curl '${XRAY_ABUSE_MULTI_IP_URL}'"
     echo "  Do not configure it as a 3x-ui panel server in /root/vpnbotdata/config/servers.json."
     echo "  Use backend_type=xray-core and skip_subscription=true."
     echo ""
