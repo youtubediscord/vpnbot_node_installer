@@ -4805,6 +4805,35 @@ def spec_route_sni_values(spec: dict) -> set[str]:
     return set()
 
 
+def list_reality_sni_pool() -> list[str]:
+    return reality_server_names("")
+
+
+def build_reality_line_from_sni(sni: str, *, protocol: str = "vless", network: str = "tcp", no_flow: bool = False, mode: str = "direct-random") -> str:
+    normalized = normalize_sni(sni)
+    pool = set(list_reality_sni_pool())
+    if not normalized or normalized not in pool:
+        raise SystemExit(f"SNI {sni!r} не найден в общем REALITY SNI pool")
+    proto = str(protocol or "vless").lower()
+    net = str(network or "tcp").lower()
+    if proto not in {"vless", "trojan"}:
+        raise SystemExit("Для REALITY SNI pool доступны только vless и trojan")
+    if net not in {"tcp", "xhttp"}:
+        raise SystemExit("Для REALITY SNI pool доступны только tcp и xhttp")
+    if no_flow and not (proto == "vless" and net == "tcp"):
+        raise SystemExit("no-flow доступен только для VLESS TCP REALITY")
+    bits = [proto, net, "raw"]
+    if no_flow:
+        bits.append("no-flow")
+    bits.append(normalized)
+    if mode == "443":
+        return "443 " + " ".join(bits)
+    if mode == "8443":
+        return "8443 " + " ".join(bits)
+    suffix = "случайный shared-порт" if mode == "shared-random" else "случайный direct-порт"
+    return " ".join(bits + [suffix])
+
+
 def iter_existing_actual_ports(rows: list[dict]) -> set[int]:
     return {int(row.get("port") or 0) for row in rows if isinstance(row, dict) and int(row.get("port") or 0) > 0}
 
@@ -5787,6 +5816,39 @@ def apply_custom_specs(specs: list[dict]) -> int:
     return 0
 
 
+def print_reality_sni_pool() -> int:
+    for idx, name in enumerate(list_reality_sni_pool(), 1):
+        print(f"{idx}. {name}")
+    return 0
+
+
+def prompt_reality_line_from_sni() -> str:
+    pool = list_reality_sni_pool()
+    print("")
+    print("Полный REALITY SNI pool:")
+    for idx, name in enumerate(pool, 1):
+        print(f"  {idx}. {name}")
+    raw = input("Выбери номер SNI или введи домен из списка: ").strip()
+    if not raw:
+        return ""
+    if raw.isdigit():
+        idx = int(raw)
+        if idx < 1 or idx > len(pool):
+            raise SystemExit(f"SNI пункта {idx} нет")
+        sni = pool[idx - 1]
+    else:
+        sni = normalize_sni(raw)
+    protocol = input("Протокол [vless/trojan, default vless]: ").strip().lower() or "vless"
+    network = input("Транспорт [tcp/xhttp, default tcp]: ").strip().lower() or "tcp"
+    no_flow = False
+    if protocol == "vless" and network == "tcp":
+        no_flow = (input("VLESS TCP REALITY no-flow? [y/N]: ").strip().lower() in {"y", "yes", "1", "true", "да", "д"})
+    mode = input("Публикация [direct-random/shared-random/443/8443, default direct-random]: ").strip().lower() or "direct-random"
+    line = build_reality_line_from_sni(sni, protocol=protocol, network=network, no_flow=no_flow, mode=mode)
+    print(f"Будет создана строка: {line}")
+    return line
+
+
 def menu() -> int:
     opener, state = make_opener()
     login(opener, state)
@@ -5800,10 +5862,18 @@ def menu() -> int:
             options.append(item)
             print(f"  {len(options)}. {item['title']}")
     print("")
-    raw = input("Номера или диапазоны через пробел, Enter = ничего не создавать: ").strip()
+    print("  s. выбрать dest/SNI из полного REALITY SNI pool")
+    print("")
+    raw = input("Номера или диапазоны через пробел, s = полный SNI pool, Enter = ничего не создавать: ").strip()
     if not raw:
         print("Пропускаю создание inbound'ов.")
         return 0
+    if raw.lower() in {"s", "sni", "pool"}:
+        line = prompt_reality_line_from_sni()
+        if not line:
+            print("Пропускаю создание inbound'ов.")
+            return 0
+        return apply_custom_specs([parse_custom_spec_line(line)])
     tokens = raw.replace(",", " ").split()
     indexes = []
     for token in tokens:
@@ -5843,6 +5913,16 @@ def menu() -> int:
 def main(argv: list[str]) -> int:
     if len(argv) == 1:
         return menu()
+    if argv[1] == "--list-sni":
+        return print_reality_sni_pool()
+    if argv[1] == "--line-from-sni":
+        if len(argv) < 3:
+            raise SystemExit("Usage: vpnbot-xui-presets --line-from-sni <sni> [vless|trojan] [tcp|xhttp] [direct-random|shared-random|443|8443] [--no-flow]")
+        protocol = argv[3] if len(argv) > 3 and not argv[3].startswith("--") else "vless"
+        network = argv[4] if len(argv) > 4 and not argv[4].startswith("--") else "tcp"
+        mode = argv[5] if len(argv) > 5 and not argv[5].startswith("--") else "direct-random"
+        print(build_reality_line_from_sni(argv[2], protocol=protocol, network=network, no_flow="--no-flow" in argv[3:], mode=mode))
+        return 0
     if argv[1] == "--catalog-json":
         opener, state = make_opener()
         login(opener, state)
@@ -6164,6 +6244,35 @@ def spec_route_sni_values(spec: dict) -> set[str]:
         normalized = normalize_sni(str(spec.get("domain") or ""))
         return {normalized} if normalized else set()
     return set()
+
+
+def list_reality_sni_pool() -> list[str]:
+    return reality_server_names("")
+
+
+def build_reality_line_from_sni(sni: str, *, protocol: str = "vless", network: str = "tcp", no_flow: bool = False, mode: str = "direct-random") -> str:
+    normalized = normalize_sni(sni)
+    pool = set(list_reality_sni_pool())
+    if not normalized or normalized not in pool:
+        raise SystemExit(f"SNI {sni!r} не найден в общем REALITY SNI pool")
+    proto = str(protocol or "vless").lower()
+    net = str(network or "tcp").lower()
+    if proto not in {"vless", "trojan"}:
+        raise SystemExit("Для REALITY SNI pool доступны только vless и trojan")
+    if net not in {"tcp", "xhttp"}:
+        raise SystemExit("Для REALITY SNI pool доступны только tcp и xhttp")
+    if no_flow and not (proto == "vless" and net == "tcp"):
+        raise SystemExit("no-flow доступен только для VLESS TCP REALITY")
+    bits = [proto, net, "raw"]
+    if no_flow:
+        bits.append("no-flow")
+    bits.append(normalized)
+    if mode == "443":
+        return "443 " + " ".join(bits)
+    if mode == "8443":
+        return "8443 " + " ".join(bits)
+    suffix = "случайный shared-порт" if mode == "shared-random" else "случайный direct-порт"
+    return " ".join(bits + [suffix])
 
 
 def slugify(text: str) -> str:
@@ -6589,10 +6698,15 @@ def select_catalog_lines(groups: list[dict]) -> list[str]:
             options.append(item)
             print(f"  {len(options)}. {item['title']}")
     print("")
-    raw = input("Номера или диапазоны через пробел, Enter = ничего не создавать: ").strip()
+    print("  s. выбрать dest/SNI из полного REALITY SNI pool")
+    print("")
+    raw = input("Номера или диапазоны через пробел, s = полный SNI pool, Enter = ничего не создавать: ").strip()
     if not raw:
         print("Пропускаю создание inbound'ов.")
         return []
+    if raw.lower() in {"s", "sni", "pool"}:
+        line = prompt_reality_line_from_sni()
+        return [line] if line else []
 
     tokens = raw.replace(",", " ").split()
     indexes = []
@@ -6626,6 +6740,39 @@ def select_catalog_lines(groups: list[dict]) -> list[str]:
         if line and line not in selected:
             selected.append(line)
     return selected
+
+
+def print_reality_sni_pool() -> int:
+    for idx, name in enumerate(list_reality_sni_pool(), 1):
+        print(f"{idx}. {name}")
+    return 0
+
+
+def prompt_reality_line_from_sni() -> str:
+    pool = list_reality_sni_pool()
+    print("")
+    print("Полный REALITY SNI pool:")
+    for idx, name in enumerate(pool, 1):
+        print(f"  {idx}. {name}")
+    raw = input("Выбери номер SNI или введи домен из списка: ").strip()
+    if not raw:
+        return ""
+    if raw.isdigit():
+        idx = int(raw)
+        if idx < 1 or idx > len(pool):
+            raise SystemExit(f"SNI пункта {idx} нет")
+        sni = pool[idx - 1]
+    else:
+        sni = normalize_sni(raw)
+    protocol = input("Протокол [vless/trojan, default vless]: ").strip().lower() or "vless"
+    network = input("Транспорт [tcp/xhttp, default tcp]: ").strip().lower() or "tcp"
+    no_flow = False
+    if protocol == "vless" and network == "tcp":
+        no_flow = (input("VLESS TCP REALITY no-flow? [y/N]: ").strip().lower() in {"y", "yes", "1", "true", "да", "д"})
+    mode = input("Публикация [direct-random/shared-random/443/8443, default direct-random]: ").strip().lower() or "direct-random"
+    line = build_reality_line_from_sni(sni, protocol=protocol, network=network, no_flow=no_flow, mode=mode)
+    print(f"Будет создана строка: {line}")
+    return line
 
 
 def apply_lines_via_xui(lines: list[str]) -> int:
@@ -7104,6 +7251,16 @@ def list_titles(groups: list[dict]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) > 1 and argv[1] == "--list-sni":
+        return print_reality_sni_pool()
+    if len(argv) > 1 and argv[1] == "--line-from-sni":
+        if len(argv) < 3:
+            raise SystemExit("Usage: vpnbot-vless-presets --line-from-sni <sni> [vless|trojan] [tcp|xhttp] [direct-random|shared-random|443|8443] [--no-flow]")
+        protocol = argv[3] if len(argv) > 3 and not argv[3].startswith("--") else "vless"
+        network = argv[4] if len(argv) > 4 and not argv[4].startswith("--") else "tcp"
+        mode = argv[5] if len(argv) > 5 and not argv[5].startswith("--") else "direct-random"
+        print(build_reality_line_from_sni(argv[2], protocol=protocol, network=network, no_flow="--no-flow" in argv[3:], mode=mode))
+        return 0
     groups = fetch_catalog_groups()
     if len(argv) > 1 and argv[1] == "--list":
         return list_titles(groups)
