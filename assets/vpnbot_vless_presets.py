@@ -70,7 +70,7 @@ def load_reality_server_name_pool() -> list[str]:
 
 REALITY_SERVER_NAME_POOL = load_reality_server_name_pool()
 
-MARK_RE = re.compile(r"\\[(?P<value>direct|shared:\\d+|\\d+)\\]", re.IGNORECASE)
+MARK_RE = re.compile(r"\[(?P<value>direct|shared:\d+|\d+)\]", re.IGNORECASE)
 
 
 def has_no_flow_marker(text: str) -> bool:
@@ -262,7 +262,7 @@ def load_xray_inbounds() -> tuple[dict, list[dict]]:
 def save_xray_inbounds(rows: list[dict]) -> None:
     payload = {"inbounds": rows}
     XRAY_MANAGED_INBOUNDS_FILE.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\\n",
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -325,9 +325,9 @@ def sync_xray_reserved_ports(rows: list[dict]) -> None:
 
     XRAY_RESERVED_PORTS_SYSCTL_FILE.parent.mkdir(parents=True, exist_ok=True)
     XRAY_RESERVED_PORTS_SYSCTL_FILE.write_text(
-        "# VPnBot standalone Xray-core managed inbound ports.\\n"
-        "# These ports must not be reused as ephemeral source ports by nginx, MTProxy, or other local clients.\\n"
-        f"net.ipv4.ip_local_reserved_ports={format_reserved_ports(ports)}\\n",
+        "# VPnBot standalone Xray-core managed inbound ports.\n"
+        "# These ports must not be reused as ephemeral source ports by nginx, MTProxy, or other local clients.\n"
+        f"net.ipv4.ip_local_reserved_ports={format_reserved_ports(ports)}\n",
         encoding="utf-8",
     )
 

@@ -176,7 +176,7 @@ def slugify(text: str) -> str:
 
 
 def parse_publication_spec(text: str) -> dict:
-    m = re.search(r"\\[(?P<value>direct|shared:\\d+|\\d+)\\]", text or "", re.IGNORECASE)
+    m = re.search(r"\[(?P<value>direct|shared:\d+|\d+)\]", text or "", re.IGNORECASE)
     if not m:
         return {"mode": "direct", "port": None}
     raw = m.group("value").lower()
