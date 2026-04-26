@@ -156,6 +156,7 @@ def parse_custom_spec_line(line: str) -> dict:
         "domain": None,
         "any_port": False,
         "no_flow": False,
+        "publication": None,
     }
 
     if tokens and tokens[0].isdigit():
@@ -166,6 +167,20 @@ def parse_custom_spec_line(line: str) -> dict:
     joined = " ".join(lower_tokens)
     if "любой порт" in joined or "any port" in joined:
         spec["any_port"] = True
+    if (
+        "случайный shared-порт" in joined
+        or "случайный shared порт" in joined
+        or "shared-random" in joined
+        or "random-shared" in joined
+    ):
+        spec["publication"] = "shared-random"
+    elif (
+        "случайный direct-порт" in joined
+        or "случайный direct порт" in joined
+        or "direct-random" in joined
+        or "random-direct" in joined
+    ):
+        spec["publication"] = "direct-random"
     if "no flow" in joined or "no-flow" in joined or "noflow" in joined:
         spec["no_flow"] = True
 
@@ -789,6 +804,7 @@ def prepare_xray_specs(lines: list[str], rows: list[dict]) -> list[dict]:
         if preferred_port is not None:
             preferred_port = int(preferred_port)
             wants_shared = (
+                preferred_port in {443, 8443} or
                 preferred_counts.get(preferred_port, 0) > 1
                 or preferred_port in occupied_shared_ports
             )
@@ -820,6 +836,10 @@ def prepare_xray_specs(lines: list[str], rows: list[dict]) -> list[dict]:
                 elif preferred_counts.get(preferred_port, 0) > 1:
                     spec["resolution_notes"].append(
                         f"порт {preferred_port} выбран несколькими inbound'ами, поэтому они будут опубликованы как shared на одном внешнем порту"
+                    )
+                elif preferred_port in {443, 8443}:
+                    spec["resolution_notes"].append(
+                        f"публичный порт {preferred_port} публикуется через nginx shared stream"
                     )
 
                 spec["external_port"] = shared_port
