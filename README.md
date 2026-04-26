@@ -33,8 +33,16 @@ gets hard to read once Python helpers and service scripts are embedded as large
 heredocs.
 
 This repository keeps the public bootstrap flow simple while allowing helper
-files such as `assets/vpnbot_xrayctl.py` to stay readable and testable as normal
-files.
+files to stay readable and testable as normal files:
+
+- `assets/vpnbot_xrayctl.py` - local Xray-core control helper used by the bot
+  over SSH.
+- `assets/vpnbot_xui_presets.py` - preset/catalog helper for legacy 3x-ui
+  nodes.
+- `assets/vpnbot_vless_presets.py` - shared VLESS/Trojan/VMess preset helper
+  that delegates to 3x-ui or manages standalone Xray-core directly.
+- `assets/reality_sni_pool.json` - shared REALITY SNI pool used by both preset
+  helpers.
 
 ## Latest Policy
 
