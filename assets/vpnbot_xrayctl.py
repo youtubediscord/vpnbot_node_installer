@@ -187,6 +187,9 @@ def _client_email(user_id: int, inbound: dict[str, Any]) -> str:
 
 
 def _client_flow(inbound: dict[str, Any]) -> str:
+    marker_text = f"{inbound.get('remark') or ''} {inbound.get('tag') or ''}".lower()
+    if "no flow" in marker_text or "noflow" in marker_text or "no-flow" in marker_text:
+        return ""
     stream = inbound.get("streamSettings") or {}
     if not isinstance(stream, dict):
         stream = {}

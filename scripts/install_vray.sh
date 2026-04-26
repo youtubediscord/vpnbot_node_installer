@@ -4776,6 +4776,11 @@ def parse_publication_spec(text: str) -> dict:
     return {"mode": "shared", "port": int(raw)}
 
 
+def has_no_flow_marker(text: str) -> bool:
+    value = str(text or "").lower()
+    return "no flow" in value or "no-flow" in value or "noflow" in value
+
+
 def iter_existing_actual_ports(rows: list[dict]) -> set[int]:
     return {int(row.get("port") or 0) for row in rows if isinstance(row, dict) and int(row.get("port") or 0) > 0}
 
@@ -4912,6 +4917,7 @@ def parse_custom_spec_line(line: str) -> dict:
         "preferred_port": None,
         "domain": None,
         "any_port": False,
+        "no_flow": False,
     }
 
     if tokens and tokens[0].isdigit():
@@ -4928,6 +4934,8 @@ def parse_custom_spec_line(line: str) -> dict:
     if "случайный shared-порт" in joined or "random shared" in joined:
         spec["any_port"] = True
         spec["publication"] = "shared-random"
+    if "no flow" in joined or "no-flow" in joined or "noflow" in joined:
+        spec["no_flow"] = True
 
     for token in tokens:
         low = token.lower()
@@ -4939,6 +4947,8 @@ def parse_custom_spec_line(line: str) -> dict:
             spec["security"] = "reality"
         elif low in {"tls", "none"}:
             spec["security"] = low
+        elif low in {"no-flow", "noflow", "no_flow"}:
+            spec["no_flow"] = True
         elif token.isdigit() and spec["preferred_port"] is None:
             spec["preferred_port"] = int(token)
         elif "." in token and not token.startswith("["):
@@ -5089,6 +5099,7 @@ def build_payload_from_custom_spec(opener, state: dict, spec: dict) -> tuple[dic
         security=security,
         sni=domain if security in {"reality", "tls"} else "",
         port=listen_port if spec["mode"] == "direct" else None,
+        no_flow=bool(spec.get("no_flow")) if protocol == "vless" and network == "tcp" and security == "reality" else None,
     )
     if existing:
         return None, f"reuse existing {protocol} {network} {security} for {domain or listen_port} (inbound #{existing.get('id')})"
@@ -5099,6 +5110,8 @@ def build_payload_from_custom_spec(opener, state: dict, spec: dict) -> tuple[dic
     else:
         remark_bits.append("[direct]")
     remark_bits.extend([protocol, network, security])
+    if spec.get("no_flow"):
+        remark_bits.append("no-flow")
     if domain:
         remark_bits.append(domain)
     remark = " ".join(remark_bits)
@@ -5206,11 +5219,24 @@ def collect_custom_specs_from_input() -> list[dict]:
     return [parse_custom_spec_line(line) for line in lines]
 
 
-def match_existing(rows: list[dict], *, protocol: str, network: str, security: str, sni: str = "", port: int | None = None) -> dict | None:
+def match_existing(
+    rows: list[dict],
+    *,
+    protocol: str,
+    network: str,
+    security: str,
+    sni: str = "",
+    port: int | None = None,
+    no_flow: bool | None = None,
+) -> dict | None:
     wanted_sni = normalize_sni(sni)
     for row in rows:
         if not isinstance(row, dict):
             continue
+        if no_flow is not None:
+            marker_text = f"{row.get('remark') or ''} {row.get('tag') or ''}"
+            if has_no_flow_marker(marker_text) != bool(no_flow):
+                continue
         if str(row.get("protocol") or "").lower() != protocol:
             continue
         row_port = int(row.get("port") or 0)
@@ -5446,6 +5472,7 @@ def build_catalog_groups(state: dict) -> list[dict]:
     for domain in CATALOG_REALITY_TCP_DOMAINS:
         slug = slugify(domain)
         reality_tcp_items.append((f"catalog_vless_tcp_{slug}", f"443 vless tcp raw {domain}", f"443 vless tcp raw {domain}"))
+        reality_tcp_items.append((f"catalog_vless_tcp_noflow_{slug}", f"443 vless tcp raw no-flow {domain}", f"443 vless tcp raw no-flow {domain}"))
         reality_tcp_items.append((f"catalog_trojan_tcp_{slug}", f"443 trojan tcp raw {domain}", f"443 trojan tcp raw {domain}"))
 
     reality_xhttp_items = []
@@ -5661,6 +5688,11 @@ XRAY_PROTOCOL_LABELS = [
 MARK_RE = re.compile(r"\\[(?P<value>direct|shared:\\d+|\\d+)\\]", re.IGNORECASE)
 
 
+def has_no_flow_marker(text: str) -> bool:
+    value = str(text or "").lower()
+    return "no flow" in value or "no-flow" in value or "noflow" in value
+
+
 def slugify(text: str) -> str:
     value = re.sub(r"[^a-zA-Z0-9]+", "-", str(text or "").strip().lower()).strip("-")
     return value or "route"
@@ -5685,6 +5717,7 @@ def parse_custom_spec_line(line: str) -> dict:
         "preferred_port": None,
         "domain": None,
         "any_port": False,
+        "no_flow": False,
     }
 
     if tokens and tokens[0].isdigit():
@@ -5695,6 +5728,8 @@ def parse_custom_spec_line(line: str) -> dict:
     joined = " ".join(lower_tokens)
     if "любой порт" in joined or "any port" in joined:
         spec["any_port"] = True
+    if "no flow" in joined or "no-flow" in joined or "noflow" in joined:
+        spec["no_flow"] = True
 
     for token in tokens:
         low = token.lower()
@@ -5706,6 +5741,8 @@ def parse_custom_spec_line(line: str) -> dict:
             spec["security"] = "reality"
         elif low in {"tls", "none"}:
             spec["security"] = low
+        elif low in {"no-flow", "noflow", "no_flow"}:
+            spec["no_flow"] = True
         elif token.isdigit() and spec["preferred_port"] is None:
             spec["preferred_port"] = int(token)
         elif "." in token and not token.startswith("["):
@@ -5978,6 +6015,13 @@ def build_xray_catalog_groups() -> list[dict]:
             )
             reality_tcp_items.append(
                 {
+                    "id": f"xray_vless_tcp_reality_noflow_{slug}_{port_label}",
+                    "title": f"{title_prefix} VLESS TCP REALITY no-flow {domain}",
+                    "line": f"{line_prefix + ' ' if line_prefix else ''}vless tcp raw no-flow {domain}{mode_suffix}",
+                }
+            )
+            reality_tcp_items.append(
+                {
                     "id": f"xray_trojan_tcp_reality_{slug}_{port_label}",
                     "title": f"{title_prefix} TROJAN TCP REALITY {domain}",
                     "line": f"{line_prefix + ' ' if line_prefix else ''}trojan tcp raw {domain}{mode_suffix}",
@@ -6154,11 +6198,24 @@ def get_xray_x25519() -> tuple[str, str]:
     return private_key, public_key
 
 
-def match_existing_xray(rows: list[dict], *, protocol: str, network: str, security: str, sni: str, port: int | None = None) -> dict | None:
+def match_existing_xray(
+    rows: list[dict],
+    *,
+    protocol: str,
+    network: str,
+    security: str,
+    sni: str,
+    port: int | None = None,
+    no_flow: bool | None = None,
+) -> dict | None:
     wanted_sni = normalize_sni(sni)
     for row in rows:
         if not isinstance(row, dict):
             continue
+        if no_flow is not None:
+            marker_text = f"{row.get('remark') or ''} {row.get('tag') or ''}"
+            if has_no_flow_marker(marker_text) != bool(no_flow):
+                continue
         if str(row.get("protocol") or "").lower() != protocol:
             continue
         row_port = int(row.get("port") or 0)
@@ -6342,6 +6399,7 @@ def build_xray_payload(spec: dict, rows: list[dict]) -> tuple[dict | None, str]:
         security=security,
         sni=domain,
         port=listen_port if spec.get("mode") == "direct" else None,
+        no_flow=bool(spec.get("no_flow")) if protocol == "vless" and network == "tcp" and security == "reality" else None,
     )
     if existing:
         return None, (
@@ -6374,6 +6432,8 @@ def build_xray_payload(spec: dict, rows: list[dict]) -> tuple[dict | None, str]:
         if spec.get("mode") == "shared" and spec.get("external_port")
         else "[direct]"
     )
+    if spec.get("no_flow"):
+        publication_marker = f"{publication_marker} no-flow"
     tag = f"{publication_marker} {tag}"
 
     stream_settings = {
