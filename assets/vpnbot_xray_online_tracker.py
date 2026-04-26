@@ -78,6 +78,7 @@ CLIENTS: dict[str, dict] = {}
 ABUSE_EVENTS: list[dict] = []
 MULTI_IP_HISTORY: dict[str, dict] = {"users": {}}
 USER_TRAFFIC: dict[str, dict] = {}
+USER_TRAFFIC_HISTORY: dict[str, list[dict]] = {}
 HISTORY_DIRTY = False
 LAST_HISTORY_SAVE_AT = 0.0
 LAST_LINE_AT = 0.0
@@ -642,6 +643,93 @@ def _event_stats_by_window(events: list[dict], now: float, windows: list[int]) -
     return out
 
 
+def _traffic_window_stats(email: str, now: float, windows: list[int]) -> dict[str, dict]:
+    with LOCK:
+        samples = [
+            dict(item)
+            for item in USER_TRAFFIC_HISTORY.get(email, [])
+            if isinstance(item, dict)
+        ]
+
+    samples.sort(key=lambda item: float(item.get("ts") or 0.0))
+    out: dict[str, dict] = {}
+    latest = samples[-1] if samples else None
+
+    for window in windows:
+        window = int(window)
+        cutoff = now - window
+        baseline = None
+        for sample in samples:
+            ts = float(sample.get("ts") or 0.0)
+            if ts <= cutoff:
+                baseline = sample
+            else:
+                break
+
+        if baseline is None:
+            for sample in samples:
+                if float(sample.get("ts") or 0.0) >= cutoff:
+                    baseline = sample
+                    break
+
+        delta_total = 0
+        delta_up = 0
+        delta_down = 0
+        rate_bps = None
+        covered_seconds = 0
+        complete = False
+        if latest is not None and baseline is not None and latest is not baseline:
+            latest_total = int(latest.get("traffic_total_bytes") or 0)
+            baseline_total = int(baseline.get("traffic_total_bytes") or 0)
+            latest_up = int(latest.get("traffic_up_bytes") or 0)
+            baseline_up = int(baseline.get("traffic_up_bytes") or 0)
+            latest_down = int(latest.get("traffic_down_bytes") or 0)
+            baseline_down = int(baseline.get("traffic_down_bytes") or 0)
+            if latest_total >= baseline_total:
+                delta_total = latest_total - baseline_total
+                delta_up = max(0, latest_up - baseline_up)
+                delta_down = max(0, latest_down - baseline_down)
+                covered_seconds = max(0, int(float(latest.get("ts") or 0.0) - float(baseline.get("ts") or 0.0)))
+                if covered_seconds > 0:
+                    rate_bps = int((delta_total * 8) / covered_seconds)
+                complete = (
+                    abs(float(baseline.get("ts") or 0.0) - cutoff) <= 5.0
+                    and covered_seconds <= window + 5
+                )
+
+        out[str(window)] = {
+            "window_seconds": window,
+            "traffic_up_bytes": int(delta_up),
+            "traffic_down_bytes": int(delta_down),
+            "traffic_total_bytes": int(delta_total),
+            "average_bps": rate_bps,
+            "covered_seconds": int(covered_seconds),
+            "complete": bool(complete),
+        }
+
+    return out
+
+
+def _traffic_load_level(load_bps: int | None, window_total_bytes: int) -> str:
+    load = int(load_bps or 0)
+    window_total = int(window_total_bytes or 0)
+    if load >= 100_000_000 or window_total >= 2 * 1024 * 1024 * 1024:
+        return "heavy"
+    if load >= 50_000_000 or window_total >= 1024 * 1024 * 1024:
+        return "high"
+    if load >= 10_000_000 or window_total >= 256 * 1024 * 1024:
+        return "noticeable"
+    if load >= 1_000_000 or window_total >= 32 * 1024 * 1024:
+        return "normal"
+    return "low"
+
+
+def _traffic_priority(load_bps: int | None, window_total_bytes: int) -> int:
+    load = int(load_bps or 0)
+    window_total = int(window_total_bytes or 0)
+    return int(load // 1000 + window_total // (1024 * 1024))
+
+
 def _burst_score(
     *,
     ip_count: int,
@@ -716,6 +804,16 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
         event_windows = _event_stats_by_window(email_events, now, windows)
         event_info = event_windows.get(main_window) or {}
         traffic = traffic_by_email.get(email) if isinstance(traffic_by_email.get(email), dict) else {}
+        traffic_windows = _traffic_window_stats(email, now, windows)
+        traffic_window = traffic_windows.get(main_window) or {}
+        load_bps = (
+            int(traffic.get("load_bps"))
+            if traffic.get("load_bps") is not None
+            else None
+        )
+        window_traffic_total = int(traffic_window.get("traffic_total_bytes") or 0)
+        traffic_level = _traffic_load_level(load_bps, window_traffic_total)
+        traffic_priority = _traffic_priority(load_bps, window_traffic_total)
         event_count = int(event_info.get("event_count") or 0)
         target_count = int(event_info.get("target_count") or 0)
         port_count = int(event_info.get("port_count") or 0)
@@ -796,11 +894,11 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
                     "traffic_up_bytes": int(traffic.get("traffic_up_bytes") or 0),
                     "traffic_down_bytes": int(traffic.get("traffic_down_bytes") or 0),
                     "traffic_total_bytes": int(traffic.get("traffic_total_bytes") or 0),
-                    "load_bps": (
-                        int(traffic.get("load_bps"))
-                        if traffic.get("load_bps") is not None
-                        else None
-                    ),
+                    "load_bps": load_bps,
+                    "load_level": traffic_level,
+                    "traffic_priority": traffic_priority,
+                    "window_traffic": traffic_window,
+                    "window_traffic_counts": traffic_windows,
                     "stats_checked_at": str(traffic.get("stats_checked_at") or ""),
                 },
                 "last_seen_at": utc_iso(last_seen) if last_seen else "",
@@ -812,6 +910,9 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
     risk_order = {"critical": 4, "high": 3, "suspicious": 2, "observe": 1, "normal": 0}
     users.sort(
         key=lambda item: (
+            int(((item.get("traffic") or {}).get("traffic_priority") or 0)),
+            int(((item.get("traffic") or {}).get("load_bps") or 0)),
+            int((((item.get("traffic") or {}).get("window_traffic") or {}).get("traffic_total_bytes") or 0)),
             risk_order.get(str(item.get("risk_level") or ""), 0),
             int(item.get("burst_score") or 0),
             int(item.get("risk_score") or 0),
@@ -923,6 +1024,8 @@ def extract_user_traffic(payload: dict) -> dict[str, dict]:
 
 def update_user_traffic(user_totals: dict[str, dict], now: float) -> None:
     with LOCK:
+        max_history_age = max([*ABUSE_MULTI_IP_WINDOWS, WINDOW_SECONDS]) + max(STATS_INTERVAL * 3, 180.0)
+        history_cutoff = now - max_history_age
         for email, totals in user_totals.items():
             new_total = int(totals.get("traffic_total_bytes") or 0)
             new_up = int(totals.get("traffic_up_bytes") or 0)
@@ -945,6 +1048,20 @@ def update_user_traffic(user_totals: dict[str, dict], now: float) -> None:
                 "stats_checked_at": utc_iso(now),
                 "_checked_at_ts": now,
             }
+            history = USER_TRAFFIC_HISTORY.setdefault(email, [])
+            history.append(
+                {
+                    "ts": float(now),
+                    "traffic_up_bytes": new_up,
+                    "traffic_down_bytes": new_down,
+                    "traffic_total_bytes": new_total,
+                }
+            )
+            history[:] = [
+                item
+                for item in history
+                if isinstance(item, dict) and float(item.get("ts") or 0.0) >= history_cutoff
+            ][-200:]
 
 
 def query_xray_stats(pattern: str) -> dict:
