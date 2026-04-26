@@ -3052,6 +3052,8 @@ issue_or_create_cert() {
 
 write_nginx_http_site() {
     local panel_location_block=""
+    local http2_listen_suffix=" http2"
+    local http2_directive=""
     if is_3xui_backend; then
         panel_location_block="$(cat <<EOF
     location ${NGINX_PANEL_LOCATION} {
@@ -3066,6 +3068,25 @@ EOF
 )"
     fi
 
+    local nginx_version
+    nginx_version="$(nginx -v 2>&1 | sed -n 's|.*nginx/\([0-9.]*\).*|\1|p')"
+    if python3 - "${nginx_version}" <<'PY' >/dev/null 2>&1
+import sys
+parts = []
+for chunk in (sys.argv[1] if len(sys.argv) > 1 else "").split("."):
+    try:
+        parts.append(int(chunk))
+    except Exception:
+        parts.append(0)
+while len(parts) < 3:
+    parts.append(0)
+raise SystemExit(0 if tuple(parts[:3]) >= (1, 25, 1) else 1)
+PY
+    then
+        http2_listen_suffix=""
+        http2_directive="    http2 on;"
+    fi
+
     cat > "${NGINX_HTTP_SITE_FILE}" <<EOF
 server {
     listen 80;
@@ -3074,7 +3095,8 @@ server {
 }
 
 server {
-    listen 127.0.0.1:${HTTP_FRONTEND_LOCAL_PORT} ssl http2;
+    listen 127.0.0.1:${HTTP_FRONTEND_LOCAL_PORT} ssl${http2_listen_suffix};
+${http2_directive}
     server_name ${NGINX_SERVER_NAME};
 
     ssl_certificate ${NGINX_SSL_CERT};
@@ -3596,6 +3618,7 @@ def load_extra_routes() -> list[dict]:
         if not parse_bool(item.get("enabled"), default=True):
             continue
         domain = str(item.get("domain") or "").strip().lower()
+        default_route = parse_bool(item.get("default"), default=False) or domain in {"default", "__default__", "*", "_"}
         backend_host = str(item.get("backend_host") or "127.0.0.1").strip() or "127.0.0.1"
         source = str(item.get("source") or item.get("service_type") or "external").strip() or "external"
         try:
@@ -3603,12 +3626,13 @@ def load_extra_routes() -> list[dict]:
             backend_port = int(item.get("backend_port") or 0)
         except Exception:
             continue
-        if not domain or shared_port <= 0 or backend_port <= 0:
+        if (not domain and not default_route) or shared_port <= 0 or backend_port <= 0:
             continue
         routes.append(
             {
                 "route_id": route_id,
-                "domain": domain,
+                "domain": "" if default_route else domain,
+                "default": default_route,
                 "shared_port": shared_port,
                 "backend_host": backend_host,
                 "backend_port": backend_port,
@@ -3633,6 +3657,21 @@ def register_stream_target(
             f"{existing} already registered, new target {backend_target} from {source}"
         )
     shared_map[domain] = backend_target
+
+
+def register_default_stream_target(
+    shared_port: int,
+    backend_target: str,
+    default_by_port: dict[int, str],
+    source: str,
+) -> None:
+    existing = default_by_port.get(shared_port)
+    if existing and existing != backend_target:
+        raise SystemExit(
+            f"Shared stream default-route conflict on port {shared_port}: "
+            f"{existing} already registered, new target {backend_target} from {source}"
+        )
+    default_by_port[shared_port] = backend_target
 
 
 def write_http_route(name: str, path: str, port: int, grpc: bool) -> None:
@@ -3661,15 +3700,21 @@ def write_http_route(name: str, path: str, port: int, grpc: bool) -> None:
     target.write_text(body, encoding="utf-8")
 
 
-def build_stream_configs(shared_ports: list[int], shared_domains: set[str], passthrough_by_port: dict[int, dict[str, str]]) -> str:
+def build_stream_configs(
+    shared_ports: list[int],
+    shared_domains: set[str],
+    passthrough_by_port: dict[int, dict[str, str]],
+    default_by_port: dict[int, str],
+) -> str:
     blocks = []
     for shared_port in shared_ports:
         var_name = f"{DOLLAR}vpnbot_backend_{shared_port}"
         explicit_routes = passthrough_by_port.get(shared_port) or {}
+        default_target = default_by_port.get(shared_port, HTTP_FRONTEND)
         lines = [
             f"map {DOLLAR}ssl_preread_server_name {var_name} {{",
             "    hostnames;",
-            f"    default {HTTP_FRONTEND};",
+            f"    default {default_target};",
         ]
         for domain in sorted(shared_domains):
             if domain in explicit_routes:
@@ -3794,6 +3839,7 @@ def main() -> int:
             "  - xray-core sync reads managed inbounds from JSON instead of x-ui DB\\n"
             "  - if no shared marker is present, sync treats inbound as direct\\n"
             "  - for reality/tls on any shared port, inbound must have serverNames / serverName set\\n"
+            "    unless it intentionally acts as the default no-SNI backend for that shared port\\n"
             "  - xhttp/httpupgrade/splithttp are treated as HTTP-like routes when possible\\n"
             "  - route sync is automatic via systemd path + timer\\n"
             f"  - sync report: {REPORT_FILE}\\n"
@@ -3814,6 +3860,7 @@ def main() -> int:
 
     shared_ports = set()
     passthrough_by_port = {}
+    default_by_port = {}
     report_lines = [
         "VPnBot xray-core sync report",
         "============================",
@@ -3880,6 +3927,21 @@ def main() -> int:
             )
             continue
 
+        if security in {"tls", "reality"}:
+            backend_target = f"127.0.0.1:{port}"
+            register_default_stream_target(
+                shared_port,
+                backend_target,
+                default_by_port,
+                f"xray inbound #{row_id}",
+            )
+            report_lines.append(
+                f"id={row_id} shared-stream-default external_port={shared_port} network={network or '<none>'} "
+                f"security={security or '<none>'} backend_port={port} protocol={protocol} "
+                f"reason=no_sni_domains marker_source={publication_source!r} tag={tag!r} remark={remark!r}"
+            )
+            continue
+
         if network == "ws":
             ws = stream.get("wsSettings") or {}
             path = str(ws.get("path") or "").strip() or f"/ws-{port}"
@@ -3929,21 +3991,33 @@ def main() -> int:
         shared_port = int(route["shared_port"])
         backend_target = f'{route["backend_host"]}:{route["backend_port"]}'
         shared_ports.add(shared_port)
-        register_stream_target(
-            shared_port,
-            route["domain"],
-            backend_target,
-            passthrough_by_port,
-            f'external route {route["route_id"]}',
-        )
-        report_lines.append(
-            f'external route_id={route["route_id"]} external_port={shared_port} '
-            f'domain={route["domain"]} backend_target={backend_target} source={route["source"]!r}'
-        )
+        if route.get("default"):
+            register_default_stream_target(
+                shared_port,
+                backend_target,
+                default_by_port,
+                f'external route {route["route_id"]}',
+            )
+            report_lines.append(
+                f'external route_id={route["route_id"]} external_port={shared_port} '
+                f'domain=<default> backend_target={backend_target} source={route["source"]!r}'
+            )
+        else:
+            register_stream_target(
+                shared_port,
+                route["domain"],
+                backend_target,
+                passthrough_by_port,
+                f'external route {route["route_id"]}',
+            )
+            report_lines.append(
+                f'external route_id={route["route_id"]} external_port={shared_port} '
+                f'domain={route["domain"]} backend_target={backend_target} source={route["source"]!r}'
+            )
 
     sync_xray_reserved_ports(rows, report_lines)
 
-    STREAM_MAP.write_text(build_stream_configs(sorted(shared_ports), shared_domains, passthrough_by_port), encoding="utf-8")
+    STREAM_MAP.write_text(build_stream_configs(sorted(shared_ports), shared_domains, passthrough_by_port, default_by_port), encoding="utf-8")
     STREAM_SERVER.write_text("# generated by vpnbot-xray-sync-routes\\n", encoding="utf-8")
     write_report(report_lines)
 
@@ -4161,6 +4235,7 @@ def load_extra_routes() -> list[dict]:
         if not parse_bool(item.get("enabled"), default=True):
             continue
         domain = str(item.get("domain") or "").strip().lower()
+        default_route = parse_bool(item.get("default"), default=False) or domain in {"default", "__default__", "*", "_"}
         backend_host = str(item.get("backend_host") or "127.0.0.1").strip() or "127.0.0.1"
         source = str(item.get("source") or item.get("service_type") or "external").strip() or "external"
         try:
@@ -4168,12 +4243,13 @@ def load_extra_routes() -> list[dict]:
             backend_port = int(item.get("backend_port") or 0)
         except Exception:
             continue
-        if not domain or shared_port <= 0 or backend_port <= 0:
+        if (not domain and not default_route) or shared_port <= 0 or backend_port <= 0:
             continue
         routes.append(
             {
                 "route_id": route_id,
-                "domain": domain,
+                "domain": "" if default_route else domain,
+                "default": default_route,
                 "shared_port": shared_port,
                 "backend_host": backend_host,
                 "backend_port": backend_port,
@@ -4198,6 +4274,21 @@ def register_stream_target(
             f"{existing} already registered, new target {backend_target} from {source}"
         )
     shared_map[domain] = backend_target
+
+
+def register_default_stream_target(
+    shared_port: int,
+    backend_target: str,
+    default_by_port: dict[int, str],
+    source: str,
+) -> None:
+    existing = default_by_port.get(shared_port)
+    if existing and existing != backend_target:
+        raise SystemExit(
+            f"Shared stream default-route conflict on port {shared_port}: "
+            f"{existing} already registered, new target {backend_target} from {source}"
+        )
+    default_by_port[shared_port] = backend_target
 
 
 def write_http_route(name: str, path: str, port: int, grpc: bool) -> None:
@@ -4226,15 +4317,21 @@ def write_http_route(name: str, path: str, port: int, grpc: bool) -> None:
     target.write_text(body, encoding="utf-8")
 
 
-def build_stream_configs(shared_ports: list[int], shared_domains: set[str], passthrough_by_port: dict[int, dict[str, str]]) -> str:
+def build_stream_configs(
+    shared_ports: list[int],
+    shared_domains: set[str],
+    passthrough_by_port: dict[int, dict[str, str]],
+    default_by_port: dict[int, str],
+) -> str:
     blocks = []
     for shared_port in shared_ports:
         var_name = f"{DOLLAR}vpnbot_backend_{shared_port}"
         explicit_routes = passthrough_by_port.get(shared_port) or {}
+        default_target = default_by_port.get(shared_port, HTTP_FRONTEND)
         lines = [
             f"map {DOLLAR}ssl_preread_server_name {var_name} {{",
             "    hostnames;",
-            f"    default {HTTP_FRONTEND};",
+            f"    default {default_target};",
         ]
         for domain in sorted(shared_domains):
             if domain in explicit_routes:
@@ -4273,6 +4370,7 @@ def main() -> int:
             "Notes:\\n"
             "  - if no shared marker is present, sync treats inbound as direct\\n"
             "  - for reality/tls on any shared port, inbound must have serverNames / serverName set\\n"
+            "    unless it intentionally acts as the default no-SNI backend for that shared port\\n"
             "  - xhttp/httpupgrade/splithttp are treated as HTTP-like routes when possible\\n"
             "  - route sync is automatic via systemd path + timer\\n"
             "  - manual sync is still available: vpnbot-xui-sync-routes\\n"
@@ -4294,6 +4392,7 @@ def main() -> int:
 
     shared_ports = set()
     passthrough_by_port = {}
+    default_by_port = {}
     report_lines = [
         "VPnBot x-ui sync report",
         "=======================",
@@ -4358,6 +4457,21 @@ def main() -> int:
             )
             continue
 
+        if security in {"tls", "reality"}:
+            backend_target = f"127.0.0.1:{port}"
+            register_default_stream_target(
+                shared_port,
+                backend_target,
+                default_by_port,
+                f"x-ui inbound #{row_id}",
+            )
+            report_lines.append(
+                f"id={row_id} shared-stream-default external_port={shared_port} network={network or '<none>'} "
+                f"security={security or '<none>'} backend_port={port} protocol={protocol} "
+                f"reason=no_sni_domains remark={remark!r}"
+            )
+            continue
+
         if network == "ws":
             ws = stream.get("wsSettings") or {}
             path = str(ws.get("path") or "").strip() or f"/ws-{port}"
@@ -4394,19 +4508,31 @@ def main() -> int:
         shared_port = int(route["shared_port"])
         backend_target = f'{route["backend_host"]}:{route["backend_port"]}'
         shared_ports.add(shared_port)
-        register_stream_target(
-            shared_port,
-            route["domain"],
-            backend_target,
-            passthrough_by_port,
-            f'external route {route["route_id"]}',
-        )
-        report_lines.append(
-            f'external route_id={route["route_id"]} external_port={shared_port} '
-            f'domain={route["domain"]} backend_target={backend_target} source={route["source"]!r}'
-        )
+        if route.get("default"):
+            register_default_stream_target(
+                shared_port,
+                backend_target,
+                default_by_port,
+                f'external route {route["route_id"]}',
+            )
+            report_lines.append(
+                f'external route_id={route["route_id"]} external_port={shared_port} '
+                f'domain=<default> backend_target={backend_target} source={route["source"]!r}'
+            )
+        else:
+            register_stream_target(
+                shared_port,
+                route["domain"],
+                backend_target,
+                passthrough_by_port,
+                f'external route {route["route_id"]}',
+            )
+            report_lines.append(
+                f'external route_id={route["route_id"]} external_port={shared_port} '
+                f'domain={route["domain"]} backend_target={backend_target} source={route["source"]!r}'
+            )
 
-    STREAM_MAP.write_text(build_stream_configs(sorted(shared_ports), shared_domains, passthrough_by_port), encoding="utf-8")
+    STREAM_MAP.write_text(build_stream_configs(sorted(shared_ports), shared_domains, passthrough_by_port, default_by_port), encoding="utf-8")
     STREAM_SERVER.write_text("# generated by vpnbot-xui-sync-routes\\n", encoding="utf-8")
     write_report(report_lines)
 
