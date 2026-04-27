@@ -15,13 +15,17 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-TRACKER_VERSION = "2026-04-27.3"
+TRACKER_VERSION = "2026-04-27.4"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
 BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
 WINDOW_SECONDS = max(10, min(int(os.environ.get("XRAY_ONLINE_WINDOW_SECONDS", "180")), 3600))
 BOOTSTRAP_BYTES = max(64 * 1024, min(int(os.environ.get("XRAY_ONLINE_BOOTSTRAP_BYTES", "524288")), 8 * 1024 * 1024))
 POLL_INTERVAL = max(0.05, min(float(os.environ.get("XRAY_ONLINE_POLL_INTERVAL", "0.2")), 5.0))
+MAINTENANCE_INTERVAL = max(
+    1.0,
+    min(float(os.environ.get("XRAY_ONLINE_MAINTENANCE_INTERVAL_SECONDS", "5")), 60.0),
+)
 MAX_IPS_PER_USER = max(1, min(int(os.environ.get("XRAY_ONLINE_MAX_IPS_PER_USER", "20")), 100))
 XRAY_BIN = os.environ.get("XRAY_ONLINE_XRAY_BIN", "/opt/vpnbot/xray-core/bin/xray")
 XRAY_API_SERVER = os.environ.get("XRAY_ONLINE_XRAY_API_SERVER", "127.0.0.1:10085")
@@ -144,6 +148,7 @@ def health_payload() -> dict:
         "script_sha256": script_sha256(),
         "bind": f"{BIND_HOST}:{BIND_PORT}",
         "window_seconds": WINDOW_SECONDS,
+        "maintenance_interval_seconds": MAINTENANCE_INTERVAL,
         "stats_interval_seconds": STATS_INTERVAL,
         "xray_api_server": XRAY_API_SERVER,
     }
@@ -1757,6 +1762,7 @@ def tail_access_log() -> None:
     fh = None
     inode = None
     position = 0
+    last_maintenance_at = 0.0
     while True:
         try:
             stat = ACCESS_LOG.stat()
@@ -1779,8 +1785,11 @@ def tail_access_log() -> None:
                 position = fh.tell()
                 continue
 
-            purge_stale()
-            save_multi_ip_history()
+            now = time.time()
+            if now - last_maintenance_at >= MAINTENANCE_INTERVAL:
+                purge_stale(now)
+                save_multi_ip_history()
+                last_maintenance_at = now
             time.sleep(POLL_INTERVAL)
         except Exception as exc:
             with LOCK:
