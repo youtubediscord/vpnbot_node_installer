@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-TRACKER_VERSION = "2026-04-27.4"
+TRACKER_VERSION = "2026-04-27.5"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
 BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
@@ -37,6 +37,16 @@ PER_IP_TRAFFIC_STALE_SECONDS = max(
 )
 PER_IP_ACTIVE_BPS = max(0, int(os.environ.get("XRAY_ABUSE_PER_IP_ACTIVE_BPS", "1000000")))
 PER_IP_HEAVY_BPS = max(PER_IP_ACTIVE_BPS, int(os.environ.get("XRAY_ABUSE_PER_IP_HEAVY_BPS", "5000000")))
+ABUSE_AUDIT_ENABLED = str(os.environ.get("XRAY_ABUSE_AUDIT_ENABLED", "0")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+ABUSE_HISTORY_TOUCH_INTERVAL_SECONDS = max(
+    0.0,
+    min(float(os.environ.get("XRAY_ABUSE_HISTORY_TOUCH_INTERVAL_SECONDS", "5")), 300.0),
+)
 ABUSE_AUDIT_WINDOW_SECONDS = max(60, min(int(os.environ.get("XRAY_ABUSE_AUDIT_WINDOW_SECONDS", "86400")), 7 * 86400))
 ABUSE_AUDIT_MAX_EVENTS = max(1000, min(int(os.environ.get("XRAY_ABUSE_AUDIT_MAX_EVENTS", "50000")), 500000))
 ABUSE_AUDIT_TOP_LIMIT = max(5, min(int(os.environ.get("XRAY_ABUSE_AUDIT_TOP_LIMIT", "20")), 100))
@@ -130,12 +140,13 @@ def health_payload() -> dict:
         "started_at": STARTED_AT,
         "features": {
             "online": True,
-            "abuse_audit": True,
+            "abuse_audit": ABUSE_AUDIT_ENABLED,
             "abuse_multi_ip": True,
             "multi_ip_cache": ABUSE_MULTI_IP_CACHE_TTL_SECONDS > 0,
             "per_ip_traffic": True,
         },
         "multi_ip_cache_ttl_seconds": ABUSE_MULTI_IP_CACHE_TTL_SECONDS,
+        "abuse_history_touch_interval_seconds": ABUSE_HISTORY_TOUCH_INTERVAL_SECONDS,
         "per_ip_traffic": {
             "source": "ss_tcp_info",
             "ss_bin": SS_BIN,
@@ -217,6 +228,13 @@ def remember_multi_ip_history(email: str, ts: float, source_ip: str | None) -> N
     entry = _history_user(email)
     ips = entry.setdefault("ips", {})
     item = ips.setdefault(source_ip, {"first_seen": float(ts), "last_seen": 0.0, "count": 0})
+    previous_last_seen = float(item.get("last_seen") or 0.0)
+    if (
+        previous_last_seen > 0
+        and ABUSE_HISTORY_TOUCH_INTERVAL_SECONDS > 0
+        and float(ts) - previous_last_seen < ABUSE_HISTORY_TOUCH_INTERVAL_SECONDS
+    ):
+        return
     try:
         item["first_seen"] = min(float(item.get("first_seen") or ts), float(ts))
     except Exception:
@@ -408,6 +426,8 @@ def extract_target(line: str) -> dict | None:
 
 
 def remember_abuse_event(email: str, ts: float, source_ip: str | None, target: dict | None) -> None:
+    if not ABUSE_AUDIT_ENABLED:
+        return
     if not target:
         return
     ABUSE_EVENTS.append(
@@ -445,7 +465,7 @@ def process_line(raw: str) -> None:
         return
 
     source_ip = extract_source_ip(line)
-    target = extract_target(line)
+    target = extract_target(line) if ABUSE_AUDIT_ENABLED else None
     now = time.time()
     with LOCK:
         entry = CLIENTS.setdefault(email, {"email": email, "ips": {}, "last_seen": 0.0})
@@ -541,6 +561,25 @@ def build_abuse_audit(
     email_filter = str(email_filter or "").strip()
     target_filter = normalize_host(target_filter)
 
+    if not ABUSE_AUDIT_ENABLED:
+        return {
+            "ok": True,
+            "source": "vpnbot_xray_abuse_audit",
+            "enabled": False,
+            "is_recent_activity": True,
+            "access_log": str(ACCESS_LOG),
+            "window_seconds": window,
+            "events_kept": 0,
+            "matched_events": 0,
+            "filters": {
+                "email": email_filter,
+                "port": port_filter,
+                "target": target_filter,
+            },
+            "top_limit": ABUSE_AUDIT_TOP_LIMIT,
+            "users": [],
+        }
+
     purge_stale(now)
     with LOCK:
         events = [
@@ -629,6 +668,7 @@ def build_abuse_audit(
     return {
         "ok": True,
         "source": "vpnbot_xray_abuse_audit",
+        "enabled": True,
         "is_recent_activity": True,
         "access_log": str(ACCESS_LOG),
         "window_seconds": window,
@@ -1722,6 +1762,7 @@ def snapshot(window_seconds: int | None = None) -> dict:
         "max_last_seen_age_seconds": max_age,
         "abuse_audit": {
             "endpoint": "/abuse",
+            "enabled": ABUSE_AUDIT_ENABLED,
             "multi_ip_endpoint": "/abuse/multi-ip",
             "window_seconds": ABUSE_AUDIT_WINDOW_SECONDS,
             "events_kept": abuse_events_kept,
