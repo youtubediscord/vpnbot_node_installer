@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-TRACKER_VERSION = "2026-04-27.14"
+TRACKER_VERSION = "2026-04-27.15"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
 BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
@@ -172,11 +172,6 @@ def script_sha256() -> str:
 
 def health_payload() -> dict:
     per_ip_status = _socket_traffic_status_snapshot(time.time())
-    top_rows = [
-        item
-        for item in rows
-        if int(item.get("connection_count") or 0) > 0 or int(item.get("load_bps") or 0) > 0
-    ][:10]
     return {
         "ok": True,
         "source": "vpnbot_xray_online_tracker",
@@ -1009,6 +1004,11 @@ def _per_ip_traffic_for_ips(ips: list[str], now: float, windows: list[int]) -> d
     heavy_count = sum(1 for item in rows if bool(item.get("is_heavy")))
     top_bps = int(rows[0].get("load_bps") or 0) if rows else 0
     top_share = float(top_bps / total_bps) if total_bps > 0 else 0.0
+    top_rows = [
+        item
+        for item in rows
+        if int(item.get("connection_count") or 0) > 0 or int(item.get("load_bps") or 0) > 0
+    ][:10]
     return {
         "source": "ss_tcp_info",
         "status": status.get("status") or "unknown",
