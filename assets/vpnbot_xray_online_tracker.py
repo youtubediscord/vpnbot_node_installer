@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-TRACKER_VERSION = "2026-04-27.12"
+TRACKER_VERSION = "2026-04-27.13"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
 BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
@@ -136,6 +136,14 @@ USER_TRAFFIC_HISTORY: dict[str, list[dict]] = {}
 IP_TRAFFIC: dict[str, dict] = {}
 IP_TRAFFIC_HISTORY: dict[str, list[dict]] = {}
 SOCKET_TRAFFIC_SAMPLES: dict[str, dict] = {}
+SOCKET_TRAFFIC_STATUS: dict[str, object] = {
+    "status": "unknown",
+    "checked_at": "",
+    "checked_at_ts": 0.0,
+    "socket_rows_seen": 0,
+    "max_ss_lines": PER_IP_TRAFFIC_MAX_SS_LINES,
+    "unavailable_reason": "",
+}
 MULTI_IP_ABUSE_CACHE: dict[str, tuple[float, dict]] = {}
 HISTORY_DIRTY = False
 LAST_HISTORY_SAVE_AT = 0.0
@@ -163,6 +171,7 @@ def script_sha256() -> str:
 
 
 def health_payload() -> dict:
+    per_ip_status = _socket_traffic_status_snapshot(time.time())
     return {
         "ok": True,
         "source": "vpnbot_xray_online_tracker",
@@ -185,11 +194,16 @@ def health_payload() -> dict:
         "abuse_history_touch_interval_seconds": ABUSE_HISTORY_TOUCH_INTERVAL_SECONDS,
         "per_ip_traffic": {
             "source": "ss_tcp_info",
+            "status": per_ip_status.get("status") or "unknown",
+            "checked_at": per_ip_status.get("checked_at") or "",
+            "checked_age_seconds": int(per_ip_status.get("checked_age_seconds") or -1),
+            "socket_rows_seen": int(per_ip_status.get("socket_rows_seen") or 0),
             "ss_bin": SS_BIN,
             "active_bps": PER_IP_ACTIVE_BPS,
             "heavy_bps": PER_IP_HEAVY_BPS,
             "stale_seconds": PER_IP_TRAFFIC_STALE_SECONDS,
             "max_ss_lines": PER_IP_TRAFFIC_MAX_SS_LINES,
+            "unavailable_reason": per_ip_status.get("unavailable_reason") or "",
         },
         "access_log": str(ACCESS_LOG),
         "script_path": str(Path(__file__)),
@@ -209,6 +223,39 @@ def health_payload() -> dict:
 
 def utc_iso(ts: float | None = None) -> str:
     return datetime.fromtimestamp(ts or time.time(), timezone.utc).isoformat()
+
+
+def _set_socket_traffic_status(
+    status: str,
+    now: float,
+    *,
+    reason: str = "",
+    socket_rows: int = 0,
+) -> None:
+    with LOCK:
+        SOCKET_TRAFFIC_STATUS.clear()
+        SOCKET_TRAFFIC_STATUS.update(
+            {
+                "status": str(status or "unknown"),
+                "checked_at": utc_iso(now),
+                "checked_at_ts": float(now),
+                "socket_rows_seen": int(max(0, socket_rows)),
+                "max_ss_lines": PER_IP_TRAFFIC_MAX_SS_LINES,
+                "unavailable_reason": str(reason or ""),
+            }
+        )
+
+
+def _socket_traffic_status_snapshot(now: float | None = None) -> dict[str, object]:
+    with LOCK:
+        status = dict(SOCKET_TRAFFIC_STATUS)
+    checked_at_ts = float(status.get("checked_at_ts") or 0.0)
+    if now is not None and checked_at_ts > 0:
+        status["checked_age_seconds"] = max(0, int(float(now) - checked_at_ts))
+    else:
+        status["checked_age_seconds"] = -1
+    status["max_ss_lines"] = PER_IP_TRAFFIC_MAX_SS_LINES
+    return status
 
 
 def load_multi_ip_history() -> None:
@@ -912,6 +959,7 @@ def _per_ip_traffic_window_stats(ip: str, now: float, windows: list[int]) -> dic
 def _per_ip_traffic_for_ips(ips: list[str], now: float, windows: list[int]) -> dict[str, object]:
     stale_cutoff = now - PER_IP_TRAFFIC_STALE_SECONDS
     rows: list[dict] = []
+    status = _socket_traffic_status_snapshot(now)
     with LOCK:
         current = {
             ip: dict(IP_TRAFFIC.get(ip) or {})
@@ -958,6 +1006,12 @@ def _per_ip_traffic_for_ips(ips: list[str], now: float, windows: list[int]) -> d
     top_share = float(top_bps / total_bps) if total_bps > 0 else 0.0
     return {
         "source": "ss_tcp_info",
+        "status": status.get("status") or "unknown",
+        "checked_at": status.get("checked_at") or "",
+        "checked_age_seconds": int(status.get("checked_age_seconds") or -1),
+        "socket_rows_seen": int(status.get("socket_rows_seen") or 0),
+        "max_ss_lines": PER_IP_TRAFFIC_MAX_SS_LINES,
+        "unavailable_reason": status.get("unavailable_reason") or "",
         "active_bps_threshold": PER_IP_ACTIVE_BPS,
         "heavy_bps_threshold": PER_IP_HEAVY_BPS,
         "stale_seconds": PER_IP_TRAFFIC_STALE_SECONDS,
@@ -1545,14 +1599,18 @@ def _established_socket_count_limited(limit: int) -> tuple[int, bool]:
 def query_socket_ip_traffic(now: float) -> dict[str, dict]:
     known_ips = _known_recent_client_ips(now)
     if not known_ips:
+        _set_socket_traffic_status("idle", now, reason="no_recent_client_ips")
         return {}
 
     socket_rows, socket_rows_limited = _established_socket_count_limited(PER_IP_TRAFFIC_MAX_SS_LINES)
     if socket_rows_limited:
-        raise RuntimeError(
-            f"socket_traffic_skipped: established TCP rows exceed "
-            f"{PER_IP_TRAFFIC_MAX_SS_LINES} (seen {socket_rows})"
+        _set_socket_traffic_status(
+            "skipped",
+            now,
+            reason="too_many_established_sockets",
+            socket_rows=socket_rows,
         )
+        return {}
 
     proc = subprocess.run(
         [SS_BIN, "-Htin", "state", "established"],
@@ -1562,6 +1620,7 @@ def query_socket_ip_traffic(now: float) -> dict[str, dict]:
         check=False,
     )
     if proc.returncode != 0:
+        _set_socket_traffic_status("error", now, reason="ss_failed", socket_rows=socket_rows)
         raise RuntimeError((proc.stderr or proc.stdout or f"exit={proc.returncode}")[-500:])
 
     sockets: list[dict] = []
@@ -1701,6 +1760,7 @@ def query_socket_ip_traffic(now: float) -> dict[str, dict]:
                 if isinstance(sample, dict) and float(sample.get("ts") or 0.0) >= history_cutoff
             ][-200:]
 
+    _set_socket_traffic_status("ok", now, socket_rows=socket_rows)
     return by_ip
 
 
@@ -1750,6 +1810,9 @@ def poll_xray_stats_once() -> None:
 
     try:
         query_socket_ip_traffic(now)
+        with LOCK:
+            if str(LAST_ERROR or "").startswith("socket_traffic:"):
+                LAST_ERROR = ""
     except Exception as exc:
         with LOCK:
             LAST_ERROR = f"socket_traffic:{type(exc).__name__}: {exc}"
