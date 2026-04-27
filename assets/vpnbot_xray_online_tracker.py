@@ -72,6 +72,10 @@ ABUSE_MULTI_IP_HISTORY_SAVE_INTERVAL_SECONDS = max(
     5.0,
     min(float(os.environ.get("XRAY_ABUSE_MULTI_IP_HISTORY_SAVE_INTERVAL_SECONDS", "30")), 300.0),
 )
+ABUSE_MULTI_IP_CACHE_TTL_SECONDS = max(
+    0.0,
+    min(float(os.environ.get("XRAY_ABUSE_MULTI_IP_CACHE_TTL_SECONDS", "10")), 60.0),
+)
 
 LOCK = threading.RLock()
 CLIENTS: dict[str, dict] = {}
@@ -79,6 +83,7 @@ ABUSE_EVENTS: list[dict] = []
 MULTI_IP_HISTORY: dict[str, dict] = {"users": {}}
 USER_TRAFFIC: dict[str, dict] = {}
 USER_TRAFFIC_HISTORY: dict[str, list[dict]] = {}
+MULTI_IP_ABUSE_CACHE: dict[str, tuple[float, dict]] = {}
 HISTORY_DIRTY = False
 LAST_HISTORY_SAVE_AT = 0.0
 LAST_LINE_AT = 0.0
@@ -757,9 +762,43 @@ def _burst_score(
     return int(score)
 
 
+def _get_multi_ip_abuse_cache(cache_key: str, now: float) -> dict | None:
+    if ABUSE_MULTI_IP_CACHE_TTL_SECONDS <= 0:
+        return None
+    with LOCK:
+        cached = MULTI_IP_ABUSE_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        cached_at, payload = cached
+        if now - float(cached_at or 0.0) > ABUSE_MULTI_IP_CACHE_TTL_SECONDS:
+            MULTI_IP_ABUSE_CACHE.pop(cache_key, None)
+            return None
+        return json.loads(json.dumps(payload, ensure_ascii=False))
+
+
+def _store_multi_ip_abuse_cache(cache_key: str, now: float, payload: dict) -> None:
+    if ABUSE_MULTI_IP_CACHE_TTL_SECONDS <= 0:
+        return
+    with LOCK:
+        MULTI_IP_ABUSE_CACHE[cache_key] = (
+            now,
+            json.loads(json.dumps(payload, ensure_ascii=False)),
+        )
+
+
 def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
     now = time.time()
     window = max(10, min(int(window_seconds or WINDOW_SECONDS), 3600))
+    cache_key = str(window)
+    cached = _get_multi_ip_abuse_cache(cache_key, now)
+    if cached is not None:
+        cached["cache"] = {
+            "hit": True,
+            "ttl_seconds": ABUSE_MULTI_IP_CACHE_TTL_SECONDS,
+            "age_seconds": max(0.0, now - float(cached.get("generated_at_ts") or now)),
+        }
+        return cached
+
     windows = sorted({*ABUSE_MULTI_IP_WINDOWS, window})
     main_window = str(window)
     history_cutoff = now - max(windows)
@@ -938,11 +977,13 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
     )
     save_multi_ip_history()
 
-    return {
+    payload = {
         "ok": True,
         "source": "vpnbot_xray_multi_ip_abuse",
         "is_recent_activity": True,
         "access_log": str(ACCESS_LOG),
+        "generated_at": utc_iso(now),
+        "generated_at_ts": now,
         "window_seconds": window,
         "thresholds": {
             "observe_ips": ABUSE_MULTI_IP_OBSERVE_IPS,
@@ -958,7 +999,14 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
         "suspect_count": len(users),
         "top_limit": ABUSE_MULTI_IP_TOP_LIMIT,
         "users": users[:ABUSE_MULTI_IP_TOP_LIMIT],
+        "cache": {
+            "hit": False,
+            "ttl_seconds": ABUSE_MULTI_IP_CACHE_TTL_SECONDS,
+            "age_seconds": 0.0,
+        },
     }
+    _store_multi_ip_abuse_cache(cache_key, now, payload)
+    return payload
 
 
 def extract_traffic_totals(payload: dict, *, prefix: str) -> dict:
