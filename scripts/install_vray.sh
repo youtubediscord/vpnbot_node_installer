@@ -114,7 +114,12 @@ XRAY_CORE_ROLLOUT_BUNDLE_FILE="${XRAY_CORE_ROLLOUT_BUNDLE_FILE:-/etc/vpnbot-xray
 XRAY_CORE_API_SERVER="${XRAY_CORE_API_SERVER:-127.0.0.1:10085}"
 XRAY_CTL_SCRIPT="${XRAY_CTL_SCRIPT:-/usr/local/bin/vpnbot-xrayctl}"
 XRAY_RESERVED_PORTS_SCRIPT="${XRAY_RESERVED_PORTS_SCRIPT:-/usr/local/bin/vpnbot-xray-reserve-ports}"
-XRAY_ONLINE_TRACKER_SCRIPT="${XRAY_ONLINE_TRACKER_SCRIPT:-/usr/local/bin/vpnbot-xray-online-tracker}"
+XRAY_ONLINE_TRACKER_CANONICAL_SCRIPT="/usr/local/bin/vpnbot-xray-online-tracker"
+XRAY_ONLINE_TRACKER_LEGACY_SCRIPT="/root/vpnbot-xray-online-tracker"
+XRAY_ONLINE_TRACKER_SCRIPT="${XRAY_ONLINE_TRACKER_SCRIPT:-${XRAY_ONLINE_TRACKER_CANONICAL_SCRIPT}}"
+if [[ "${XRAY_ONLINE_TRACKER_SCRIPT}" == "${XRAY_ONLINE_TRACKER_LEGACY_SCRIPT}" ]]; then
+    XRAY_ONLINE_TRACKER_SCRIPT="${XRAY_ONLINE_TRACKER_CANONICAL_SCRIPT}"
+fi
 XRAY_ONLINE_TRACKER_SERVICE_NAME="${XRAY_ONLINE_TRACKER_SERVICE_NAME:-vpnbot-xray-online.service}"
 XRAY_ONLINE_TRACKER_SERVICE_FILE="${XRAY_ONLINE_TRACKER_SERVICE_FILE:-/etc/systemd/system/${XRAY_ONLINE_TRACKER_SERVICE_NAME}}"
 XRAY_ONLINE_TRACKER_BIND="${XRAY_ONLINE_TRACKER_BIND:-127.0.0.1}"
@@ -138,6 +143,7 @@ XRAY_ABUSE_MULTI_IP_HISTORY_FILE="${XRAY_ABUSE_MULTI_IP_HISTORY_FILE:-/var/lib/v
 XRAY_ABUSE_MULTI_IP_KNOWN_IP_TTL_SECONDS="${XRAY_ABUSE_MULTI_IP_KNOWN_IP_TTL_SECONDS:-1209600}"
 XRAY_ABUSE_MULTI_IP_REPEAT_WINDOW_SECONDS="${XRAY_ABUSE_MULTI_IP_REPEAT_WINDOW_SECONDS:-86400}"
 XRAY_ABUSE_MULTI_IP_RISK_EVENT_MIN_INTERVAL_SECONDS="${XRAY_ABUSE_MULTI_IP_RISK_EVENT_MIN_INTERVAL_SECONDS:-120}"
+XRAY_ABUSE_MULTI_IP_CACHE_TTL_SECONDS="${XRAY_ABUSE_MULTI_IP_CACHE_TTL_SECONDS:-10}"
 XRAY_ABUSE_MULTI_IP_URL="${XRAY_ABUSE_MULTI_IP_URL:-http://${XRAY_ONLINE_TRACKER_BIND}:${XRAY_ONLINE_TRACKER_PORT}/abuse/multi-ip}"
 XRAY_SYNC_SCRIPT="${XRAY_SYNC_SCRIPT:-/usr/local/bin/vpnbot-xray-sync-routes}"
 XRAY_SYNC_SERVICE="${XRAY_SYNC_SERVICE:-/etc/systemd/system/vpnbot-xray-sync-routes.service}"
@@ -2012,11 +2018,37 @@ write_xrayctl_assets() {
 }
 
 
+normalize_xray_online_tracker_service_unit() {
+    if [[ ! -f "${XRAY_ONLINE_TRACKER_SERVICE_FILE}" ]]; then
+        return 0
+    fi
+
+    if grep -Fq "ExecStart=${XRAY_ONLINE_TRACKER_LEGACY_SCRIPT}" "${XRAY_ONLINE_TRACKER_SERVICE_FILE}"; then
+        cp -a "${XRAY_ONLINE_TRACKER_SERVICE_FILE}" "${XRAY_ONLINE_TRACKER_SERVICE_FILE}.bak.$(date +%Y%m%d%H%M%S)" || true
+        sed -i "s#^ExecStart=${XRAY_ONLINE_TRACKER_LEGACY_SCRIPT}.*#ExecStart=${XRAY_ONLINE_TRACKER_CANONICAL_SCRIPT}#" "${XRAY_ONLINE_TRACKER_SERVICE_FILE}"
+        log "Repaired legacy online tracker ExecStart path in ${XRAY_ONLINE_TRACKER_SERVICE_FILE}"
+    fi
+}
+
+
+restart_xray_online_tracker_service_only() {
+    systemctl daemon-reload
+    systemctl enable "${XRAY_ONLINE_TRACKER_SERVICE_NAME}" >/dev/null
+    if systemctl is-active --quiet "${XRAY_ONLINE_TRACKER_SERVICE_NAME}"; then
+        systemctl restart "${XRAY_ONLINE_TRACKER_SERVICE_NAME}"
+    else
+        systemctl start "${XRAY_ONLINE_TRACKER_SERVICE_NAME}"
+    fi
+}
+
+
 write_xray_online_tracker_assets() {
     local tracker_state_dir
     tracker_state_dir="/var/lib/vpnbot-xray-online"
     mkdir -p "${tracker_state_dir}"
     chmod 755 "${tracker_state_dir}"
+
+    normalize_xray_online_tracker_service_unit
 
     download_node_installer_asset "assets/vpnbot_xray_online_tracker.py" "${XRAY_ONLINE_TRACKER_SCRIPT}" 755
     log "Installed Xray-core online tracker helper: ${XRAY_ONLINE_TRACKER_SCRIPT}"
@@ -2052,6 +2084,7 @@ Environment=XRAY_ABUSE_MULTI_IP_HISTORY_FILE=${XRAY_ABUSE_MULTI_IP_HISTORY_FILE}
 Environment=XRAY_ABUSE_MULTI_IP_KNOWN_IP_TTL_SECONDS=${XRAY_ABUSE_MULTI_IP_KNOWN_IP_TTL_SECONDS}
 Environment=XRAY_ABUSE_MULTI_IP_REPEAT_WINDOW_SECONDS=${XRAY_ABUSE_MULTI_IP_REPEAT_WINDOW_SECONDS}
 Environment=XRAY_ABUSE_MULTI_IP_RISK_EVENT_MIN_INTERVAL_SECONDS=${XRAY_ABUSE_MULTI_IP_RISK_EVENT_MIN_INTERVAL_SECONDS}
+Environment=XRAY_ABUSE_MULTI_IP_CACHE_TTL_SECONDS=${XRAY_ABUSE_MULTI_IP_CACHE_TTL_SECONDS}
 ExecStart=${XRAY_ONLINE_TRACKER_SCRIPT}
 Restart=always
 RestartSec=2s
@@ -2061,8 +2094,8 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable --now "${XRAY_ONLINE_TRACKER_SERVICE_NAME}"
+    normalize_xray_online_tracker_service_unit
+    restart_xray_online_tracker_service_only
     if ! systemctl is-active --quiet "${XRAY_ONLINE_TRACKER_SERVICE_NAME}"; then
         journalctl -u "${XRAY_ONLINE_TRACKER_SERVICE_NAME}" -n 100 --no-pager || true
         err "Xray-core online tracker service failed to reach active state: ${XRAY_ONLINE_TRACKER_SERVICE_NAME}"

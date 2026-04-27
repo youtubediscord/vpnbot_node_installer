@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ipaddress
+import hashlib
 import json
 import os
 import re
@@ -14,6 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
+TRACKER_VERSION = "2026-04-27.2"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
 BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
@@ -97,6 +99,36 @@ TRAFFIC = {
     "stats_checked_at": "",
     "stats_last_error": "",
 }
+
+
+def script_sha256() -> str:
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except Exception:
+        return ""
+
+
+def health_payload() -> dict:
+    return {
+        "ok": True,
+        "source": "vpnbot_xray_online_tracker",
+        "version": TRACKER_VERSION,
+        "started_at": STARTED_AT,
+        "features": {
+            "online": True,
+            "abuse_audit": True,
+            "abuse_multi_ip": True,
+            "multi_ip_cache": ABUSE_MULTI_IP_CACHE_TTL_SECONDS > 0,
+        },
+        "multi_ip_cache_ttl_seconds": ABUSE_MULTI_IP_CACHE_TTL_SECONDS,
+        "access_log": str(ACCESS_LOG),
+        "script_path": str(Path(__file__)),
+        "script_sha256": script_sha256(),
+        "bind": f"{BIND_HOST}:{BIND_PORT}",
+        "window_seconds": WINDOW_SECONDS,
+        "stats_interval_seconds": STATS_INTERVAL,
+        "xray_api_server": XRAY_API_SERVER,
+    }
 
 
 def utc_iso(ts: float | None = None) -> str:
@@ -1338,7 +1370,7 @@ def tail_access_log() -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "vpnbot-xray-online-tracker/1.0"
+    server_version = f"vpnbot-xray-online-tracker/{TRACKER_VERSION}"
 
     def log_message(self, fmt: str, *args) -> None:
         return
@@ -1355,7 +1387,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path in {"/health", "/ready"}:
-            self._send_json(200, {"ok": True, "source": "vpnbot_xray_online_tracker", "started_at": STARTED_AT})
+            self._send_json(200, health_payload())
             return
         if parsed.path in {"/", "/online", "/stats"}:
             query = parse_qs(parsed.query)
