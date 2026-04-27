@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-TRACKER_VERSION = "2026-04-27.2"
+TRACKER_VERSION = "2026-04-27.3"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
 BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
@@ -26,6 +26,13 @@ MAX_IPS_PER_USER = max(1, min(int(os.environ.get("XRAY_ONLINE_MAX_IPS_PER_USER",
 XRAY_BIN = os.environ.get("XRAY_ONLINE_XRAY_BIN", "/opt/vpnbot/xray-core/bin/xray")
 XRAY_API_SERVER = os.environ.get("XRAY_ONLINE_XRAY_API_SERVER", "127.0.0.1:10085")
 STATS_INTERVAL = max(5.0, min(float(os.environ.get("XRAY_ONLINE_STATS_INTERVAL_SECONDS", "60")), 300.0))
+SS_BIN = os.environ.get("XRAY_ONLINE_SS_BIN", "ss")
+PER_IP_TRAFFIC_STALE_SECONDS = max(
+    15.0,
+    min(float(os.environ.get("XRAY_ABUSE_PER_IP_TRAFFIC_STALE_SECONDS", "180")), 900.0),
+)
+PER_IP_ACTIVE_BPS = max(0, int(os.environ.get("XRAY_ABUSE_PER_IP_ACTIVE_BPS", "1000000")))
+PER_IP_HEAVY_BPS = max(PER_IP_ACTIVE_BPS, int(os.environ.get("XRAY_ABUSE_PER_IP_HEAVY_BPS", "5000000")))
 ABUSE_AUDIT_WINDOW_SECONDS = max(60, min(int(os.environ.get("XRAY_ABUSE_AUDIT_WINDOW_SECONDS", "86400")), 7 * 86400))
 ABUSE_AUDIT_MAX_EVENTS = max(1000, min(int(os.environ.get("XRAY_ABUSE_AUDIT_MAX_EVENTS", "50000")), 500000))
 ABUSE_AUDIT_TOP_LIMIT = max(5, min(int(os.environ.get("XRAY_ABUSE_AUDIT_TOP_LIMIT", "20")), 100))
@@ -85,6 +92,9 @@ ABUSE_EVENTS: list[dict] = []
 MULTI_IP_HISTORY: dict[str, dict] = {"users": {}}
 USER_TRAFFIC: dict[str, dict] = {}
 USER_TRAFFIC_HISTORY: dict[str, list[dict]] = {}
+IP_TRAFFIC: dict[str, dict] = {}
+IP_TRAFFIC_HISTORY: dict[str, list[dict]] = {}
+SOCKET_TRAFFIC_SAMPLES: dict[str, dict] = {}
 MULTI_IP_ABUSE_CACHE: dict[str, tuple[float, dict]] = {}
 HISTORY_DIRTY = False
 LAST_HISTORY_SAVE_AT = 0.0
@@ -119,8 +129,16 @@ def health_payload() -> dict:
             "abuse_audit": True,
             "abuse_multi_ip": True,
             "multi_ip_cache": ABUSE_MULTI_IP_CACHE_TTL_SECONDS > 0,
+            "per_ip_traffic": True,
         },
         "multi_ip_cache_ttl_seconds": ABUSE_MULTI_IP_CACHE_TTL_SECONDS,
+        "per_ip_traffic": {
+            "source": "ss_tcp_info",
+            "ss_bin": SS_BIN,
+            "active_bps": PER_IP_ACTIVE_BPS,
+            "heavy_bps": PER_IP_HEAVY_BPS,
+            "stale_seconds": PER_IP_TRAFFIC_STALE_SECONDS,
+        },
         "access_log": str(ACCESS_LOG),
         "script_path": str(Path(__file__)),
         "script_sha256": script_sha256(),
@@ -484,6 +502,27 @@ def purge_stale(now: float | None = None) -> None:
                 if float(item.get("ts") or 0.0) >= abuse_cutoff
             ][-ABUSE_AUDIT_MAX_EVENTS:]
 
+        ip_traffic_cutoff = now - PER_IP_TRAFFIC_STALE_SECONDS
+        for ip, item in list(IP_TRAFFIC.items()):
+            if not isinstance(item, dict) or float(item.get("checked_at_ts") or 0.0) < ip_traffic_cutoff:
+                IP_TRAFFIC.pop(ip, None)
+        history_cutoff = now - (max([*ABUSE_MULTI_IP_WINDOWS, WINDOW_SECONDS]) + max(STATS_INTERVAL * 3, 180.0))
+        for ip, samples in list(IP_TRAFFIC_HISTORY.items()):
+            if not isinstance(samples, list):
+                IP_TRAFFIC_HISTORY.pop(ip, None)
+                continue
+            samples[:] = [
+                item
+                for item in samples
+                if isinstance(item, dict) and float(item.get("ts") or 0.0) >= history_cutoff
+            ][-200:]
+            if not samples:
+                IP_TRAFFIC_HISTORY.pop(ip, None)
+        socket_cutoff = now - max(PER_IP_TRAFFIC_STALE_SECONDS, STATS_INTERVAL * 3)
+        for key, item in list(SOCKET_TRAFFIC_SAMPLES.items()):
+            if not isinstance(item, dict) or float(item.get("ts") or 0.0) < socket_cutoff:
+                SOCKET_TRAFFIC_SAMPLES.pop(key, None)
+
 
 def build_abuse_audit(
     window_seconds: int | None = None,
@@ -751,6 +790,101 @@ def _traffic_window_stats(email: str, now: float, windows: list[int]) -> dict[st
     return _traffic_window_stats_from_samples(samples, now, windows)
 
 
+def _per_ip_traffic_window_stats(ip: str, now: float, windows: list[int]) -> dict[str, dict]:
+    with LOCK:
+        samples = [
+            dict(item)
+            for item in IP_TRAFFIC_HISTORY.get(ip, [])
+            if isinstance(item, dict)
+        ]
+
+    out: dict[str, dict] = {}
+    for window in windows:
+        cutoff = now - int(window)
+        filtered = [
+            item
+            for item in samples
+            if float(item.get("ts") or 0.0) >= cutoff
+        ]
+        down = sum(int(item.get("delta_down_bytes") or 0) for item in filtered)
+        up = sum(int(item.get("delta_up_bytes") or 0) for item in filtered)
+        max_load = max((int(item.get("load_bps") or 0) for item in filtered), default=0)
+        max_down_load = max((int(item.get("load_down_bps") or 0) for item in filtered), default=0)
+        out[str(window)] = {
+            "window_seconds": int(window),
+            "traffic_down_bytes": int(down),
+            "traffic_up_bytes": int(up),
+            "traffic_total_bytes": int(down + up),
+            "max_load_bps": int(max_load),
+            "max_load_down_bps": int(max_down_load),
+            "sample_count": len(filtered),
+        }
+    return out
+
+
+def _per_ip_traffic_for_ips(ips: list[str], now: float, windows: list[int]) -> dict[str, object]:
+    stale_cutoff = now - PER_IP_TRAFFIC_STALE_SECONDS
+    rows: list[dict] = []
+    with LOCK:
+        current = {
+            ip: dict(IP_TRAFFIC.get(ip) or {})
+            for ip in ips
+            if isinstance(IP_TRAFFIC.get(ip), dict)
+            and float((IP_TRAFFIC.get(ip) or {}).get("checked_at_ts") or 0.0) >= stale_cutoff
+        }
+
+    for ip in ips:
+        item = current.get(ip) or {}
+        windows_payload = _per_ip_traffic_window_stats(ip, now, windows)
+        load_bps = int(item.get("load_bps") or 0)
+        load_down_bps = int(item.get("load_down_bps") or 0)
+        row = {
+            "ip": ip,
+            "connection_count": int(item.get("connection_count") or 0),
+            "load_bps": load_bps,
+            "load_down_bps": load_down_bps,
+            "load_up_bps": int(item.get("load_up_bps") or 0),
+            "delta_down_bytes": int(item.get("delta_down_bytes") or 0),
+            "delta_up_bytes": int(item.get("delta_up_bytes") or 0),
+            "checked_at": str(item.get("checked_at") or ""),
+            "checked_age_seconds": max(0, int(now - float(item.get("checked_at_ts") or now))) if item else -1,
+            "is_active": load_bps >= PER_IP_ACTIVE_BPS,
+            "is_heavy": load_bps >= PER_IP_HEAVY_BPS,
+            "local_ports": item.get("local_ports") if isinstance(item.get("local_ports"), list) else [],
+            "window_traffic_counts": windows_payload,
+        }
+        rows.append(row)
+
+    rows.sort(
+        key=lambda item: (
+            int(item.get("load_bps") or 0),
+            int(item.get("connection_count") or 0),
+            int(item.get("delta_down_bytes") or 0),
+        ),
+        reverse=True,
+    )
+    total_bps = sum(int(item.get("load_bps") or 0) for item in rows)
+    total_down_bps = sum(int(item.get("load_down_bps") or 0) for item in rows)
+    active_count = sum(1 for item in rows if bool(item.get("is_active")))
+    heavy_count = sum(1 for item in rows if bool(item.get("is_heavy")))
+    top_bps = int(rows[0].get("load_bps") or 0) if rows else 0
+    top_share = float(top_bps / total_bps) if total_bps > 0 else 0.0
+    return {
+        "source": "ss_tcp_info",
+        "active_bps_threshold": PER_IP_ACTIVE_BPS,
+        "heavy_bps_threshold": PER_IP_HEAVY_BPS,
+        "stale_seconds": PER_IP_TRAFFIC_STALE_SECONDS,
+        "observed_ip_count": len([item for item in rows if int(item.get("connection_count") or 0) > 0]),
+        "active_ip_count": active_count,
+        "heavy_ip_count": heavy_count,
+        "total_bps": int(total_bps),
+        "total_down_bps": int(total_down_bps),
+        "top_ip_bps": int(top_bps),
+        "top_ip_share": round(top_share, 4),
+        "top_ips": rows[:10],
+    }
+
+
 def _traffic_load_level(load_bps: int | None, window_total_bytes: int) -> str:
     load = int(load_bps or 0)
     window_total = int(window_total_bytes or 0)
@@ -816,6 +950,60 @@ def _store_multi_ip_abuse_cache(cache_key: str, now: float, payload: dict) -> No
             now,
             json.loads(json.dumps(payload, ensure_ascii=False)),
         )
+
+
+def _risk_from_per_ip_traffic(
+    base_risk: str,
+    *,
+    ip_count: int,
+    new_ip_count: int,
+    repeat_count: int,
+    per_ip_traffic: dict,
+) -> tuple[str, str]:
+    active_count = int(per_ip_traffic.get("active_ip_count") or 0)
+    heavy_count = int(per_ip_traffic.get("heavy_ip_count") or 0)
+    observed_count = int(per_ip_traffic.get("observed_ip_count") or 0)
+    total_bps = int(per_ip_traffic.get("total_bps") or 0)
+    top_share = float(per_ip_traffic.get("top_ip_share") or 0.0)
+
+    if observed_count <= 0:
+        return base_risk, "ip_count_only"
+
+    if total_bps <= 0:
+        if base_risk in {"critical", "high"}:
+            if repeat_count >= 3 or new_ip_count >= ABUSE_MULTI_IP_HIGH_IPS:
+                return "suspicious", "many_ips_no_current_ip_traffic"
+            return "observe", "many_ips_no_current_ip_traffic"
+        return base_risk, "many_ips_no_current_ip_traffic"
+
+    if heavy_count >= 2:
+        if ip_count >= ABUSE_MULTI_IP_HIGH_IPS or active_count >= 3:
+            return "critical", "many_ips_heavy"
+        return "high", "few_ips_heavy"
+
+    if active_count >= 3:
+        if ip_count >= ABUSE_MULTI_IP_CRITICAL_IPS and new_ip_count >= ABUSE_MULTI_IP_SUSPICIOUS_IPS:
+            return "critical", "many_ips_active"
+        return "high", "many_ips_active"
+
+    if active_count == 2:
+        if ip_count >= ABUSE_MULTI_IP_CRITICAL_IPS and repeat_count >= 3:
+            return "high", "two_ips_active_repeated"
+        return "suspicious", "two_ips_active"
+
+    if active_count <= 1 and total_bps > 0:
+        if base_risk in {"critical", "high"}:
+            if repeat_count >= 3 or new_ip_count >= ABUSE_MULTI_IP_HIGH_IPS:
+                return "suspicious", "single_active_ip_churn"
+            return "observe", "single_active_ip_churn"
+        return base_risk, "single_active_ip_churn"
+
+    if total_bps > 0 and top_share >= 0.9:
+        if base_risk in {"critical", "high"}:
+            return "suspicious", "one_ip_dominates"
+        return base_risk, "one_ip_dominates"
+
+    return base_risk, "ip_count_only"
 
 
 def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
@@ -904,7 +1092,7 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
         event_count = int(event_info.get("event_count") or 0)
         target_count = int(event_info.get("target_count") or 0)
         port_count = int(event_info.get("port_count") or 0)
-        risk_level = _multi_ip_risk_level(ip_count, prefix_count)
+        base_risk_level = _multi_ip_risk_level(ip_count, prefix_count)
         short_window_key = str(min(windows))
         short_ip_count = int((window_stats.get(short_window_key) or {}).get("ip_count") or 0)
         history_summary = record_multi_ip_risk_event(
@@ -924,6 +1112,14 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
             event_count=event_count,
             short_ip_count=short_ip_count,
             repeat_count=repeat_count,
+        )
+        per_ip_traffic = _per_ip_traffic_for_ips(recent_ips, now, windows)
+        risk_level, traffic_pattern = _risk_from_per_ip_traffic(
+            base_risk_level,
+            ip_count=ip_count,
+            new_ip_count=new_ip_count,
+            repeat_count=repeat_count,
+            per_ip_traffic=per_ip_traffic,
         )
         history_summary = record_multi_ip_risk_event(
             email,
@@ -951,6 +1147,17 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
             reasons.append(f"{event_count} подключений/записей access.log")
         if target_count >= 10:
             reasons.append(f"{target_count} разных целей")
+        active_ip_count = int(per_ip_traffic.get("active_ip_count") or 0)
+        heavy_ip_count = int(per_ip_traffic.get("heavy_ip_count") or 0)
+        top_ip_share = float(per_ip_traffic.get("top_ip_share") or 0.0)
+        if heavy_ip_count >= 2:
+            reasons.append(f"{heavy_ip_count} IP одновременно качают много")
+        elif active_ip_count >= 2:
+            reasons.append(f"{active_ip_count} IP одновременно активны по трафику")
+        elif traffic_pattern in {"single_active_ip_churn", "one_ip_dominates"}:
+            reasons.append("трафик сейчас в основном у одного IP: похоже на смену IP, проверить вручную")
+        elif traffic_pattern == "many_ips_no_current_ip_traffic":
+            reasons.append("много IP без текущей IP-нагрузки: похоже на idle/смену IP, проверить вручную")
         if risk_level in {"high", "critical"} and prefix_count < ABUSE_MULTI_IP_MIN_PREFIXES:
             reasons.append("много IP, но мало разных подсетей: проверьте вручную")
 
@@ -958,7 +1165,13 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
             {
                 "email": email,
                 "risk_level": risk_level,
-                "evidence_strength": "strong" if prefix_count >= ABUSE_MULTI_IP_MIN_PREFIXES else "medium",
+                "base_risk_level": base_risk_level,
+                "traffic_pattern": traffic_pattern,
+                "evidence_strength": (
+                    "strong"
+                    if (heavy_ip_count >= 2 or active_ip_count >= 3) and prefix_count >= ABUSE_MULTI_IP_MIN_PREFIXES
+                    else "medium"
+                ),
                 "risk_score": _multi_ip_risk_score(ip_count, prefix_count, event_count),
                 "burst_score": burst_score,
                 "ip_count": ip_count,
@@ -970,6 +1183,7 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
                 "new_ips": list(recent_window.get("new_ips") or [])[:ABUSE_AUDIT_TOP_LIMIT],
                 "window_ip_counts": window_stats,
                 "window_event_counts": event_windows,
+                "per_ip_traffic": per_ip_traffic,
                 "repeat_count": repeat_count,
                 "repeat_level_counts": history_summary.get("repeat_level_counts") or {},
                 "last_risk_seen_at": str(history_summary.get("last_risk_seen_at") or ""),
@@ -1160,6 +1374,211 @@ def update_user_traffic(user_totals: dict[str, dict], now: float) -> None:
             ][-200:]
 
 
+_SS_ENDPOINT_RE = re.compile(r"^(?P<host>.+):(?P<port>\d+)$")
+_SS_BYTES_SENT_RE = re.compile(r"\bbytes_sent:(?P<value>\d+)\b")
+_SS_BYTES_RECEIVED_RE = re.compile(r"\bbytes_received:(?P<value>\d+)\b")
+
+
+def _parse_ss_endpoint(value: str) -> tuple[str, int] | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.startswith("[") and "]:" in text:
+        host = text[1:text.index("]:")]
+        port_text = text[text.index("]:") + 2:]
+    else:
+        match = _SS_ENDPOINT_RE.match(text)
+        if not match:
+            return None
+        host = match.group("host")
+        port_text = match.group("port")
+    ip = normalize_ip(host)
+    if not ip:
+        return None
+    try:
+        port = int(port_text)
+    except Exception:
+        port = 0
+    return ip, port
+
+
+def _is_loopback_ip(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(str(value or "").strip()).is_loopback
+    except Exception:
+        return False
+
+
+def _known_recent_client_ips(now: float) -> set[str]:
+    cutoff = now - max(WINDOW_SECONDS, max(ABUSE_MULTI_IP_WINDOWS or [WINDOW_SECONDS]))
+    out: set[str] = set()
+    with LOCK:
+        for entry in CLIENTS.values():
+            ips = entry.get("ips") if isinstance(entry, dict) and isinstance(entry.get("ips"), dict) else {}
+            for ip, seen in ips.items():
+                try:
+                    if float(seen) >= cutoff:
+                        out.add(str(ip))
+                except Exception:
+                    continue
+    return out
+
+
+def query_socket_ip_traffic(now: float) -> dict[str, dict]:
+    known_ips = _known_recent_client_ips(now)
+    if not known_ips:
+        return {}
+
+    proc = subprocess.run(
+        [SS_BIN, "-Htin", "state", "established"],
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or f"exit={proc.returncode}")[-500:])
+
+    sockets: list[dict] = []
+    current: dict | None = None
+    for raw in (proc.stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) >= 4 and ":" in parts[2] and ":" in parts[3]:
+            local = _parse_ss_endpoint(parts[2])
+            peer = _parse_ss_endpoint(parts[3])
+            current = None
+            if local and peer:
+                local_ip, local_port = local
+                peer_ip, peer_port = peer
+                if peer_ip in known_ips and not _is_loopback_ip(local_ip) and not _is_loopback_ip(peer_ip):
+                    current = {
+                        "key": f"{local_ip}:{local_port}>{peer_ip}:{peer_port}",
+                        "ip": peer_ip,
+                        "local_ip": local_ip,
+                        "local_port": local_port,
+                        "peer_port": peer_port,
+                        "bytes_sent": 0,
+                        "bytes_received": 0,
+                    }
+                    sockets.append(current)
+            continue
+
+        if current is None:
+            continue
+        sent_match = _SS_BYTES_SENT_RE.search(line)
+        received_match = _SS_BYTES_RECEIVED_RE.search(line)
+        if sent_match:
+            current["bytes_sent"] = int(sent_match.group("value"))
+        if received_match:
+            current["bytes_received"] = int(received_match.group("value"))
+
+    with LOCK:
+        previous_samples = dict(SOCKET_TRAFFIC_SAMPLES)
+
+    by_ip: dict[str, dict] = {}
+    next_samples: dict[str, dict] = {}
+    for item in sockets:
+        key = str(item.get("key") or "")
+        ip = str(item.get("ip") or "")
+        if not key or not ip:
+            continue
+        sent = int(item.get("bytes_sent") or 0)
+        received = int(item.get("bytes_received") or 0)
+        previous = previous_samples.get(key) if isinstance(previous_samples.get(key), dict) else {}
+        previous_ts = float(previous.get("ts") or 0.0)
+        previous_sent = int(previous.get("bytes_sent") or 0)
+        previous_received = int(previous.get("bytes_received") or 0)
+        delta_seconds = max(0.001, now - previous_ts) if previous_ts > 0 else 0.0
+        delta_sent = sent - previous_sent if previous_ts > 0 and sent >= previous_sent else 0
+        delta_received = received - previous_received if previous_ts > 0 and received >= previous_received else 0
+        down_bps = int((delta_sent * 8) / delta_seconds) if delta_seconds > 0 else None
+        up_bps = int((delta_received * 8) / delta_seconds) if delta_seconds > 0 else None
+
+        entry = by_ip.setdefault(
+            ip,
+            {
+                "ip": ip,
+                "connection_count": 0,
+                "socket_bytes_sent": 0,
+                "socket_bytes_received": 0,
+                "delta_down_bytes": 0,
+                "delta_up_bytes": 0,
+                "load_down_bps": 0,
+                "load_up_bps": 0,
+                "load_bps": 0,
+                "local_ports": {},
+                "checked_at_ts": now,
+                "checked_at": utc_iso(now),
+                "source": "ss_tcp_info",
+            },
+        )
+        entry["connection_count"] = int(entry.get("connection_count") or 0) + 1
+        entry["socket_bytes_sent"] = int(entry.get("socket_bytes_sent") or 0) + sent
+        entry["socket_bytes_received"] = int(entry.get("socket_bytes_received") or 0) + received
+        entry["delta_down_bytes"] = int(entry.get("delta_down_bytes") or 0) + max(0, delta_sent)
+        entry["delta_up_bytes"] = int(entry.get("delta_up_bytes") or 0) + max(0, delta_received)
+        if down_bps is not None:
+            entry["load_down_bps"] = int(entry.get("load_down_bps") or 0) + max(0, down_bps)
+        if up_bps is not None:
+            entry["load_up_bps"] = int(entry.get("load_up_bps") or 0) + max(0, up_bps)
+        entry["load_bps"] = int(entry.get("load_down_bps") or 0) + int(entry.get("load_up_bps") or 0)
+        local_ports = entry.setdefault("local_ports", {})
+        local_port_key = str(int(item.get("local_port") or 0))
+        if local_port_key != "0":
+            local_ports[local_port_key] = int(local_ports.get(local_port_key) or 0) + 1
+
+        next_samples[key] = {
+            "ts": now,
+            "ip": ip,
+            "bytes_sent": sent,
+            "bytes_received": received,
+        }
+
+    for entry in by_ip.values():
+        ports = sorted(
+            [
+                {"port": int(port), "connection_count": int(count)}
+                for port, count in (entry.get("local_ports") or {}).items()
+                if str(port).isdigit()
+            ],
+            key=lambda item: int(item.get("connection_count") or 0),
+            reverse=True,
+        )
+        entry["local_ports"] = ports[:10]
+        entry["is_active"] = int(entry.get("load_bps") or 0) >= PER_IP_ACTIVE_BPS
+        entry["is_heavy"] = int(entry.get("load_bps") or 0) >= PER_IP_HEAVY_BPS
+
+    with LOCK:
+        SOCKET_TRAFFIC_SAMPLES.clear()
+        SOCKET_TRAFFIC_SAMPLES.update(next_samples)
+        max_history_age = max([*ABUSE_MULTI_IP_WINDOWS, WINDOW_SECONDS]) + max(STATS_INTERVAL * 3, 180.0)
+        history_cutoff = now - max_history_age
+        for ip, entry in by_ip.items():
+            IP_TRAFFIC[ip] = dict(entry)
+            history = IP_TRAFFIC_HISTORY.setdefault(ip, [])
+            history.append(
+                {
+                    "ts": now,
+                    "load_bps": int(entry.get("load_bps") or 0),
+                    "load_down_bps": int(entry.get("load_down_bps") or 0),
+                    "load_up_bps": int(entry.get("load_up_bps") or 0),
+                    "delta_down_bytes": int(entry.get("delta_down_bytes") or 0),
+                    "delta_up_bytes": int(entry.get("delta_up_bytes") or 0),
+                    "connection_count": int(entry.get("connection_count") or 0),
+                }
+            )
+            history[:] = [
+                sample
+                for sample in history
+                if isinstance(sample, dict) and float(sample.get("ts") or 0.0) >= history_cutoff
+            ][-200:]
+
+    return by_ip
+
+
 def query_xray_stats(pattern: str) -> dict:
     proc = subprocess.run(
         [
@@ -1182,6 +1601,7 @@ def query_xray_stats(pattern: str) -> dict:
 
 
 def poll_xray_stats_once() -> None:
+    global LAST_ERROR
     now = time.time()
     source = "xray_stats_inbound"
     payload = query_xray_stats("inbound>>>")
@@ -1199,6 +1619,12 @@ def poll_xray_stats_once() -> None:
 
     if isinstance(user_payload, dict):
         update_user_traffic(extract_user_traffic(user_payload), now)
+
+    try:
+        query_socket_ip_traffic(now)
+    except Exception as exc:
+        with LOCK:
+            LAST_ERROR = f"socket_traffic:{type(exc).__name__}: {exc}"
 
     with LOCK:
         previous_total = int(TRAFFIC.get("traffic_total_bytes") or 0)
@@ -1271,6 +1697,7 @@ def snapshot(window_seconds: int | None = None) -> dict:
             "email": email,
             "ips": ips,
             "traffic": user_traffic.get(email) if isinstance(user_traffic.get(email), dict) else {},
+            "per_ip_traffic": _per_ip_traffic_for_ips(ips, now, [window]),
             "last_seen": last_seen,
             "last_seen_at": utc_iso(last_seen),
             "last_seen_age_seconds": max(0, int(now - last_seen)),
