@@ -21,6 +21,7 @@ XRAY_MANAGED_INBOUNDS_FILE = Path(os.environ.get("XRAY_CORE_MANAGED_INBOUNDS_FIL
 XRAY_SERVICE_NAME = os.environ.get("XRAY_CORE_SERVICE_NAME", "vpnbot-xray.service")
 XRAY_SYNC_SCRIPT = os.environ.get("XRAY_SYNC_SCRIPT", "/usr/local/bin/vpnbot-xray-sync-routes")
 XRAY_RESERVED_PORTS_SYSCTL_FILE = Path(os.environ.get("VPNBOT_XRAY_RESERVED_PORTS_SYSCTL_FILE", "/etc/sysctl.d/99-vpnbot-xray-reserved-ports.conf"))
+XRAY_RESERVED_EXTRA_PORTS = os.environ.get("VPNBOT_XRAY_RESERVED_EXTRA_PORTS", "10086")
 DEFAULT_TLS_CERT = os.environ.get("NGINX_SSL_CERT", "/etc/nginx/ssl/vpnbot/fullchain.pem")
 DEFAULT_TLS_KEY = os.environ.get("NGINX_SSL_KEY", "/etc/nginx/ssl/vpnbot/privkey.pem")
 PORT_MIN = 20000
@@ -325,7 +326,7 @@ def current_reserved_ports() -> set[int]:
 
 
 def sync_xray_reserved_ports(rows: list[dict]) -> None:
-    ports: set[int] = set()
+    ports: set[int] = parse_reserved_ports(XRAY_RESERVED_EXTRA_PORTS)
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -340,7 +341,7 @@ def sync_xray_reserved_ports(rows: list[dict]) -> None:
 
     XRAY_RESERVED_PORTS_SYSCTL_FILE.parent.mkdir(parents=True, exist_ok=True)
     XRAY_RESERVED_PORTS_SYSCTL_FILE.write_text(
-        "# VPnBot standalone Xray-core managed inbound ports.\n"
+        "# VPnBot standalone Xray-core managed inbound/control ports.\n"
         "# These ports must not be reused as ephemeral source ports by nginx, MTProxy, or other local clients.\n"
         f"net.ipv4.ip_local_reserved_ports={format_reserved_ports(ports)}\n",
         encoding="utf-8",

@@ -168,6 +168,7 @@ XRAY_CORE_SMOKE_LINK=""
 INSTALL_VRAY_CURL_COMMAND='bash <(curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/refs/heads/main/install.sh?ts=$(date +%s)")'
 VPNBOT_NETWORK_SYSCTL_FILE="${VPNBOT_NETWORK_SYSCTL_FILE:-/etc/sysctl.d/99-vpnbot-network.conf}"
 VPNBOT_XRAY_RESERVED_PORTS_SYSCTL_FILE="${VPNBOT_XRAY_RESERVED_PORTS_SYSCTL_FILE:-/etc/sysctl.d/99-vpnbot-xray-reserved-ports.conf}"
+VPNBOT_XRAY_RESERVED_EXTRA_PORTS="${VPNBOT_XRAY_RESERVED_EXTRA_PORTS:-10086}"
 VPNBOT_NF_CONNTRACK_MAX="${VPNBOT_NF_CONNTRACK_MAX:-1048576}"
 
 RED='\033[0;31m'
@@ -1906,21 +1907,51 @@ set -euo pipefail
 
 managed_file=${XRAY_CORE_MANAGED_INBOUNDS_FILE@Q}
 sysctl_file=${VPNBOT_XRAY_RESERVED_PORTS_SYSCTL_FILE@Q}
+extra_ports=${VPNBOT_XRAY_RESERVED_EXTRA_PORTS@Q}
 
-ports="\$(python3 - "\${managed_file}" <<'PY'
+ports="\$(python3 - "\${managed_file}" "\${extra_ports}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
+extra_raw = sys.argv[2] if len(sys.argv) > 2 else ""
+ports = set()
+
+def parse(raw: str) -> set[int]:
+    result = set()
+    for chunk in str(raw or "").replace(" ", "").split(","):
+        if not chunk:
+            continue
+        if "-" in chunk:
+            left, _, right = chunk.partition("-")
+            try:
+                start = int(left)
+                end = int(right)
+            except Exception:
+                continue
+            if start > end:
+                start, end = end, start
+            result.update(range(max(1, start), min(65535, end) + 1))
+            continue
+        try:
+            value = int(chunk)
+        except Exception:
+            continue
+        if 1 <= value <= 65535:
+            result.add(value)
+    return result
+
+ports |= parse(extra_raw)
 if not path.exists():
+    print(",".join(str(port) for port in sorted(ports)))
     raise SystemExit(0)
 try:
     payload = json.loads(path.read_text(encoding="utf-8"))
 except Exception:
+    print(",".join(str(port) for port in sorted(ports)))
     raise SystemExit(0)
 rows = payload.get("inbounds") if isinstance(payload, dict) else []
-ports = set()
 if isinstance(rows, list):
     for row in rows:
         if not isinstance(row, dict):
@@ -1941,7 +1972,7 @@ fi
 
 mkdir -p "\$(dirname "\${sysctl_file}")"
 {
-    echo "# VPnBot standalone Xray-core managed inbound ports."
+    echo "# VPnBot standalone Xray-core managed inbound/control ports."
     echo "# These ports must not be reused as ephemeral source ports by nginx, MTProxy, or other local clients."
     echo "net.ipv4.ip_local_reserved_ports=\${ports}"
 } > "\${sysctl_file}"

@@ -26,6 +26,7 @@ STATE_DIR = Path(os.environ.get("XRAY_SYNC_STATE_DIR", "/var/lib/vpnbot-xray-syn
 REPORT_FILE = STATE_DIR / "last_sync_report.txt"
 EXTRA_STREAM_ROUTES = Path("/etc/vpnbot-shared-stream-routes.json")
 RESERVED_PORTS_SYSCTL_FILE = Path(os.environ.get("VPNBOT_XRAY_RESERVED_PORTS_SYSCTL_FILE", "/etc/sysctl.d/99-vpnbot-xray-reserved-ports.conf"))
+RESERVED_EXTRA_PORTS = os.environ.get("VPNBOT_XRAY_RESERVED_EXTRA_PORTS", "10086")
 NGINX_AUTOSTART = str(os.environ.get("VPNBOT_NGINX_AUTOSTART", "1")).strip().lower() not in {"0", "false", "no", "off"}
 
 MARK_RE = re.compile(r"\[(?P<value>direct|shared:\d+|\d+)\]", re.IGNORECASE)
@@ -442,13 +443,13 @@ def managed_inbound_ports(rows: list[dict]) -> set[int]:
 
 
 def sync_xray_reserved_ports(rows: list[dict], report_lines: list[str] | None = None) -> None:
-    ports = managed_inbound_ports(rows)
+    ports = managed_inbound_ports(rows) | parse_reserved_ports(RESERVED_EXTRA_PORTS)
     if not ports:
         return
 
     RESERVED_PORTS_SYSCTL_FILE.parent.mkdir(parents=True, exist_ok=True)
     RESERVED_PORTS_SYSCTL_FILE.write_text(
-        "# VPnBot standalone Xray-core managed inbound ports.\n"
+        "# VPnBot standalone Xray-core managed inbound/control ports.\n"
         "# These ports must not be reused as ephemeral source ports by nginx, MTProxy, or other local clients.\n"
         f"net.ipv4.ip_local_reserved_ports={format_reserved_ports(ports)}\n",
         encoding="utf-8",
