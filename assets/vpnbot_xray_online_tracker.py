@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-TRACKER_VERSION = "2026-04-27.13"
+TRACKER_VERSION = "2026-04-27.14"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
 BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
@@ -172,6 +172,11 @@ def script_sha256() -> str:
 
 def health_payload() -> dict:
     per_ip_status = _socket_traffic_status_snapshot(time.time())
+    top_rows = [
+        item
+        for item in rows
+        if int(item.get("connection_count") or 0) > 0 or int(item.get("load_bps") or 0) > 0
+    ][:10]
     return {
         "ok": True,
         "source": "vpnbot_xray_online_tracker",
@@ -1022,7 +1027,7 @@ def _per_ip_traffic_for_ips(ips: list[str], now: float, windows: list[int]) -> d
         "total_down_bps": int(total_down_bps),
         "top_ip_bps": int(top_bps),
         "top_ip_share": round(top_share, 4),
-        "top_ips": rows[:10],
+        "top_ips": top_rows,
     }
 
 
