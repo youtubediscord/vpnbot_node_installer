@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-TRACKER_VERSION = "2026-04-27.11"
+TRACKER_VERSION = "2026-04-27.12"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
 BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
@@ -2008,6 +2008,10 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"ok": False, "error": "not_found"})
 
 
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
 STARTED_AT = utc_iso()
 
 
@@ -2017,7 +2021,7 @@ def main() -> None:
     worker.start()
     stats = threading.Thread(target=stats_worker, name="xray-stats-poll", daemon=True)
     stats.start()
-    server = ThreadingHTTPServer((BIND_HOST, BIND_PORT), Handler)
+    server = ReusableThreadingHTTPServer((BIND_HOST, BIND_PORT), Handler)
     server.serve_forever()
 
 
