@@ -586,11 +586,12 @@ def _multi_ip_risk_score(ip_count: int, prefix_count: int, event_count: int) -> 
 
 def _window_ip_stats(ips_raw: dict, now: float, windows: list[int], history_ips: dict) -> dict[str, dict]:
     out: dict[str, dict] = {}
+    sorted_ips = sorted(ips_raw.items(), key=lambda item: float(item[1]), reverse=True)
     for window in windows:
         cutoff = now - int(window)
         ips = [
             ip
-            for ip, seen in sorted(ips_raw.items(), key=lambda item: float(item[1]), reverse=True)
+            for ip, seen in sorted_ips
             if float(seen) >= cutoff
         ][:MAX_IPS_PER_USER]
         prefixes = sorted({prefix for ip in ips for prefix in [ip_prefix(ip)] if prefix})
@@ -643,14 +644,7 @@ def _event_stats_by_window(events: list[dict], now: float, windows: list[int]) -
     return out
 
 
-def _traffic_window_stats(email: str, now: float, windows: list[int]) -> dict[str, dict]:
-    with LOCK:
-        samples = [
-            dict(item)
-            for item in USER_TRAFFIC_HISTORY.get(email, [])
-            if isinstance(item, dict)
-        ]
-
+def _traffic_window_stats_from_samples(samples: list[dict], now: float, windows: list[int]) -> dict[str, dict]:
     samples.sort(key=lambda item: float(item.get("ts") or 0.0))
     out: dict[str, dict] = {}
     latest = samples[-1] if samples else None
@@ -710,6 +704,16 @@ def _traffic_window_stats(email: str, now: float, windows: list[int]) -> dict[st
     return out
 
 
+def _traffic_window_stats(email: str, now: float, windows: list[int]) -> dict[str, dict]:
+    with LOCK:
+        samples = [
+            dict(item)
+            for item in USER_TRAFFIC_HISTORY.get(email, [])
+            if isinstance(item, dict)
+        ]
+    return _traffic_window_stats_from_samples(samples, now, windows)
+
+
 def _traffic_load_level(load_bps: int | None, window_total_bytes: int) -> str:
     load = int(load_bps or 0)
     window_total = int(window_total_bytes or 0)
@@ -765,11 +769,23 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
         client_items = [(email, dict(entry)) for email, entry in CLIENTS.items()]
         history_users = json.loads(json.dumps(MULTI_IP_HISTORY.get("users") or {}, ensure_ascii=False))
         traffic_by_email = json.loads(json.dumps(USER_TRAFFIC, ensure_ascii=False))
+        traffic_history_by_email = {
+            str(email): [dict(sample) for sample in samples if isinstance(sample, dict)]
+            for email, samples in USER_TRAFFIC_HISTORY.items()
+            if isinstance(samples, list)
+        }
         abuse_events = [
             dict(item)
             for item in ABUSE_EVENTS
             if float(item.get("ts") or 0.0) >= history_cutoff
         ]
+
+    abuse_events_by_email: dict[str, list[dict]] = {}
+    for item in abuse_events:
+        email = str(item.get("email") or "").strip()
+        if not email:
+            continue
+        abuse_events_by_email.setdefault(email, []).append(item)
 
     users = []
     counters = {"observe": 0, "suspicious": 0, "high": 0, "critical": 0}
@@ -796,15 +812,15 @@ def build_multi_ip_abuse(window_seconds: int | None = None) -> dict:
         prefix_count = int(recent_window.get("prefix_count") or 0)
         new_ip_count = int(recent_window.get("new_ip_count") or 0)
         known_ip_count = int(recent_window.get("known_ip_count") or 0)
-        email_events = [
-            item
-            for item in abuse_events
-            if str(item.get("email") or "").strip() == email
-        ]
+        email_events = abuse_events_by_email.get(email) or []
         event_windows = _event_stats_by_window(email_events, now, windows)
         event_info = event_windows.get(main_window) or {}
         traffic = traffic_by_email.get(email) if isinstance(traffic_by_email.get(email), dict) else {}
-        traffic_windows = _traffic_window_stats(email, now, windows)
+        traffic_windows = _traffic_window_stats_from_samples(
+            traffic_history_by_email.get(email) or [],
+            now,
+            windows,
+        )
         traffic_window = traffic_windows.get(main_window) or {}
         load_bps = (
             int(traffic.get("load_bps"))
