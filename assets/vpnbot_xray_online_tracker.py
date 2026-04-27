@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-TRACKER_VERSION = "2026-04-27.5"
+TRACKER_VERSION = "2026-04-27.6"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
 BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
@@ -351,9 +351,7 @@ def ip_prefix(value: str) -> str | None:
 
 
 def extract_source_ip(line: str) -> str | None:
-    match = re.match(r"^\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+(?P<body>.*)$", line)
-    body = match.group("body") if match else line
-    before_accepted = body.split(" accepted ", 1)[0]
+    before_accepted = line.split(" accepted ", 1)[0]
 
     for token in reversed(re.split(r"[\s,;]+", before_accepted)):
         ip = normalize_ip(token)
@@ -444,20 +442,22 @@ def remember_abuse_event(email: str, ts: float, source_ip: str | None, target: d
         del ABUSE_EVENTS[:-ABUSE_AUDIT_MAX_EVENTS]
 
 
-def process_line(raw: str) -> None:
+def process_line(raw: str, *, parse_timestamp: bool = False) -> None:
     global LAST_LINE_AT
 
     line = str(raw or "").strip()
     if " accepted " not in line or "email:" not in line:
         return
 
-    ts_match = re.search(r"^(?P<ts>\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})(?:\.\d+)?\s+", line)
-    email_match = re.search(r"\bemail:\s*(?P<email>\S+)", line)
-    if not ts_match or not email_match:
-        return
+    now = time.time()
+    ts = now
+    if parse_timestamp:
+        ts_match = _LOG_TS_RE.search(line)
+        if ts_match:
+            ts = parse_xray_ts(ts_match.group("ts")) or now
 
-    ts = parse_xray_ts(ts_match.group("ts"))
-    if ts is None:
+    email_match = _LOG_EMAIL_RE.search(line)
+    if not email_match:
         return
 
     email = email_match.group("email").strip().strip("\"'[](){}<>")
@@ -466,7 +466,6 @@ def process_line(raw: str) -> None:
 
     source_ip = extract_source_ip(line)
     target = extract_target(line) if ABUSE_AUDIT_ENABLED else None
-    now = time.time()
     with LOCK:
         entry = CLIENTS.setdefault(email, {"email": email, "ips": {}, "last_seen": 0.0})
         entry["last_seen"] = max(float(entry.get("last_seen") or 0.0), ts)
@@ -1419,6 +1418,8 @@ def update_user_traffic(user_totals: dict[str, dict], now: float) -> None:
             ][-200:]
 
 
+_LOG_TS_RE = re.compile(r"^(?P<ts>\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})(?:\.\d+)?\s+")
+_LOG_EMAIL_RE = re.compile(r"\bemail:\s*(?P<email>\S+)")
 _SS_ENDPOINT_RE = re.compile(r"^(?P<host>.+):(?P<port>\d+)$")
 _SS_BYTES_SENT_RE = re.compile(r"\bbytes_sent:(?P<value>\d+)\b")
 _SS_BYTES_RECEIVED_RE = re.compile(r"\bbytes_received:(?P<value>\d+)\b")
@@ -1793,7 +1794,7 @@ def read_bootstrap_tail(path: Path) -> int:
             fh.seek(size - read_size)
         text = fh.read().decode("utf-8", errors="replace")
     for line in text.splitlines():
-        process_line(line)
+        process_line(line, parse_timestamp=True)
     return size
 
 
