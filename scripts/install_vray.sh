@@ -2070,6 +2070,11 @@ Environment=XRAY_ONLINE_BOOTSTRAP_BYTES=${XRAY_ONLINE_TRACKER_BOOTSTRAP_BYTES}
 Environment=XRAY_ONLINE_STATS_INTERVAL_SECONDS=${XRAY_ONLINE_TRACKER_STATS_INTERVAL_SECONDS}
 Environment=XRAY_ONLINE_XRAY_BIN=${XRAY_CORE_BIN}
 Environment=XRAY_ONLINE_XRAY_API_SERVER=${XRAY_CORE_API_SERVER}
+# Detailed /abuse target audit is intentionally locked off: it parses target/port
+# details from access.log and was too expensive on busy nodes. Multi-IP abuse
+# detection uses IP churn plus per-IP socket traffic instead.
+Environment=XRAY_ABUSE_AUDIT_ENABLED=0
+Environment=XRAY_ABUSE_AUDIT_FORCE_ENABLE=0
 Environment=XRAY_ABUSE_AUDIT_WINDOW_SECONDS=${XRAY_ABUSE_AUDIT_WINDOW_SECONDS}
 Environment=XRAY_ABUSE_AUDIT_MAX_EVENTS=${XRAY_ABUSE_AUDIT_MAX_EVENTS}
 Environment=XRAY_ABUSE_AUDIT_TOP_LIMIT=${XRAY_ABUSE_AUDIT_TOP_LIMIT}

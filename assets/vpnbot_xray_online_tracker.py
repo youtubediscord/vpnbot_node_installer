@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-TRACKER_VERSION = "2026-04-27.9"
+TRACKER_VERSION = "2026-04-27.10"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
 BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
@@ -47,14 +47,25 @@ PER_IP_TRAFFIC_STALE_SECONDS = max(
     15.0,
     min(float(os.environ.get("XRAY_ABUSE_PER_IP_TRAFFIC_STALE_SECONDS", "180")), 900.0),
 )
+TRUTHY_VALUES = {"1", "true", "yes", "on"}
 PER_IP_ACTIVE_BPS = max(0, int(os.environ.get("XRAY_ABUSE_PER_IP_ACTIVE_BPS", "1000000")))
 PER_IP_HEAVY_BPS = max(PER_IP_ACTIVE_BPS, int(os.environ.get("XRAY_ABUSE_PER_IP_HEAVY_BPS", "5000000")))
-ABUSE_AUDIT_ENABLED = str(os.environ.get("XRAY_ABUSE_AUDIT_ENABLED", "0")).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+ABUSE_AUDIT_REQUESTED = str(os.environ.get("XRAY_ABUSE_AUDIT_ENABLED", "0")).strip().lower() in TRUTHY_VALUES
+# Не включать в production обычной переменной XRAY_ABUSE_AUDIT_ENABLED.
+# Этот аудит хранит цели/порты по каждой строке access.log и оказался слишком
+# дорогим на горячих нодах. Для multi-IP abuse достаточно смены IP и текущего
+# per-IP трафика, поэтому подробный target-аудит заперт отдельным force-флагом.
+ABUSE_AUDIT_FORCE_ENABLE = (
+    str(os.environ.get("XRAY_ABUSE_AUDIT_FORCE_ENABLE", "0")).strip().lower() in TRUTHY_VALUES
+)
+ABUSE_AUDIT_ENABLED = ABUSE_AUDIT_REQUESTED and ABUSE_AUDIT_FORCE_ENABLE
+ABUSE_AUDIT_DISABLED_REASON = (
+    "locked_high_overhead"
+    if ABUSE_AUDIT_REQUESTED and not ABUSE_AUDIT_FORCE_ENABLE
+    else "default_off_high_overhead"
+    if not ABUSE_AUDIT_ENABLED
+    else ""
+)
 ABUSE_HISTORY_TOUCH_INTERVAL_SECONDS = max(
     0.0,
     min(float(os.environ.get("XRAY_ABUSE_HISTORY_TOUCH_INTERVAL_SECONDS", "5")), 300.0),
@@ -159,6 +170,12 @@ def health_payload() -> dict:
             "abuse_multi_ip": True,
             "multi_ip_cache": ABUSE_MULTI_IP_CACHE_TTL_SECONDS > 0,
             "per_ip_traffic": True,
+        },
+        "abuse_audit": {
+            "enabled": ABUSE_AUDIT_ENABLED,
+            "requested": ABUSE_AUDIT_REQUESTED,
+            "force_enabled": ABUSE_AUDIT_FORCE_ENABLE,
+            "disabled_reason": ABUSE_AUDIT_DISABLED_REASON,
         },
         "multi_ip_cache_ttl_seconds": ABUSE_MULTI_IP_CACHE_TTL_SECONDS,
         "abuse_history_touch_interval_seconds": ABUSE_HISTORY_TOUCH_INTERVAL_SECONDS,
