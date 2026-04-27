@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-TRACKER_VERSION = "2026-04-27.7"
+TRACKER_VERSION = "2026-04-27.8"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
 BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
@@ -38,6 +38,10 @@ MAX_IPS_PER_USER = max(1, min(int(os.environ.get("XRAY_ONLINE_MAX_IPS_PER_USER",
 XRAY_BIN = os.environ.get("XRAY_ONLINE_XRAY_BIN", "/opt/vpnbot/xray-core/bin/xray")
 XRAY_API_SERVER = os.environ.get("XRAY_ONLINE_XRAY_API_SERVER", "127.0.0.1:10085")
 STATS_INTERVAL = max(5.0, min(float(os.environ.get("XRAY_ONLINE_STATS_INTERVAL_SECONDS", "60")), 300.0))
+USER_STATS_INTERVAL = max(
+    STATS_INTERVAL,
+    min(float(os.environ.get("XRAY_ONLINE_USER_STATS_INTERVAL_SECONDS", "300")), 1800.0),
+)
 SS_BIN = os.environ.get("XRAY_ONLINE_SS_BIN", "ss")
 PER_IP_TRAFFIC_STALE_SECONDS = max(
     15.0,
@@ -124,6 +128,7 @@ LAST_LINE_AT = 0.0
 LAST_ERROR = ""
 PROCESSED_LOG_LINES = 0
 SKIPPED_LOG_LINES = 0
+LAST_USER_STATS_AT = 0.0
 TRAFFIC = {
     "traffic_source": "xray_stats_unavailable",
     "traffic_up_bytes": 0,
@@ -175,6 +180,7 @@ def health_payload() -> dict:
         "processed_log_lines": PROCESSED_LOG_LINES,
         "skipped_log_lines": SKIPPED_LOG_LINES,
         "stats_interval_seconds": STATS_INTERVAL,
+        "user_stats_interval_seconds": USER_STATS_INTERVAL,
         "xray_api_server": XRAY_API_SERVER,
     }
 
@@ -1662,19 +1668,22 @@ def query_xray_stats(pattern: str) -> dict:
 
 
 def poll_xray_stats_once() -> None:
-    global LAST_ERROR
+    global LAST_ERROR, LAST_USER_STATS_AT
     now = time.time()
     source = "xray_stats_inbound"
     payload = query_xray_stats("inbound>>>")
     totals = extract_traffic_totals(payload, prefix="inbound>>>")
     user_payload = None
-    if int(totals.get("traffic_total_bytes") or 0) <= 0:
+    should_query_user_stats = now - LAST_USER_STATS_AT >= USER_STATS_INTERVAL
+    if int(totals.get("traffic_total_bytes") or 0) <= 0 and should_query_user_stats:
         source = "xray_stats_user_fallback"
         user_payload = query_xray_stats("user>>>")
+        LAST_USER_STATS_AT = now
         totals = extract_traffic_totals(user_payload, prefix="user>>>")
-    else:
+    elif should_query_user_stats:
         try:
             user_payload = query_xray_stats("user>>>")
+            LAST_USER_STATS_AT = now
         except Exception:
             user_payload = None
 
