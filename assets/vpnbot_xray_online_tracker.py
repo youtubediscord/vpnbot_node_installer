@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-TRACKER_VERSION = "2026-04-27.10"
+TRACKER_VERSION = "2026-04-27.11"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
 BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
@@ -46,6 +46,10 @@ SS_BIN = os.environ.get("XRAY_ONLINE_SS_BIN", "ss")
 PER_IP_TRAFFIC_STALE_SECONDS = max(
     15.0,
     min(float(os.environ.get("XRAY_ABUSE_PER_IP_TRAFFIC_STALE_SECONDS", "180")), 900.0),
+)
+PER_IP_TRAFFIC_MAX_SS_LINES = max(
+    1000,
+    min(int(os.environ.get("XRAY_ABUSE_PER_IP_TRAFFIC_MAX_SS_LINES", "50000")), 500000),
 )
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
 PER_IP_ACTIVE_BPS = max(0, int(os.environ.get("XRAY_ABUSE_PER_IP_ACTIVE_BPS", "1000000")))
@@ -185,6 +189,7 @@ def health_payload() -> dict:
             "active_bps": PER_IP_ACTIVE_BPS,
             "heavy_bps": PER_IP_HEAVY_BPS,
             "stale_seconds": PER_IP_TRAFFIC_STALE_SECONDS,
+            "max_ss_lines": PER_IP_TRAFFIC_MAX_SS_LINES,
         },
         "access_log": str(ACCESS_LOG),
         "script_path": str(Path(__file__)),
@@ -1508,10 +1513,46 @@ def _known_recent_client_ips(now: float) -> set[str]:
     return out
 
 
+def _established_socket_count_limited(limit: int) -> tuple[int, bool]:
+    """Посчитать TCP-сокеты до лимита перед дорогим ss -i обходом."""
+    proc = subprocess.Popen(
+        [SS_BIN, "-Htn", "state", "established"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    count = 0
+    limited = False
+    try:
+        assert proc.stdout is not None
+        for _line in proc.stdout:
+            count += 1
+            if count > limit:
+                limited = True
+                proc.kill()
+                break
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+    return count, limited
+
+
 def query_socket_ip_traffic(now: float) -> dict[str, dict]:
     known_ips = _known_recent_client_ips(now)
     if not known_ips:
         return {}
+
+    socket_rows, socket_rows_limited = _established_socket_count_limited(PER_IP_TRAFFIC_MAX_SS_LINES)
+    if socket_rows_limited:
+        raise RuntimeError(
+            f"socket_traffic_skipped: established TCP rows exceed "
+            f"{PER_IP_TRAFFIC_MAX_SS_LINES} (seen {socket_rows})"
+        )
 
     proc = subprocess.run(
         [SS_BIN, "-Htin", "state", "established"],
