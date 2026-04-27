@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-TRACKER_VERSION = "2026-04-27.6"
+TRACKER_VERSION = "2026-04-27.7"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
 BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
@@ -25,6 +25,14 @@ POLL_INTERVAL = max(0.05, min(float(os.environ.get("XRAY_ONLINE_POLL_INTERVAL", 
 MAINTENANCE_INTERVAL = max(
     1.0,
     min(float(os.environ.get("XRAY_ONLINE_MAINTENANCE_INTERVAL_SECONDS", "5")), 60.0),
+)
+MAX_LOG_LINES_PER_SECOND = max(
+    50,
+    min(int(os.environ.get("XRAY_ONLINE_MAX_LOG_LINES_PER_SECOND", "300")), 5000),
+)
+LOG_SAMPLE_EVERY_OVER_LIMIT = max(
+    0,
+    min(int(os.environ.get("XRAY_ONLINE_LOG_SAMPLE_EVERY_OVER_LIMIT", "25")), 1000),
 )
 MAX_IPS_PER_USER = max(1, min(int(os.environ.get("XRAY_ONLINE_MAX_IPS_PER_USER", "20")), 100))
 XRAY_BIN = os.environ.get("XRAY_ONLINE_XRAY_BIN", "/opt/vpnbot/xray-core/bin/xray")
@@ -114,6 +122,8 @@ HISTORY_DIRTY = False
 LAST_HISTORY_SAVE_AT = 0.0
 LAST_LINE_AT = 0.0
 LAST_ERROR = ""
+PROCESSED_LOG_LINES = 0
+SKIPPED_LOG_LINES = 0
 TRAFFIC = {
     "traffic_source": "xray_stats_unavailable",
     "traffic_up_bytes": 0,
@@ -160,6 +170,10 @@ def health_payload() -> dict:
         "bind": f"{BIND_HOST}:{BIND_PORT}",
         "window_seconds": WINDOW_SECONDS,
         "maintenance_interval_seconds": MAINTENANCE_INTERVAL,
+        "max_log_lines_per_second": MAX_LOG_LINES_PER_SECOND,
+        "log_sample_every_over_limit": LOG_SAMPLE_EVERY_OVER_LIMIT,
+        "processed_log_lines": PROCESSED_LOG_LINES,
+        "skipped_log_lines": SKIPPED_LOG_LINES,
         "stats_interval_seconds": STATS_INTERVAL,
         "xray_api_server": XRAY_API_SERVER,
     }
@@ -443,7 +457,7 @@ def remember_abuse_event(email: str, ts: float, source_ip: str | None, target: d
 
 
 def process_line(raw: str, *, parse_timestamp: bool = False) -> None:
-    global LAST_LINE_AT
+    global LAST_LINE_AT, PROCESSED_LOG_LINES
 
     line = str(raw or "").strip()
     if " accepted " not in line or "email:" not in line:
@@ -478,6 +492,7 @@ def process_line(raw: str, *, parse_timestamp: bool = False) -> None:
             remember_multi_ip_history(email, ts, source_ip)
         remember_abuse_event(email, ts, source_ip, target)
         LAST_LINE_AT = now
+        PROCESSED_LOG_LINES += 1
 
 
 def purge_stale(now: float | None = None) -> None:
@@ -1799,12 +1814,14 @@ def read_bootstrap_tail(path: Path) -> int:
 
 
 def tail_access_log() -> None:
-    global LAST_ERROR
+    global LAST_ERROR, SKIPPED_LOG_LINES
 
     fh = None
     inode = None
     position = 0
     last_maintenance_at = 0.0
+    line_window_started_at = time.time()
+    line_seen_in_window = 0
     while True:
         try:
             stat = ACCESS_LOG.stat()
@@ -1823,7 +1840,23 @@ def tail_access_log() -> None:
 
             line = fh.readline()
             if line:
-                process_line(line)
+                now = time.time()
+                if now - line_window_started_at >= 1.0:
+                    line_window_started_at = now
+                    line_seen_in_window = 0
+                line_seen_in_window += 1
+                should_process = line_seen_in_window <= MAX_LOG_LINES_PER_SECOND
+                if (
+                    not should_process
+                    and LOG_SAMPLE_EVERY_OVER_LIMIT > 0
+                    and line_seen_in_window % LOG_SAMPLE_EVERY_OVER_LIMIT == 0
+                ):
+                    should_process = True
+                if should_process:
+                    process_line(line)
+                else:
+                    with LOCK:
+                        SKIPPED_LOG_LINES += 1
                 position = fh.tell()
                 continue
 
