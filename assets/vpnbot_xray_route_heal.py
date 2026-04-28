@@ -220,8 +220,8 @@ def heal_routing(path: Path, share_dir: Path) -> tuple[dict[str, Any], dict[str,
     return payload, summary, before != after
 
 
-def run(cmd: list[str], *, timeout: int = 60) -> tuple[int, str]:
-    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+def run(cmd: list[str], *, timeout: int = 60, env: dict[str, str] | None = None) -> tuple[int, str]:
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, env=env)
     return proc.returncode, proc.stdout.strip()
 
 
@@ -282,7 +282,9 @@ def main() -> int:
 
         needs_restart = bool(geosite_changed or routing_changed)
         if needs_restart and not args.check:
-            code, out = run([str(xray_bin), "run", "-confdir", str(confdir), "-test"], timeout=60)
+            xray_env = os.environ.copy()
+            xray_env["XRAY_LOCATION_ASSET"] = str(share_dir)
+            code, out = run([str(xray_bin), "run", "-confdir", str(confdir), "-test"], timeout=60, env=xray_env)
             report["xray_test_code"] = code
             report["xray_test_tail"] = out[-1000:]
             if code != 0:
