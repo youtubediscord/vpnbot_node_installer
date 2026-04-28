@@ -415,6 +415,40 @@ def cmd_list_inbounds(ns: argparse.Namespace) -> dict[str, Any]:
     return {"ok": True, "inbounds": inbounds, "count": len(inbounds)}
 
 
+def cmd_list_clients_for_audit(ns: argparse.Namespace) -> dict[str, Any]:
+    payload = _load_payload(Path(ns.managed_file))
+    clients_out: list[dict[str, Any]] = []
+    inbound_count = 0
+    for raw in payload.get("inbounds") or []:
+        if not isinstance(raw, dict):
+            continue
+        inbound = _normalize_inbound(raw)
+        inbound_count += 1
+        inbound_id = int(inbound.get("id") or 0)
+        protocol = _normalize_protocol(inbound.get("protocol"))
+        settings = inbound.get("settings") or {}
+        clients = settings.get("clients", []) if isinstance(settings, dict) else []
+        if not isinstance(clients, list):
+            continue
+        for client in clients:
+            if not isinstance(client, dict):
+                continue
+            email = str(client.get("email") or "").strip()
+            client_id = _extract_client_identifier(client, protocol)
+            if not email and not client_id:
+                continue
+            clients_out.append(
+                {
+                    "inbound_id": inbound_id,
+                    "protocol": protocol,
+                    "email": email,
+                    "client_id": client_id,
+                    "sub_id": str(client.get("subId") or "").strip(),
+                }
+            )
+    return {"ok": True, "clients": clients_out, "count": len(clients_out), "inbound_count": inbound_count}
+
+
 def cmd_ensure_client(ns: argparse.Namespace) -> dict[str, Any]:
     path = Path(ns.managed_file)
     with _FileLock(_lock_path(ns)):
@@ -604,6 +638,8 @@ def build_parser() -> argparse.ArgumentParser:
     list_inbounds = subparsers.add_parser("list-inbounds")
     list_inbounds.add_argument("--compact", action="store_true")
 
+    subparsers.add_parser("list-clients-for-audit")
+
     ensure = subparsers.add_parser("ensure-client")
     ensure.add_argument("--inbound-id", required=True, type=int)
     ensure.add_argument("--user-id", required=True, type=int)
@@ -620,6 +656,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if ns.command == "list-inbounds":
             return _json_response(cmd_list_inbounds(ns))
+        if ns.command == "list-clients-for-audit":
+            return _json_response(cmd_list_clients_for_audit(ns))
         if ns.command == "ensure-client":
             return _json_response(cmd_ensure_client(ns))
         if ns.command == "remove-client":
