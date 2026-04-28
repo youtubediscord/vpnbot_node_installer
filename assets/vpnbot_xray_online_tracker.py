@@ -1576,11 +1576,30 @@ def _parse_ss_endpoint(value: str) -> tuple[str, int] | None:
     return ip, port
 
 
-def _is_loopback_ip(value: str) -> bool:
+def _parse_ss_endpoint_fast(value: str) -> tuple[str, int] | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.startswith("[") and "]:" in text:
+        host = text[1:text.index("]:")]
+        port_text = text[text.index("]:") + 2:]
+    else:
+        host, sep, port_text = text.rpartition(":")
+        if not sep:
+            return None
+    host = host.strip().strip("[]").lower()
+    if not host:
+        return None
     try:
-        return ipaddress.ip_address(str(value or "").strip()).is_loopback
+        port = int(port_text)
     except Exception:
-        return False
+        return None
+    return host, port
+
+
+def _is_loopback_ip(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    return text == "::1" or text == "localhost" or text.startswith("127.") or text.startswith("::ffff:127.")
 
 
 def _managed_public_ports() -> set[int]:
@@ -1655,8 +1674,8 @@ def _connection_top_payload(now: float) -> dict:
             parts = raw.split()
             if len(parts) < 4:
                 continue
-            local = _parse_ss_endpoint(parts[2])
-            peer = _parse_ss_endpoint(parts[3])
+            local = _parse_ss_endpoint_fast(parts[2])
+            peer = _parse_ss_endpoint_fast(parts[3])
             if not local or not peer:
                 continue
             local_ip, local_port = local
