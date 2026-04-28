@@ -138,6 +138,14 @@ XRAY_CONN_GUARD_SCAN_MAX_ROWS="${XRAY_CONN_GUARD_SCAN_MAX_ROWS:-80000}"
 XRAY_CONN_GUARD_STATE_DIR="${XRAY_CONN_GUARD_STATE_DIR:-/var/lib/vpnbot-xray-conn-guard}"
 XRAY_CONN_GUARD_BAN_STATE_FILE="${XRAY_CONN_GUARD_BAN_STATE_FILE:-${XRAY_CONN_GUARD_STATE_DIR}/bans.json}"
 XRAY_CONN_GUARD_EVENTS_FILE="${XRAY_CONN_GUARD_EVENTS_FILE:-${XRAY_CONN_GUARD_STATE_DIR}/events.jsonl}"
+VPNBOT_SSH_GUARD_ENABLED="${VPNBOT_SSH_GUARD_ENABLED:-1}"
+VPNBOT_SSH_KEY_ONLY_MODE="${VPNBOT_SSH_KEY_ONLY_MODE:-auto}"
+VPNBOT_SSH_GUARD_CHAIN="${VPNBOT_SSH_GUARD_CHAIN:-VPNBOT_SSH_GUARD}"
+VPNBOT_SSH_GUARD_TRUSTED_IPS="${VPNBOT_SSH_GUARD_TRUSTED_IPS:-144.31.50.172}"
+VPNBOT_SSH_GUARD_PER_SRC_RATE="${VPNBOT_SSH_GUARD_PER_SRC_RATE:-6/min}"
+VPNBOT_SSH_GUARD_PER_SRC_BURST="${VPNBOT_SSH_GUARD_PER_SRC_BURST:-8}"
+VPNBOT_SSH_GUARD_GLOBAL_RATE="${VPNBOT_SSH_GUARD_GLOBAL_RATE:-40/min}"
+VPNBOT_SSH_GUARD_GLOBAL_BURST="${VPNBOT_SSH_GUARD_GLOBAL_BURST:-60}"
 XRAY_ONLINE_TRACKER_CANONICAL_SCRIPT="/usr/local/bin/vpnbot-xray-online-tracker"
 XRAY_ONLINE_TRACKER_LEGACY_SCRIPT="/root/vpnbot-xray-online-tracker"
 XRAY_ONLINE_TRACKER_SCRIPT="${XRAY_ONLINE_TRACKER_SCRIPT:-${XRAY_ONLINE_TRACKER_CANONICAL_SCRIPT}}"
@@ -3962,6 +3970,204 @@ PY
     echo "  • Shared ports remove external port collisions, but tls/reality still need unique SNI per route."
 }
 
+detect_current_ssh_port() {
+    local port
+    port=""
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        port="$(printf '%s' "${SSH_CONNECTION}" | awk '{print $4}' | head -n 1)"
+    fi
+    if [ -z "${port}" ] || ! [[ "${port}" =~ ^[0-9]+$ ]]; then
+        port="$(sshd -T 2>/dev/null | awk '$1 == "port" { print $2; exit }' || true)"
+    fi
+    if [ -z "${port}" ] || ! [[ "${port}" =~ ^[0-9]+$ ]]; then
+        port="22"
+    fi
+    printf '%s\n' "${port}"
+}
+
+has_root_ssh_key() {
+    [ -s /root/.ssh/authorized_keys ]
+}
+
+should_disable_ssh_passwords() {
+    case "${VPNBOT_SSH_KEY_ONLY_MODE}" in
+        1|true|yes|on) return 0 ;;
+        0|false|no|off) return 1 ;;
+        auto|"")
+            has_root_ssh_key
+            return $?
+            ;;
+        *)
+            has_root_ssh_key
+            return $?
+            ;;
+    esac
+}
+
+sanitize_ssh_dropin_conflicts() {
+    local managed_file="$1"
+    local key_only="$2"
+    local file tmp
+    [ -d /etc/ssh/sshd_config.d ] || return 0
+    for file in /etc/ssh/sshd_config.d/*.conf; do
+        [ -f "${file}" ] || continue
+        [ "${file}" != "${managed_file}" ] || continue
+        if [ "${key_only}" = "1" ]; then
+            grep -Eq '^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|UseDNS|LoginGraceTime|MaxAuthTries|MaxStartups)[[:space:]]+' "${file}" || continue
+        else
+            grep -Eq '^[[:space:]]*(UseDNS|LoginGraceTime|MaxAuthTries|MaxStartups)[[:space:]]+' "${file}" || continue
+        fi
+        cp -a "${file}" "${file}.before-vpnbot-ssh-guard.$(date +%s)" 2>/dev/null || true
+        tmp="$(mktemp)"
+        KEY_ONLY="${key_only}" MANAGED_FILE="${managed_file}" python3 - "${file}" > "${tmp}" <<'PY'
+import os
+import re
+import sys
+path = sys.argv[1]
+key_only = os.environ.get("KEY_ONLY") == "1"
+managed = os.environ.get("MANAGED_FILE", "/etc/ssh/sshd_config.d/00-vpnbot-control-plane.conf")
+base = {"UseDNS", "LoginGraceTime", "MaxAuthTries", "MaxStartups"}
+auth = {"PasswordAuthentication", "KbdInteractiveAuthentication", "ChallengeResponseAuthentication"}
+keys = base | (auth if key_only else set())
+in_match = False
+for line in open(path, encoding="utf-8", errors="replace"):
+    stripped = line.lstrip()
+    if re.match(r"Match\s+", stripped, flags=re.I):
+        in_match = True
+    key = stripped.split(None, 1)[0] if stripped.split(None, 1) else ""
+    if not in_match and stripped and not stripped.startswith("#") and key in keys:
+        sys.stdout.write(f"# disabled by vpnbot ssh guard; managed in {managed}: {line}")
+    else:
+        sys.stdout.write(line)
+PY
+        cat "${tmp}" > "${file}"
+        rm -f "${tmp}"
+    done
+}
+
+configure_ssh_control_plane_guard() {
+    [ "${VPNBOT_SSH_GUARD_ENABLED}" = "1" ] || return 0
+    command -v iptables >/dev/null 2>&1 || return 0
+
+    local ssh_port current_client trusted_ips key_only dropin
+    ssh_port="$(detect_current_ssh_port)"
+    current_client=""
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        current_client="$(printf '%s' "${SSH_CONNECTION}" | awk '{print $1}' | head -n 1)"
+    fi
+    trusted_ips="${VPNBOT_SSH_GUARD_TRUSTED_IPS}"
+    if [ -n "${current_client}" ]; then
+        trusted_ips="${trusted_ips} ${current_client}"
+    fi
+
+    key_only=0
+    if should_disable_ssh_passwords; then
+        key_only=1
+    fi
+
+    mkdir -p /etc/ssh/sshd_config.d
+    dropin="/etc/ssh/sshd_config.d/00-vpnbot-control-plane.conf"
+    cp -a "${dropin}" "${dropin}.before-vpnbot-ssh-guard.$(date +%s)" 2>/dev/null || true
+    {
+        echo "# Managed by VPnBot Xray node installer."
+        echo "UseDNS no"
+        echo "LoginGraceTime 20"
+        echo "MaxAuthTries 3"
+        echo "MaxStartups 20:30:60"
+        if [ "${key_only}" = "1" ]; then
+            echo "PasswordAuthentication no"
+            echo "KbdInteractiveAuthentication no"
+            echo "ChallengeResponseAuthentication no"
+            echo "PubkeyAuthentication yes"
+            echo "PermitRootLogin prohibit-password"
+        else
+            echo "# PasswordAuthentication is left unchanged because /root/.ssh/authorized_keys is empty."
+        fi
+    } > "${dropin}"
+    sanitize_ssh_dropin_conflicts "${dropin}" "${key_only}"
+    if sshd -t 2>/tmp/vpnbot-sshd-test.err; then
+        systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+    else
+        cat /tmp/vpnbot-sshd-test.err >&2 || true
+        warn "sshd -t failed after writing ${dropin}; leaving current sshd process unchanged"
+    fi
+
+    cat >/usr/local/bin/vpnbot-ssh-guard <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+CHAIN="${VPNBOT_SSH_GUARD_CHAIN:-VPNBOT_SSH_GUARD}"
+PORTS="${VPNBOT_SSH_GUARD_PORTS:-22}"
+TRUSTED_IPS="${VPNBOT_SSH_GUARD_TRUSTED_IPS:-144.31.50.172}"
+PER_SRC_RATE="${VPNBOT_SSH_GUARD_PER_SRC_RATE:-6/min}"
+PER_SRC_BURST="${VPNBOT_SSH_GUARD_PER_SRC_BURST:-8}"
+GLOBAL_RATE="${VPNBOT_SSH_GUARD_GLOBAL_RATE:-40/min}"
+GLOBAL_BURST="${VPNBOT_SSH_GUARD_GLOBAL_BURST:-60}"
+apply_v4() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  iptables -N "$CHAIN" 2>/dev/null || true
+  iptables -F "$CHAIN"
+  for ip in $TRUSTED_IPS; do
+    case "$ip" in *:*) continue ;; esac
+    iptables -A "$CHAIN" -s "$ip" -j RETURN
+  done
+  iptables -A "$CHAIN" -m hashlimit --hashlimit-name vpnbot_ssh_src --hashlimit-mode srcip --hashlimit-srcmask 32 --hashlimit-above "$PER_SRC_RATE" --hashlimit-burst "$PER_SRC_BURST" -j DROP
+  iptables -A "$CHAIN" -m hashlimit --hashlimit-name vpnbot_ssh_global --hashlimit-mode dstport --hashlimit-above "$GLOBAL_RATE" --hashlimit-burst "$GLOBAL_BURST" -j DROP
+  iptables -A "$CHAIN" -j RETURN
+  IFS=',' read -ra ports <<<"$PORTS"
+  for port in "${ports[@]}"; do
+    port="${port// /}"
+    [ -n "$port" ] || continue
+    iptables -C INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW -j "$CHAIN" 2>/dev/null \
+      || iptables -I INPUT 1 -p tcp --dport "$port" -m conntrack --ctstate NEW -j "$CHAIN"
+  done
+}
+apply_v6() {
+  command -v ip6tables >/dev/null 2>&1 || return 0
+  ip6tables -N "$CHAIN" 2>/dev/null || true
+  ip6tables -F "$CHAIN"
+  ip6tables -A "$CHAIN" -m hashlimit --hashlimit-name vpnbot_ssh6_src --hashlimit-mode srcip --hashlimit-srcmask 64 --hashlimit-above "$PER_SRC_RATE" --hashlimit-burst "$PER_SRC_BURST" -j DROP
+  ip6tables -A "$CHAIN" -m hashlimit --hashlimit-name vpnbot_ssh6_global --hashlimit-mode dstport --hashlimit-above "$GLOBAL_RATE" --hashlimit-burst "$GLOBAL_BURST" -j DROP
+  ip6tables -A "$CHAIN" -j RETURN
+  IFS=',' read -ra ports <<<"$PORTS"
+  for port in "${ports[@]}"; do
+    port="${port// /}"
+    [ -n "$port" ] || continue
+    ip6tables -C INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW -j "$CHAIN" 2>/dev/null \
+      || ip6tables -I INPUT 1 -p tcp --dport "$port" -m conntrack --ctstate NEW -j "$CHAIN"
+  done
+}
+apply_v4
+apply_v6
+echo "vpnbot ssh guard active: ports=$PORTS trusted=$TRUSTED_IPS per_src=$PER_SRC_RATE/$PER_SRC_BURST global=$GLOBAL_RATE/$GLOBAL_BURST"
+EOF
+    chmod 0755 /usr/local/bin/vpnbot-ssh-guard
+    cat >/etc/systemd/system/vpnbot-ssh-guard.service <<EOF
+[Unit]
+Description=VPnBot SSH control-plane guard
+After=network-online.target ssh.service sshd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=VPNBOT_SSH_GUARD_CHAIN=${VPNBOT_SSH_GUARD_CHAIN}
+Environment=VPNBOT_SSH_GUARD_PORTS=${ssh_port}
+Environment=VPNBOT_SSH_GUARD_TRUSTED_IPS=${trusted_ips}
+Environment=VPNBOT_SSH_GUARD_PER_SRC_RATE=${VPNBOT_SSH_GUARD_PER_SRC_RATE}
+Environment=VPNBOT_SSH_GUARD_PER_SRC_BURST=${VPNBOT_SSH_GUARD_PER_SRC_BURST}
+Environment=VPNBOT_SSH_GUARD_GLOBAL_RATE=${VPNBOT_SSH_GUARD_GLOBAL_RATE}
+Environment=VPNBOT_SSH_GUARD_GLOBAL_BURST=${VPNBOT_SSH_GUARD_GLOBAL_BURST}
+ExecStart=/usr/local/bin/vpnbot-ssh-guard
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now vpnbot-ssh-guard.service >/dev/null || true
+    systemctl restart vpnbot-ssh-guard.service || true
+    info "SSH guard installed on port ${ssh_port}; key_only=${key_only}; trusted=${trusted_ips}"
+}
+
 
 main() {
     check_root
@@ -3972,6 +4178,7 @@ main() {
     collect_interactive_defaults
     sync_domain_aliases
     install_dependencies
+    configure_ssh_control_plane_guard
     configure_vpnbot_network_limits
     configure_dynv6_domain
     normalize_inputs
