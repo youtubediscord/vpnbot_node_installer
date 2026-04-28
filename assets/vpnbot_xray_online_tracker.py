@@ -2048,7 +2048,14 @@ def query_socket_ip_traffic(now: float) -> dict[str, dict]:
         if not line:
             continue
         parts = line.split()
-        if len(parts) >= 4 and ":" in parts[2] and ":" in parts[3]:
+        is_socket_row = (
+            len(parts) >= 4
+            and parts[0].isdigit()
+            and parts[1].isdigit()
+            and ":" in parts[2]
+            and ":" in parts[3]
+        )
+        if is_socket_row:
             local = _parse_ss_endpoint(parts[2])
             peer = _parse_ss_endpoint(parts[3])
             current = None
