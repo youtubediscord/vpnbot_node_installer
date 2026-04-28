@@ -1701,8 +1701,9 @@ def _connection_top_payload(now: float) -> dict:
                     local_api += 1
 
             if local_port in public_ports:
-                public_peer_ips[peer_ip] += 1
-                per_port_peer_ips.setdefault(local_port, collections.Counter())[peer_ip] += 1
+                if not _is_loopback_ip(peer_ip):
+                    public_peer_ips[peer_ip] += 1
+                    per_port_peer_ips.setdefault(local_port, collections.Counter())[peer_ip] += 1
             else:
                 other_peer_ips[peer_ip] += 1
 
