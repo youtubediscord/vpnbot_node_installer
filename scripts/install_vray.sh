@@ -185,6 +185,7 @@ XRAY_POLICY_CONN_IDLE_SECONDS="${XRAY_POLICY_CONN_IDLE_SECONDS:-180}"
 XRAY_POLICY_UPLINK_ONLY_SECONDS="${XRAY_POLICY_UPLINK_ONLY_SECONDS:-8}"
 XRAY_POLICY_DOWNLINK_ONLY_SECONDS="${XRAY_POLICY_DOWNLINK_ONLY_SECONDS:-20}"
 VPNBOT_XRAY_BLOCK_RU_EGRESS="${VPNBOT_XRAY_BLOCK_RU_EGRESS:-1}"
+VPNBOT_XRAY_RU_EGRESS_ALLOW_DOMAINS="${VPNBOT_XRAY_RU_EGRESS_ALLOW_DOMAINS:-domain:pally.info}"
 VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS="${VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS:-}"
 VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS="${VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS:-}"
 VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE="${VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE:-1}"
@@ -1678,6 +1679,7 @@ ensure_xray_core_ru_egress_block() {
     XRAY_CORE_ROUTING_FILE="${XRAY_CORE_CONFIG_DIR}/10_routing.json" \
     XRAY_CORE_SHARE_DIR_VALUE="${XRAY_CORE_SHARE_DIR}" \
     VPNBOT_XRAY_BLOCK_RU_EGRESS_VALUE="${VPNBOT_XRAY_BLOCK_RU_EGRESS}" \
+    VPNBOT_XRAY_RU_EGRESS_ALLOW_DOMAINS_VALUE="${VPNBOT_XRAY_RU_EGRESS_ALLOW_DOMAINS}" \
     VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE_VALUE="${VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE}" \
     VPNBOT_XRAY_RU_GEOSITE_FILE_VALUE="${VPNBOT_XRAY_RU_GEOSITE_FILE}" \
     VPNBOT_XRAY_RU_GEOSITE_TAG_VALUE="${VPNBOT_XRAY_RU_GEOSITE_TAG}" \
@@ -1750,6 +1752,7 @@ if external_geosite_enabled and external_file and external_tag and (share_dir / 
 
 domains = default_domains + split_list(os.environ.get("VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS_VALUE", ""))
 ips = default_ips + split_list(os.environ.get("VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS_VALUE", ""))
+allow_domains = split_list(os.environ.get("VPNBOT_XRAY_RU_EGRESS_ALLOW_DOMAINS_VALUE", ""))
 
 if routing_path.exists():
     try:
@@ -1770,14 +1773,29 @@ rules = routing.setdefault("rules", [])
 if not isinstance(rules, list):
     raise SystemExit(f"Invalid Xray routing JSON in {routing_path}: routing.rules must be an array")
 
-managed_tags = {"vpnbot-block-ru-domains", "vpnbot-block-ru-ips"}
+managed_tags = {"vpnbot-allow-ru-egress-domains", "vpnbot-block-ru-domains", "vpnbot-block-ru-ips"}
 
 if enabled:
     strategy = str(routing.get("domainStrategy") or "").strip()
     if strategy not in {"IPIfNonMatch", "IPOnDemand"}:
         routing["domainStrategy"] = "IPIfNonMatch"
 
-    managed = [
+    managed = []
+    if allow_domains:
+        managed.append(
+            (
+                "vpnbot-allow-ru-egress-domains",
+                "domain",
+                allow_domains,
+                {
+                    "type": "field",
+                    "domain": allow_domains,
+                    "outboundTag": "direct",
+                    "ruleTag": "vpnbot-allow-ru-egress-domains",
+                },
+            )
+        )
+    managed.extend([
         (
             "vpnbot-block-ru-domains",
             "domain",
@@ -1800,7 +1818,7 @@ if enabled:
                 "ruleTag": "vpnbot-block-ru-ips",
             },
         ),
-    ]
+    ])
     for tag, key, values, rule in reversed(managed):
         tagged_index = next(
             (idx for idx, existing in enumerate(rules) if isinstance(existing, dict) and existing.get("ruleTag") == tag),

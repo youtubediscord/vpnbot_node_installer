@@ -58,7 +58,8 @@ domains/IPs by default through Xray `routing` and the `blackhole` outbound. The
 installer downloads `roscomvpn-geosite.dat` from
 `hydraponique/roscomvpn-geosite` and uses `ext:roscomvpn-geosite.dat:category-ru`
 plus conservative fallback rules for `.ru`, `.su`, `.рф`, Yandex/VK domains and
-`geoip:ru`. This does not add a server firewall rule, so REALITY `dest`
+`geoip:ru`. `domain:pally.info` is allowed before the RU block because it is the
+payment gateway. This does not add a server firewall rule, so REALITY `dest`
 camouflage targets such as Yandex remain reachable by the node itself. Set
 `VPNBOT_XRAY_BLOCK_RU_EGRESS=0` before running the installer to disable that
 routing block for a special node.
