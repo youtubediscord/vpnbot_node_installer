@@ -4084,6 +4084,32 @@ configure_ssh_control_plane_guard() {
             echo "# PasswordAuthentication is left unchanged because /root/.ssh/authorized_keys is empty."
         fi
     } > "${dropin}"
+    if [ -f /etc/ssh/sshd_config ]; then
+        cp -a /etc/ssh/sshd_config "/etc/ssh/sshd_config.before-vpnbot-ssh-guard.$(date +%s)" 2>/dev/null || true
+        KEY_ONLY="${key_only}" MANAGED_FILE="${dropin}" python3 - /etc/ssh/sshd_config > /tmp/vpnbot-sshd-main.tmp <<'PY'
+import os
+import re
+import sys
+path = sys.argv[1]
+key_only = os.environ.get("KEY_ONLY") == "1"
+managed = os.environ.get("MANAGED_FILE", "/etc/ssh/sshd_config.d/00-vpnbot-control-plane.conf")
+base = {"UseDNS", "LoginGraceTime", "MaxAuthTries", "MaxStartups"}
+auth = {"PasswordAuthentication", "KbdInteractiveAuthentication", "ChallengeResponseAuthentication"}
+keys = base | (auth if key_only else set())
+in_match = False
+for line in open(path, encoding="utf-8", errors="replace"):
+    stripped = line.lstrip()
+    if re.match(r"Match\s+", stripped, flags=re.I):
+        in_match = True
+    key = stripped.split(None, 1)[0] if stripped.split(None, 1) else ""
+    if not in_match and stripped and not stripped.startswith("#") and key in keys:
+        sys.stdout.write(f"# disabled by vpnbot ssh guard; managed in {managed}: {line}")
+    else:
+        sys.stdout.write(line)
+PY
+        cat /tmp/vpnbot-sshd-main.tmp > /etc/ssh/sshd_config
+        rm -f /tmp/vpnbot-sshd-main.tmp
+    fi
     sanitize_ssh_dropin_conflicts "${dropin}" "${key_only}"
     if sshd -t 2>/tmp/vpnbot-sshd-test.err; then
         systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
