@@ -159,6 +159,7 @@ XRAY_CONNECTION_TOP_CACHE_TTL_SECONDS="${XRAY_CONNECTION_TOP_CACHE_TTL_SECONDS:-
 XRAY_CONNECTION_TOP_LIMIT="${XRAY_CONNECTION_TOP_LIMIT:-10}"
 XRAY_CONNECTION_TOP_MAX_ROWS="${XRAY_CONNECTION_TOP_MAX_ROWS:-80000}"
 XRAY_SYNC_SCRIPT="${XRAY_SYNC_SCRIPT:-/usr/local/bin/vpnbot-xray-sync-routes}"
+XRAY_ROUTE_HEAL_SCRIPT="${XRAY_ROUTE_HEAL_SCRIPT:-/usr/local/bin/vpnbot-xray-heal-routes}"
 XRAY_SYNC_SERVICE="${XRAY_SYNC_SERVICE:-/etc/systemd/system/vpnbot-xray-sync-routes.service}"
 XRAY_SYNC_PATH="${XRAY_SYNC_PATH:-/etc/systemd/system/vpnbot-xray-sync-routes.path}"
 XRAY_SYNC_TIMER="${XRAY_SYNC_TIMER:-/etc/systemd/system/vpnbot-xray-sync-routes.timer}"
@@ -185,7 +186,7 @@ XRAY_POLICY_CONN_IDLE_SECONDS="${XRAY_POLICY_CONN_IDLE_SECONDS:-180}"
 XRAY_POLICY_UPLINK_ONLY_SECONDS="${XRAY_POLICY_UPLINK_ONLY_SECONDS:-8}"
 XRAY_POLICY_DOWNLINK_ONLY_SECONDS="${XRAY_POLICY_DOWNLINK_ONLY_SECONDS:-20}"
 VPNBOT_XRAY_BLOCK_RU_EGRESS="${VPNBOT_XRAY_BLOCK_RU_EGRESS:-1}"
-VPNBOT_XRAY_RU_EGRESS_ALLOW_DOMAINS="${VPNBOT_XRAY_RU_EGRESS_ALLOW_DOMAINS:-domain:pally.info}"
+VPNBOT_XRAY_RU_EGRESS_ALLOW_DOMAINS="${VPNBOT_XRAY_RU_EGRESS_ALLOW_DOMAINS:-domain:pally.info,domain:pal24.pro}"
 VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS="${VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS:-}"
 VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS="${VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS:-}"
 VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE="${VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE:-1}"
@@ -3315,6 +3316,35 @@ EOF
 }
 
 
+write_xray_route_heal_assets() {
+    mkdir -p "${VPNBOT_ASSET_LIB_DIR}"
+    local helper_asset
+    helper_asset="${VPNBOT_ASSET_LIB_DIR}/vpnbot_xray_route_heal.py"
+    download_node_installer_asset "assets/vpnbot_xray_route_heal.py" "${helper_asset}" 755
+    cat > "${XRAY_ROUTE_HEAL_SCRIPT}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export XRAY_CORE_CONFIG_DIR=${XRAY_CORE_CONFIG_DIR@Q}
+export XRAY_CORE_ROUTING_FILE=${XRAY_CORE_CONFIG_DIR@Q}/10_routing.json
+export XRAY_CORE_BIN=${XRAY_CORE_BIN@Q}
+export XRAY_CORE_SHARE_DIR=${XRAY_CORE_SHARE_DIR@Q}
+export XRAY_CORE_SERVICE_NAME=${XRAY_CORE_SERVICE_NAME@Q}
+export XRAY_SYNC_SCRIPT=${XRAY_SYNC_SCRIPT@Q}
+export VPNBOT_XRAY_BLOCK_RU_EGRESS=${VPNBOT_XRAY_BLOCK_RU_EGRESS@Q}
+export VPNBOT_XRAY_RU_EGRESS_ALLOW_DOMAINS=${VPNBOT_XRAY_RU_EGRESS_ALLOW_DOMAINS@Q}
+export VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS=${VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS@Q}
+export VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS=${VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS@Q}
+export VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE=${VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE@Q}
+export VPNBOT_XRAY_RU_GEOSITE_URL=${VPNBOT_XRAY_RU_GEOSITE_URL@Q}
+export VPNBOT_XRAY_RU_GEOSITE_FILE=${VPNBOT_XRAY_RU_GEOSITE_FILE@Q}
+export VPNBOT_XRAY_RU_GEOSITE_TAG=${VPNBOT_XRAY_RU_GEOSITE_TAG@Q}
+exec /usr/bin/env python3 ${helper_asset@Q} "\$@"
+EOF
+    chmod 755 "${XRAY_ROUTE_HEAL_SCRIPT}"
+    log "Installed Xray-core route heal helper: ${XRAY_ROUTE_HEAL_SCRIPT}"
+}
+
+
 write_xui_sync_assets() {
     mkdir -p "${VPNBOT_ASSET_LIB_DIR}"
     local helper_asset
@@ -3872,6 +3902,7 @@ main() {
         write_xray_core_installer_state
         write_xray_core_rollout_bundle
         write_xray_sync_assets
+        write_xray_route_heal_assets
         write_vless_preset_helper
         write_direct_helpers
         enable_sync

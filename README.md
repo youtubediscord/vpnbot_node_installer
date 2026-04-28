@@ -58,11 +58,14 @@ domains/IPs by default through Xray `routing` and the `blackhole` outbound. The
 installer downloads `roscomvpn-geosite.dat` from
 `hydraponique/roscomvpn-geosite` and uses `ext:roscomvpn-geosite.dat:category-ru`
 plus conservative fallback rules for `.ru`, `.su`, `.рф`, Yandex/VK domains and
-`geoip:ru`. `domain:pally.info` is allowed before the RU block because it is the
-payment gateway. This does not add a server firewall rule, so REALITY `dest`
-camouflage targets such as Yandex remain reachable by the node itself. Set
-`VPNBOT_XRAY_BLOCK_RU_EGRESS=0` before running the installer to disable that
-routing block for a special node.
+`geoip:ru`. `domain:pally.info` and `domain:pal24.pro` are allowed before the RU
+block because they are payment gateways. This does not add a server firewall
+rule, so REALITY `dest` camouflage targets such as Yandex remain reachable by
+the node itself. Set `VPNBOT_XRAY_BLOCK_RU_EGRESS=0` before running the
+installer to disable that routing block for a special node. Rerun
+`/usr/local/bin/vpnbot-xray-heal-routes` on an installed standalone node to
+refresh `roscomvpn-geosite.dat`, reapply the managed routing rules, validate
+Xray, and trigger nginx route-sync without editing JSON by hand.
 
 For a side-by-side smoke test on a legacy node where another service already
 owns public HTTP/TCP ports, set `VPNBOT_NGINX_AUTOSTART=0`. Route sync will
