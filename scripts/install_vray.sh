@@ -184,6 +184,9 @@ XRAY_POLICY_HANDSHAKE_SECONDS="${XRAY_POLICY_HANDSHAKE_SECONDS:-4}"
 XRAY_POLICY_CONN_IDLE_SECONDS="${XRAY_POLICY_CONN_IDLE_SECONDS:-180}"
 XRAY_POLICY_UPLINK_ONLY_SECONDS="${XRAY_POLICY_UPLINK_ONLY_SECONDS:-8}"
 XRAY_POLICY_DOWNLINK_ONLY_SECONDS="${XRAY_POLICY_DOWNLINK_ONLY_SECONDS:-20}"
+VPNBOT_XRAY_BLOCK_RU_EGRESS="${VPNBOT_XRAY_BLOCK_RU_EGRESS:-1}"
+VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS="${VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS:-}"
+VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS="${VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS:-}"
 VPNBOT_NF_CONNTRACK_TCP_ESTABLISHED_TIMEOUT="${VPNBOT_NF_CONNTRACK_TCP_ESTABLISHED_TIMEOUT:-7200}"
 VPNBOT_XRAY_RESERVED_EXTRA_PORTS="${VPNBOT_XRAY_RESERVED_EXTRA_PORTS:-10086}"
 VPNBOT_NF_CONNTRACK_MAX="${VPNBOT_NF_CONNTRACK_MAX:-1048576}"
@@ -1641,6 +1644,125 @@ PY
 }
 
 
+ensure_xray_core_ru_egress_block() {
+    XRAY_CORE_ROUTING_FILE="${XRAY_CORE_CONFIG_DIR}/10_routing.json" \
+    VPNBOT_XRAY_BLOCK_RU_EGRESS_VALUE="${VPNBOT_XRAY_BLOCK_RU_EGRESS}" \
+    VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS_VALUE="${VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS}" \
+    VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS_VALUE="${VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS}" \
+    python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+
+TRUTHY = {"1", "true", "yes", "on"}
+FALSY = {"0", "false", "no", "off"}
+
+
+def env_enabled(name: str, default: bool = True) -> bool:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    if raw in TRUTHY:
+        return True
+    if raw in FALSY:
+        return False
+    return default
+
+
+def split_list(value: str) -> list[str]:
+    out: list[str] = []
+    for item in str(value or "").replace("\n", ",").split(","):
+        item = item.strip()
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+def rule_covers(rule: dict, key: str, values: list[str]) -> bool:
+    if rule.get("type") != "field" or rule.get("outboundTag") != "block":
+        return False
+    present = set(rule.get(key) or [])
+    return bool(values) and set(values).issubset(present)
+
+
+def exact_managed_rule(rule: dict, key: str, values: list[str]) -> bool:
+    if rule.get("type") != "field" or rule.get("outboundTag") != "block":
+        return False
+    return set(rule.get(key) or []) == set(values)
+
+
+routing_path = Path(os.environ["XRAY_CORE_ROUTING_FILE"])
+enabled = env_enabled("VPNBOT_XRAY_BLOCK_RU_EGRESS_VALUE", default=True)
+
+default_domains = [
+    "regexp:\\.ru$",
+    "regexp:\\.su$",
+    "regexp:\\.xn--p1ai$",
+    "domain:ya.ru",
+    "domain:yandex.com",
+    "domain:yandex.net",
+    "domain:yastatic.net",
+    "domain:vk.com",
+]
+default_ips = ["geoip:ru"]
+
+domains = default_domains + split_list(os.environ.get("VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS_VALUE", ""))
+ips = default_ips + split_list(os.environ.get("VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS_VALUE", ""))
+
+if routing_path.exists():
+    try:
+        payload = json.loads(routing_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"Failed to parse {routing_path}: {exc}") from exc
+else:
+    payload = {}
+
+if not isinstance(payload, dict):
+    raise SystemExit(f"Invalid Xray routing JSON in {routing_path}: top-level value must be an object")
+
+routing = payload.setdefault("routing", {})
+if not isinstance(routing, dict):
+    raise SystemExit(f"Invalid Xray routing JSON in {routing_path}: routing must be an object")
+
+rules = routing.setdefault("rules", [])
+if not isinstance(rules, list):
+    raise SystemExit(f"Invalid Xray routing JSON in {routing_path}: routing.rules must be an array")
+
+if enabled:
+    strategy = str(routing.get("domainStrategy") or "").strip()
+    if strategy not in {"IPIfNonMatch", "IPOnDemand"}:
+        routing["domainStrategy"] = "IPIfNonMatch"
+
+    managed = [
+        ("domain", domains, {"type": "field", "domain": domains, "outboundTag": "block"}),
+        ("ip", ips, {"type": "field", "ip": ips, "outboundTag": "block"}),
+    ]
+    for key, values, rule in reversed(managed):
+        if not any(rule_covers(existing, key, values) for existing in rules if isinstance(existing, dict)):
+            rules.insert(0, rule)
+else:
+    rules[:] = [
+        rule
+        for rule in rules
+        if not (
+            isinstance(rule, dict)
+            and (
+                exact_managed_rule(rule, "domain", domains)
+                or exact_managed_rule(rule, "ip", ips)
+            )
+        )
+    ]
+
+routing_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+
+    if env_is_true "${VPNBOT_XRAY_BLOCK_RU_EGRESS}"; then
+        log "Enabled Xray routing block for Russian destination domains/IPs in ${XRAY_CORE_CONFIG_DIR}/10_routing.json"
+    else
+        info "Xray Russian destination egress block is disabled by VPNBOT_XRAY_BLOCK_RU_EGRESS=${VPNBOT_XRAY_BLOCK_RU_EGRESS}"
+    fi
+}
+
+
 write_xray_core_base_configs() {
     mkdir -p "${XRAY_CORE_ROOT}/bin" "${XRAY_CORE_CONFIG_DIR}" "${XRAY_CORE_SHARE_DIR}" "${XRAY_CORE_LOG_DIR}"
     touch "${XRAY_CORE_LOG_DIR}/access.log" "${XRAY_CORE_LOG_DIR}/error.log"
@@ -1670,6 +1792,8 @@ EOF
 }
 EOF
     fi
+
+    ensure_xray_core_ru_egress_block
 
     if [[ ! -f "${XRAY_CORE_CONFIG_DIR}/20_outbounds.json" ]]; then
         cat > "${XRAY_CORE_CONFIG_DIR}/20_outbounds.json" <<'EOF'
@@ -3296,6 +3420,7 @@ show_xray_core_summary() {
     echo "  Abuse audit API: ${XRAY_ABUSE_AUDIT_URL}"
     echo "  Multi-IP abuse API: ${XRAY_ABUSE_MULTI_IP_URL}"
     echo "  Multi-IP history: ${XRAY_ABUSE_MULTI_IP_HISTORY_FILE}"
+    echo "  RU destination egress block: ${VPNBOT_XRAY_BLOCK_RU_EGRESS}"
     echo "  Root: ${XRAY_CORE_ROOT}"
     echo "  Binary: ${XRAY_CORE_BIN}"
     echo "  Config dir: ${XRAY_CORE_CONFIG_DIR}"
@@ -3341,6 +3466,7 @@ show_xray_core_summary() {
     echo "  • exposes local-only multi-IP scoring at /abuse/multi-ip"
     echo "  • requires the online tracker for VPnBot online stats; missing tracker is an error"
     echo "  • publishes shared ports through nginx stream/http route sync"
+    echo "  • blocks proxied user egress to Russian destination domains/IPs through Xray routing"
     echo "  • keeps xray-managed inbounds in a separate JSON file under confdir"
     echo ""
     info "Important compatibility note"
