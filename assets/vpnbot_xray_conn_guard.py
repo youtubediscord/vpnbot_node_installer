@@ -44,6 +44,34 @@ BAN_BAD_STATES = max(
     50,
     int(os.environ.get("XRAY_CONN_GUARD_BAN_BAD_STATES", "350") or "350"),
 )
+PORT_TOTAL_STATES = max(
+    1000,
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_TOTAL_STATES", "6000") or "6000"),
+)
+PORT_BAD_STATES = max(
+    300,
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_BAD_STATES", "1200") or "1200"),
+)
+PORT_PRESSURE_MIN_IP_TOTAL = max(
+    100,
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_TOTAL", "500") or "500"),
+)
+PORT_PRESSURE_MIN_IP_BAD = max(
+    50,
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_BAD", "100") or "100"),
+)
+PORT_PRESSURE_MIN_IP_ESTAB = max(
+    100,
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_ESTAB", "900") or "900"),
+)
+PORT_PRESSURE_MAX_BANS_PER_PORT = max(
+    1,
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MAX_BANS_PER_PORT", "5") or "5"),
+)
+PORT_PRESSURE_EVENT_COOLDOWN_SECONDS = max(
+    60,
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_EVENT_COOLDOWN_SECONDS", "300") or "300"),
+)
 BAN_SECONDS = max(60, min(int(os.environ.get("XRAY_CONN_GUARD_BAN_SECONDS", "3600") or "3600"), 86400))
 SCAN_MAX_ROWS = max(
     1000,
@@ -52,6 +80,9 @@ SCAN_MAX_ROWS = max(
 STATE_DIR = Path(os.environ.get("XRAY_CONN_GUARD_STATE_DIR", "/var/lib/vpnbot-xray-conn-guard"))
 BAN_STATE_FILE = Path(os.environ.get("XRAY_CONN_GUARD_BAN_STATE_FILE", str(STATE_DIR / "bans.json")))
 EVENTS_FILE = Path(os.environ.get("XRAY_CONN_GUARD_EVENTS_FILE", str(STATE_DIR / "events.jsonl")))
+PORT_PRESSURE_STATE_FILE = Path(
+    os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_STATE_FILE", str(STATE_DIR / "port_pressure.json"))
+)
 SHARED_PORT_RE = re.compile(r"\[shared:(?P<port>\d{1,5})\]")
 _IPV6_RE = re.compile(r"^[0-9a-fA-F:]+$")
 BAD_TCP_STATES = {
@@ -116,6 +147,23 @@ def _save_bans(items: list[dict]) -> None:
     tmp.replace(BAN_STATE_FILE)
 
 
+def _load_port_pressure_state() -> dict:
+    try:
+        payload = json.loads(PORT_PRESSURE_STATE_FILE.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_port_pressure_state(payload: dict) -> None:
+    _ensure_state_dir()
+    data = payload if isinstance(payload, dict) else {}
+    data["updated_at"] = _utc_iso()
+    tmp = PORT_PRESSURE_STATE_FILE.with_suffix(PORT_PRESSURE_STATE_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(PORT_PRESSURE_STATE_FILE)
+
+
 def _append_event(event: dict) -> None:
     _ensure_state_dir()
     payload = {
@@ -164,14 +212,18 @@ def _is_loopback_ip(ip: str) -> bool:
     return text == "::1" or text == "localhost" or text.startswith("127.") or text.startswith("::ffff:127.")
 
 
-def _scan_abusive_ips(ports: list[int]) -> tuple[list[dict], int, bool]:
+def _scan_abusive_ips(ports: list[int]) -> tuple[list[dict], list[dict], int, bool]:
     if not BAN_ENABLED or not ports or not _cmd_exists("ss"):
-        return [], 0, False
+        return [], [], 0, False
     public_ports = set(int(port) for port in ports)
     established_counts: dict[tuple[str, int], int] = {}
     total_counts: dict[tuple[str, int], int] = {}
     bad_counts: dict[tuple[str, int], int] = {}
     state_counts: dict[tuple[str, int], dict[str, int]] = {}
+    port_established_counts: dict[int, int] = {}
+    port_total_counts: dict[int, int] = {}
+    port_bad_counts: dict[int, int] = {}
+    port_state_counts: dict[int, dict[str, int]] = {}
     rows_seen = 0
     limited = False
     proc = subprocess.Popen(
@@ -208,12 +260,17 @@ def _scan_abusive_ips(ports: list[int]) -> tuple[list[dict], int, bool]:
                 continue
             key = (peer_ip, local_port)
             total_counts[key] = total_counts.get(key, 0) + 1
+            port_total_counts[local_port] = port_total_counts.get(local_port, 0) + 1
             if state == "ESTAB":
                 established_counts[key] = established_counts.get(key, 0) + 1
+                port_established_counts[local_port] = port_established_counts.get(local_port, 0) + 1
             if state in BAD_TCP_STATES:
                 bad_counts[key] = bad_counts.get(key, 0) + 1
+                port_bad_counts[local_port] = port_bad_counts.get(local_port, 0) + 1
             per_state = state_counts.setdefault(key, {})
             per_state[state] = per_state.get(state, 0) + 1
+            per_port_state = port_state_counts.setdefault(local_port, {})
+            per_port_state[state] = per_port_state.get(state, 0) + 1
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
@@ -223,42 +280,154 @@ def _scan_abusive_ips(ports: list[int]) -> tuple[list[dict], int, bool]:
         if proc.stdout is not None:
             proc.stdout.close()
 
-    offenders = []
-    for key, total_count in total_counts.items():
+    offender_by_key: dict[tuple[str, int], dict] = {}
+
+    def add_offender(
+        *,
+        key: tuple[str, int],
+        reason: str,
+        threshold: int,
+        trigger_count: int,
+        port_reason: str = "",
+    ) -> None:
         ip, port = key
         established_count = int(established_counts.get(key, 0))
+        total_count = int(total_counts.get(key, 0))
         bad_count = int(bad_counts.get(key, 0))
-        reason = ""
-        threshold = 0
-        trigger_count = 0
+        item = {
+            "ip": ip,
+            "port": int(port),
+            "connection_count": int(established_count),
+            "total_state_count": int(total_count),
+            "bad_state_count": int(bad_count),
+            "trigger_count": int(trigger_count),
+            "threshold": int(threshold),
+            "reason": reason,
+            "state_counts": dict(sorted(state_counts.get(key, {}).items())),
+        }
+        if port_reason:
+            item["port_reason"] = port_reason
+            item["port_total_state_count"] = int(port_total_counts.get(port, 0))
+            item["port_bad_state_count"] = int(port_bad_counts.get(port, 0))
+            item["port_established_count"] = int(port_established_counts.get(port, 0))
+        old = offender_by_key.get(key)
+        if not old or int(item.get("trigger_count") or 0) > int(old.get("trigger_count") or 0):
+            offender_by_key[key] = item
+
+    for key, total_count in total_counts.items():
+        established_count = int(established_counts.get(key, 0))
+        bad_count = int(bad_counts.get(key, 0))
         if established_count >= BAN_CONNECTIONS:
-            reason = "too_many_established_connections_from_one_ip"
-            threshold = BAN_CONNECTIONS
-            trigger_count = established_count
+            add_offender(
+                key=key,
+                reason="too_many_established_connections_from_one_ip",
+                threshold=BAN_CONNECTIONS,
+                trigger_count=established_count,
+            )
         elif bad_count >= BAN_BAD_STATES:
-            reason = "too_many_closing_tcp_states_from_one_ip"
-            threshold = BAN_BAD_STATES
-            trigger_count = bad_count
+            add_offender(
+                key=key,
+                reason="too_many_closing_tcp_states_from_one_ip",
+                threshold=BAN_BAD_STATES,
+                trigger_count=bad_count,
+            )
         elif total_count >= BAN_TOTAL_STATES:
-            reason = "too_many_tcp_states_from_one_ip"
-            threshold = BAN_TOTAL_STATES
-            trigger_count = total_count
-        if reason:
-            offenders.append(
+            add_offender(
+                key=key,
+                reason="too_many_tcp_states_from_one_ip",
+                threshold=BAN_TOTAL_STATES,
+                trigger_count=total_count,
+            )
+
+    port_events: list[dict] = []
+    for port, total_count in port_total_counts.items():
+        bad_count = int(port_bad_counts.get(port, 0))
+        established_count = int(port_established_counts.get(port, 0))
+        port_reason = ""
+        port_threshold = 0
+        port_trigger_count = 0
+        if bad_count >= PORT_BAD_STATES:
+            port_reason = "too_many_closing_tcp_states_on_port"
+            port_threshold = PORT_BAD_STATES
+            port_trigger_count = bad_count
+        elif int(total_count) >= PORT_TOTAL_STATES:
+            port_reason = "too_many_tcp_states_on_port"
+            port_threshold = PORT_TOTAL_STATES
+            port_trigger_count = int(total_count)
+        if not port_reason:
+            continue
+
+        keys = [key for key in total_counts if int(key[1]) == int(port)]
+        keys.sort(
+            key=lambda key: (
+                int(bad_counts.get(key, 0)),
+                int(total_counts.get(key, 0)),
+                int(established_counts.get(key, 0)),
+            ),
+            reverse=True,
+        )
+        top_ips = []
+        bans_planned = 0
+        for key in keys[:10]:
+            ip, key_port = key
+            ip_total = int(total_counts.get(key, 0))
+            ip_bad = int(bad_counts.get(key, 0))
+            ip_estab = int(established_counts.get(key, 0))
+            top_ips.append(
                 {
                     "ip": ip,
-                    "port": int(port),
-                    "connection_count": int(established_count),
-                    "total_state_count": int(total_count),
-                    "bad_state_count": int(bad_count),
-                    "trigger_count": int(trigger_count),
-                    "threshold": int(threshold),
-                    "reason": reason,
+                    "port": int(key_port),
+                    "connection_count": ip_estab,
+                    "total_state_count": ip_total,
+                    "bad_state_count": ip_bad,
                     "state_counts": dict(sorted(state_counts.get(key, {}).items())),
                 }
             )
+            if bans_planned >= PORT_PRESSURE_MAX_BANS_PER_PORT:
+                continue
+            if (
+                ip_bad >= PORT_PRESSURE_MIN_IP_BAD
+                or ip_total >= PORT_PRESSURE_MIN_IP_TOTAL
+                or ip_estab >= PORT_PRESSURE_MIN_IP_ESTAB
+            ):
+                if ip_bad >= PORT_PRESSURE_MIN_IP_BAD:
+                    threshold = PORT_PRESSURE_MIN_IP_BAD
+                    trigger = ip_bad
+                elif ip_total >= PORT_PRESSURE_MIN_IP_TOTAL:
+                    threshold = PORT_PRESSURE_MIN_IP_TOTAL
+                    trigger = ip_total
+                else:
+                    threshold = PORT_PRESSURE_MIN_IP_ESTAB
+                    trigger = ip_estab
+                add_offender(
+                    key=key,
+                    reason="port_tcp_state_pressure",
+                    threshold=threshold,
+                    trigger_count=trigger,
+                    port_reason=port_reason,
+                )
+                bans_planned += 1
+
+        port_events.append(
+            {
+                "event": "port_tcp_pressure",
+                "port": int(port),
+                "reason": port_reason,
+                "threshold": int(port_threshold),
+                "trigger_count": int(port_trigger_count),
+                "connection_count": int(established_count),
+                "total_state_count": int(total_count),
+                "bad_state_count": int(bad_count),
+                "state_counts": dict(sorted(port_state_counts.get(port, {}).items())),
+                "top_ips": top_ips,
+                "bans_planned": int(bans_planned),
+            }
+        )
+
+    offenders = list(offender_by_key.values())
     offenders.sort(key=lambda item: int(item.get("trigger_count") or item.get("connection_count") or 0), reverse=True)
-    return offenders, rows_seen, limited
+    port_events.sort(key=lambda item: int(item.get("trigger_count") or 0), reverse=True)
+    return offenders, port_events, rows_seen, limited
 
 
 def _managed_public_ports() -> list[int]:
@@ -434,7 +603,7 @@ def _refresh_dynamic_bans(ports: list[int]) -> list[dict]:
         except Exception:
             continue
 
-    offenders, rows_seen, limited = _scan_abusive_ips(ports)
+    offenders, port_events, rows_seen, limited = _scan_abusive_ips(ports)
     new_count = 0
     extended_count = 0
     for offender in offenders:
@@ -464,6 +633,19 @@ def _refresh_dynamic_bans(ports: list[int]) -> list[dict]:
             )
             item["threshold"] = int(offender.get("threshold") or item.get("threshold") or BAN_CONNECTIONS)
             item["reason"] = str(offender.get("reason") or item.get("reason") or "too_many_tcp_states_from_one_ip")
+            item["port_reason"] = str(offender.get("port_reason") or item.get("port_reason") or "")
+            item["port_total_state_count"] = max(
+                int(item.get("port_total_state_count") or 0),
+                int(offender.get("port_total_state_count") or 0),
+            )
+            item["port_bad_state_count"] = max(
+                int(item.get("port_bad_state_count") or 0),
+                int(offender.get("port_bad_state_count") or 0),
+            )
+            item["port_established_count"] = max(
+                int(item.get("port_established_count") or 0),
+                int(offender.get("port_established_count") or 0),
+            )
             item["state_counts"] = offender.get("state_counts") or item.get("state_counts") or {}
             item["last_seen_at"] = _utc_iso(now)
             item["last_seen_at_ts"] = now
@@ -497,6 +679,10 @@ def _refresh_dynamic_bans(ports: list[int]) -> list[dict]:
                     "trigger_count": int(offender.get("trigger_count") or 0),
                     "threshold": int(offender.get("threshold") or BAN_CONNECTIONS),
                     "reason": str(offender.get("reason") or "too_many_tcp_states_from_one_ip"),
+                    "port_reason": str(offender.get("port_reason") or ""),
+                    "port_total_state_count": int(offender.get("port_total_state_count") or 0),
+                    "port_bad_state_count": int(offender.get("port_bad_state_count") or 0),
+                    "port_established_count": int(offender.get("port_established_count") or 0),
                     "state_counts": offender.get("state_counts") or {},
                     "ban_seconds": BAN_SECONDS,
                     "expires_at": item["expires_at"],
@@ -506,19 +692,50 @@ def _refresh_dynamic_bans(ports: list[int]) -> list[dict]:
             )
             _drop_existing_connections(ip, port)
 
+    if port_events:
+        pressure_state = _load_port_pressure_state()
+        last_events = pressure_state.get("last_events")
+        if not isinstance(last_events, dict):
+            last_events = {}
+        now_ts = time.time()
+        for event in port_events:
+            port_key = str(int(event.get("port") or 0))
+            try:
+                last_ts = float(last_events.get(port_key) or 0.0)
+            except Exception:
+                last_ts = 0.0
+            if now_ts - last_ts < PORT_PRESSURE_EVENT_COOLDOWN_SECONDS:
+                continue
+            _append_event(
+                {
+                    **event,
+                    "rows_seen": rows_seen,
+                    "limited": limited,
+                    "port_total_threshold": PORT_TOTAL_STATES,
+                    "port_bad_threshold": PORT_BAD_STATES,
+                    "min_ip_total": PORT_PRESSURE_MIN_IP_TOTAL,
+                    "min_ip_bad": PORT_PRESSURE_MIN_IP_BAD,
+                    "min_ip_estab": PORT_PRESSURE_MIN_IP_ESTAB,
+                }
+            )
+            last_events[port_key] = now_ts
+        pressure_state["last_events"] = last_events
+        _save_port_pressure_state(pressure_state)
+
     bans = sorted(
         by_key.values(),
-        key=lambda item: (int(item.get("connection_count") or 0), float(item.get("expires_at_ts") or 0)),
+        key=lambda item: (int(item.get("trigger_count") or item.get("connection_count") or 0), float(item.get("expires_at_ts") or 0)),
         reverse=True,
     )
     _save_bans(bans)
-    if offenders or existing:
+    if offenders or existing or port_events:
         print(
             "dynamic bans: "
             f"active={len(bans)} new={new_count} extended={extended_count} "
-            f"offenders={len(offenders)} rows_seen={rows_seen} limited={limited} "
+            f"offenders={len(offenders)} port_pressure={len(port_events)} rows_seen={rows_seen} limited={limited} "
             f"established_threshold={BAN_CONNECTIONS} total_threshold={BAN_TOTAL_STATES} "
-            f"bad_threshold={BAN_BAD_STATES} seconds={BAN_SECONDS}"
+            f"bad_threshold={BAN_BAD_STATES} port_total_threshold={PORT_TOTAL_STATES} "
+            f"port_bad_threshold={PORT_BAD_STATES} seconds={BAN_SECONDS}"
         )
     return bans
 
