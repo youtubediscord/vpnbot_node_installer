@@ -83,7 +83,7 @@ def _load_bans(now: float) -> list[dict]:
         except Exception:
             continue
         ip = str(item.get("ip") or "").strip()
-        if not ip or port <= 0 or port > 65535 or expires_at <= now:
+        if not ip or _is_loopback_ip(ip) or port <= 0 or port > 65535 or expires_at <= now:
             continue
         out.append(item)
     return out
@@ -143,6 +143,11 @@ def _is_ipv6(ip: str) -> bool:
     return ":" in str(ip or "") and bool(_IPV6_RE.match(str(ip or "")))
 
 
+def _is_loopback_ip(ip: str) -> bool:
+    text = str(ip or "").strip().lower()
+    return text == "::1" or text == "localhost" or text.startswith("127.") or text.startswith("::ffff:127.")
+
+
 def _scan_abusive_ips(ports: list[int]) -> tuple[list[dict], int, bool]:
     if not BAN_ENABLED or not ports or not _cmd_exists("ss"):
         return [], 0, False
@@ -174,6 +179,8 @@ def _scan_abusive_ips(ports: list[int]) -> tuple[list[dict], int, bool]:
             _local_ip, local_port = local
             peer_ip, _peer_port = peer
             if local_port not in public_ports:
+                continue
+            if _is_loopback_ip(peer_ip):
                 continue
             counts[(peer_ip, local_port)] = counts.get((peer_ip, local_port), 0) + 1
         try:
@@ -214,6 +221,8 @@ def _managed_public_ports() -> list[int]:
                 shared_port = 0
             if 0 < shared_port <= 65535:
                 ports.add(shared_port)
+        if SHARED_PORT_RE.search(marker_text):
+            continue
         try:
             port = int(inbound.get("port") or 0)
         except Exception:
@@ -243,6 +252,8 @@ def _add_ban_rule(tool: str, item: dict) -> bool:
     except Exception:
         port = 0
     if not ip or port <= 0 or port > 65535:
+        return False
+    if _is_loopback_ip(ip):
         return False
     if tool == "iptables" and _is_ipv6(ip):
         return False
@@ -365,6 +376,8 @@ def _refresh_dynamic_bans(ports: list[int]) -> list[dict]:
     extended_count = 0
     for offender in offenders:
         ip = str(offender.get("ip") or "")
+        if _is_loopback_ip(ip):
+            continue
         port = int(offender.get("port") or 0)
         key = (ip, port)
         expires_at = now + BAN_SECONDS
