@@ -187,6 +187,10 @@ XRAY_POLICY_DOWNLINK_ONLY_SECONDS="${XRAY_POLICY_DOWNLINK_ONLY_SECONDS:-20}"
 VPNBOT_XRAY_BLOCK_RU_EGRESS="${VPNBOT_XRAY_BLOCK_RU_EGRESS:-1}"
 VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS="${VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS:-}"
 VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS="${VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS:-}"
+VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE="${VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE:-1}"
+VPNBOT_XRAY_RU_GEOSITE_URL="${VPNBOT_XRAY_RU_GEOSITE_URL:-https://github.com/hydraponique/roscomvpn-geosite/releases/latest/download/geosite.dat}"
+VPNBOT_XRAY_RU_GEOSITE_FILE="${VPNBOT_XRAY_RU_GEOSITE_FILE:-roscomvpn-geosite.dat}"
+VPNBOT_XRAY_RU_GEOSITE_TAG="${VPNBOT_XRAY_RU_GEOSITE_TAG:-category-ru}"
 VPNBOT_NF_CONNTRACK_TCP_ESTABLISHED_TIMEOUT="${VPNBOT_NF_CONNTRACK_TCP_ESTABLISHED_TIMEOUT:-7200}"
 VPNBOT_XRAY_RESERVED_EXTRA_PORTS="${VPNBOT_XRAY_RESERVED_EXTRA_PORTS:-10086}"
 VPNBOT_NF_CONNTRACK_MAX="${VPNBOT_NF_CONNTRACK_MAX:-1048576}"
@@ -1644,9 +1648,39 @@ PY
 }
 
 
+download_xray_core_ru_geosite() {
+    if ! env_is_true "${VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE}"; then
+        info "External RU geosite download is disabled by VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE=${VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE}"
+        return 0
+    fi
+
+    local target tmp
+    target="${XRAY_CORE_SHARE_DIR}/${VPNBOT_XRAY_RU_GEOSITE_FILE}"
+    tmp="$(mktemp)"
+    if curl -fsSL --retry 3 --connect-timeout 10 -o "${tmp}" "${VPNBOT_XRAY_RU_GEOSITE_URL}"; then
+        if [[ -s "${tmp}" ]]; then
+            install -m 644 "${tmp}" "${target}"
+            rm -f "${tmp}"
+            log "Installed external RU geosite for Xray routing: ${target}"
+            return 0
+        fi
+        warn "Downloaded external RU geosite is empty: ${VPNBOT_XRAY_RU_GEOSITE_URL}"
+    else
+        warn "Failed to download external RU geosite: ${VPNBOT_XRAY_RU_GEOSITE_URL}"
+    fi
+
+    rm -f "${tmp}"
+    warn "Continuing with built-in/manual RU routing fallback only"
+}
+
+
 ensure_xray_core_ru_egress_block() {
     XRAY_CORE_ROUTING_FILE="${XRAY_CORE_CONFIG_DIR}/10_routing.json" \
+    XRAY_CORE_SHARE_DIR_VALUE="${XRAY_CORE_SHARE_DIR}" \
     VPNBOT_XRAY_BLOCK_RU_EGRESS_VALUE="${VPNBOT_XRAY_BLOCK_RU_EGRESS}" \
+    VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE_VALUE="${VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE}" \
+    VPNBOT_XRAY_RU_GEOSITE_FILE_VALUE="${VPNBOT_XRAY_RU_GEOSITE_FILE}" \
+    VPNBOT_XRAY_RU_GEOSITE_TAG_VALUE="${VPNBOT_XRAY_RU_GEOSITE_TAG}" \
     VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS_VALUE="${VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS}" \
     VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS_VALUE="${VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS}" \
     python3 - <<'PY'
@@ -1693,7 +1727,9 @@ def exact_legacy_rule(rule: dict, key: str, values: list[str]) -> bool:
 
 
 routing_path = Path(os.environ["XRAY_CORE_ROUTING_FILE"])
+share_dir = Path(os.environ["XRAY_CORE_SHARE_DIR_VALUE"])
 enabled = env_enabled("VPNBOT_XRAY_BLOCK_RU_EGRESS_VALUE", default=True)
+external_geosite_enabled = env_enabled("VPNBOT_XRAY_BLOCK_RU_EXTERNAL_GEOSITE_VALUE", default=True)
 
 default_domains = [
     "regexp:\\.ru$",
@@ -1706,6 +1742,11 @@ default_domains = [
     "domain:vk.com",
 ]
 default_ips = ["geoip:ru"]
+
+external_file = str(os.environ.get("VPNBOT_XRAY_RU_GEOSITE_FILE_VALUE", "")).strip()
+external_tag = str(os.environ.get("VPNBOT_XRAY_RU_GEOSITE_TAG_VALUE", "")).strip()
+if external_geosite_enabled and external_file and external_tag and (share_dir / external_file).is_file():
+    default_domains.insert(0, f"ext:{external_file}:{external_tag}")
 
 domains = default_domains + split_list(os.environ.get("VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS_VALUE", ""))
 ips = default_ips + split_list(os.environ.get("VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS_VALUE", ""))
@@ -1813,6 +1854,8 @@ write_xray_core_base_configs() {
     touch "${XRAY_CORE_LOG_DIR}/access.log" "${XRAY_CORE_LOG_DIR}/error.log"
     chmod 755 "${XRAY_CORE_ROOT}" "${XRAY_CORE_ROOT}/bin" "${XRAY_CORE_CONFIG_DIR}" "${XRAY_CORE_SHARE_DIR}" "${XRAY_CORE_LOG_DIR}"
     chmod 600 "${XRAY_CORE_LOG_DIR}/access.log" "${XRAY_CORE_LOG_DIR}/error.log" 2>/dev/null || true
+
+    download_xray_core_ru_geosite
 
     # Keep minimal access/error logs enabled. The online and abuse trackers depend
     # on access.log, so rerunning the installer repairs older disabled log files.
@@ -3466,6 +3509,7 @@ show_xray_core_summary() {
     echo "  Multi-IP abuse API: ${XRAY_ABUSE_MULTI_IP_URL}"
     echo "  Multi-IP history: ${XRAY_ABUSE_MULTI_IP_HISTORY_FILE}"
     echo "  RU destination egress block: ${VPNBOT_XRAY_BLOCK_RU_EGRESS}"
+    echo "  RU geosite: ${XRAY_CORE_SHARE_DIR}/${VPNBOT_XRAY_RU_GEOSITE_FILE} tag=${VPNBOT_XRAY_RU_GEOSITE_TAG}"
     echo "  Root: ${XRAY_CORE_ROOT}"
     echo "  Binary: ${XRAY_CORE_BIN}"
     echo "  Config dir: ${XRAY_CORE_CONFIG_DIR}"
