@@ -120,10 +120,12 @@ XRAY_CONN_GUARD_SERVICE_FILE="${XRAY_CONN_GUARD_SERVICE_FILE:-/etc/systemd/syste
 XRAY_CONN_GUARD_PATH_FILE="${XRAY_CONN_GUARD_PATH_FILE:-/etc/systemd/system/vpnbot-xray-conn-guard.path}"
 XRAY_CONN_GUARD_TIMER_FILE="${XRAY_CONN_GUARD_TIMER_FILE:-/etc/systemd/system/vpnbot-xray-conn-guard.timer}"
 XRAY_CONN_GUARD_ENABLED="${XRAY_CONN_GUARD_ENABLED:-1}"
-XRAY_CONN_GUARD_MAX_PER_IP="${XRAY_CONN_GUARD_MAX_PER_IP:-3000}"
-XRAY_CONN_GUARD_IPV6_MAX_PER_IP="${XRAY_CONN_GUARD_IPV6_MAX_PER_IP:-3000}"
+XRAY_CONN_GUARD_MAX_PER_IP="${XRAY_CONN_GUARD_MAX_PER_IP:-1200}"
+XRAY_CONN_GUARD_IPV6_MAX_PER_IP="${XRAY_CONN_GUARD_IPV6_MAX_PER_IP:-1200}"
 XRAY_CONN_GUARD_BAN_ENABLED="${XRAY_CONN_GUARD_BAN_ENABLED:-1}"
 XRAY_CONN_GUARD_BAN_CONNECTIONS="${XRAY_CONN_GUARD_BAN_CONNECTIONS:-${XRAY_CONN_GUARD_MAX_PER_IP}}"
+XRAY_CONN_GUARD_BAN_TOTAL_STATES="${XRAY_CONN_GUARD_BAN_TOTAL_STATES:-700}"
+XRAY_CONN_GUARD_BAN_BAD_STATES="${XRAY_CONN_GUARD_BAN_BAD_STATES:-350}"
 XRAY_CONN_GUARD_BAN_SECONDS="${XRAY_CONN_GUARD_BAN_SECONDS:-3600}"
 XRAY_CONN_GUARD_SCAN_MAX_ROWS="${XRAY_CONN_GUARD_SCAN_MAX_ROWS:-80000}"
 XRAY_CONN_GUARD_STATE_DIR="${XRAY_CONN_GUARD_STATE_DIR:-/var/lib/vpnbot-xray-conn-guard}"
@@ -1370,6 +1372,10 @@ EOF
     append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.ip_local_port_range" "1024 65535" && written=$((written + 1))
     append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_fin_timeout" "15" && written=$((written + 1))
     append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_tw_reuse" "1" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_orphan_retries" "1" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_max_orphans" "65536" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_max_tw_buckets" "262144" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_mem" "65536 87380 131072" && written=$((written + 1))
     append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_keepalive_time" "600" && written=$((written + 1))
     append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_keepalive_intvl" "60" && written=$((written + 1))
     append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_keepalive_probes" "5" && written=$((written + 1))
@@ -2446,6 +2452,8 @@ Environment=XRAY_CONN_GUARD_MAX_PER_IP=${XRAY_CONN_GUARD_MAX_PER_IP}
 Environment=XRAY_CONN_GUARD_IPV6_MAX_PER_IP=${XRAY_CONN_GUARD_IPV6_MAX_PER_IP}
 Environment=XRAY_CONN_GUARD_BAN_ENABLED=${XRAY_CONN_GUARD_BAN_ENABLED}
 Environment=XRAY_CONN_GUARD_BAN_CONNECTIONS=${XRAY_CONN_GUARD_BAN_CONNECTIONS}
+Environment=XRAY_CONN_GUARD_BAN_TOTAL_STATES=${XRAY_CONN_GUARD_BAN_TOTAL_STATES}
+Environment=XRAY_CONN_GUARD_BAN_BAD_STATES=${XRAY_CONN_GUARD_BAN_BAD_STATES}
 Environment=XRAY_CONN_GUARD_BAN_SECONDS=${XRAY_CONN_GUARD_BAN_SECONDS}
 Environment=XRAY_CONN_GUARD_SCAN_MAX_ROWS=${XRAY_CONN_GUARD_SCAN_MAX_ROWS}
 Environment=XRAY_CONN_GUARD_STATE_DIR=${XRAY_CONN_GUARD_STATE_DIR}
@@ -2471,8 +2479,8 @@ Description=Periodic VPnBot Xray-core connection guard refresh
 
 [Timer]
 OnBootSec=90s
-OnUnitActiveSec=5min
-RandomizedDelaySec=30s
+OnUnitActiveSec=60s
+RandomizedDelaySec=10s
 Unit=${XRAY_CONN_GUARD_SERVICE_NAME}
 
 [Install]
@@ -2486,7 +2494,7 @@ EOF
         1|true|yes|on) systemctl start "${XRAY_CONN_GUARD_SERVICE_NAME}" || true ;;
     esac
     log "Installed Xray-core connection guard service: ${XRAY_CONN_GUARD_SERVICE_NAME}"
-    info "Connection guard max per source IP per public inbound port: IPv4=${XRAY_CONN_GUARD_MAX_PER_IP}, IPv6=${XRAY_CONN_GUARD_IPV6_MAX_PER_IP}"
+    info "Connection guard max per source IP per public inbound port: IPv4=${XRAY_CONN_GUARD_MAX_PER_IP}, IPv6=${XRAY_CONN_GUARD_IPV6_MAX_PER_IP}, total_states=${XRAY_CONN_GUARD_BAN_TOTAL_STATES}, bad_states=${XRAY_CONN_GUARD_BAN_BAD_STATES}"
 }
 
 
@@ -3110,6 +3118,8 @@ write_xray_core_installer_state() {
     XRAY_CONN_GUARD_IPV6_MAX_PER_IP_VALUE="${XRAY_CONN_GUARD_IPV6_MAX_PER_IP}" \
     XRAY_CONN_GUARD_BAN_ENABLED_VALUE="${XRAY_CONN_GUARD_BAN_ENABLED}" \
     XRAY_CONN_GUARD_BAN_CONNECTIONS_VALUE="${XRAY_CONN_GUARD_BAN_CONNECTIONS}" \
+    XRAY_CONN_GUARD_BAN_TOTAL_STATES_VALUE="${XRAY_CONN_GUARD_BAN_TOTAL_STATES}" \
+    XRAY_CONN_GUARD_BAN_BAD_STATES_VALUE="${XRAY_CONN_GUARD_BAN_BAD_STATES}" \
     XRAY_CONN_GUARD_BAN_SECONDS_VALUE="${XRAY_CONN_GUARD_BAN_SECONDS}" \
     XRAY_CONN_GUARD_SCAN_MAX_ROWS_VALUE="${XRAY_CONN_GUARD_SCAN_MAX_ROWS}" \
     XRAY_SOCKET_OVERLOAD_WARN_ROWS_VALUE="${XRAY_SOCKET_OVERLOAD_WARN_ROWS}" \
@@ -3188,6 +3198,8 @@ payload = {
         "max_per_ipv6": int(os.environ["XRAY_CONN_GUARD_IPV6_MAX_PER_IP_VALUE"]),
         "temporary_ban_enabled": parse_bool(os.environ.get("XRAY_CONN_GUARD_BAN_ENABLED_VALUE")),
         "temporary_ban_connections": int(os.environ["XRAY_CONN_GUARD_BAN_CONNECTIONS_VALUE"]),
+        "temporary_ban_total_states": int(os.environ["XRAY_CONN_GUARD_BAN_TOTAL_STATES_VALUE"]),
+        "temporary_ban_bad_states": int(os.environ["XRAY_CONN_GUARD_BAN_BAD_STATES_VALUE"]),
         "temporary_ban_seconds": int(os.environ["XRAY_CONN_GUARD_BAN_SECONDS_VALUE"]),
         "scan_max_rows": int(os.environ["XRAY_CONN_GUARD_SCAN_MAX_ROWS_VALUE"]),
         "socket_overload_warn_rows": int(os.environ["XRAY_SOCKET_OVERLOAD_WARN_ROWS_VALUE"]),

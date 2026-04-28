@@ -36,6 +36,14 @@ BAN_CONNECTIONS = max(
     100,
     int(os.environ.get("XRAY_CONN_GUARD_BAN_CONNECTIONS", str(MAX_PER_IP)) or MAX_PER_IP),
 )
+BAN_TOTAL_STATES = max(
+    100,
+    int(os.environ.get("XRAY_CONN_GUARD_BAN_TOTAL_STATES", "700") or "700"),
+)
+BAN_BAD_STATES = max(
+    50,
+    int(os.environ.get("XRAY_CONN_GUARD_BAN_BAD_STATES", "350") or "350"),
+)
 BAN_SECONDS = max(60, min(int(os.environ.get("XRAY_CONN_GUARD_BAN_SECONDS", "3600") or "3600"), 86400))
 SCAN_MAX_ROWS = max(
     1000,
@@ -46,6 +54,14 @@ BAN_STATE_FILE = Path(os.environ.get("XRAY_CONN_GUARD_BAN_STATE_FILE", str(STATE
 EVENTS_FILE = Path(os.environ.get("XRAY_CONN_GUARD_EVENTS_FILE", str(STATE_DIR / "events.jsonl")))
 SHARED_PORT_RE = re.compile(r"\[shared:(?P<port>\d{1,5})\]")
 _IPV6_RE = re.compile(r"^[0-9a-fA-F:]+$")
+BAD_TCP_STATES = {
+    "CLOSE-WAIT",
+    "CLOSING",
+    "FIN-WAIT-1",
+    "FIN-WAIT-2",
+    "LAST-ACK",
+    "SYN-RECV",
+}
 
 
 def _run(args: list[str], *, check: bool = False) -> subprocess.CompletedProcess:
@@ -152,11 +168,14 @@ def _scan_abusive_ips(ports: list[int]) -> tuple[list[dict], int, bool]:
     if not BAN_ENABLED or not ports or not _cmd_exists("ss"):
         return [], 0, False
     public_ports = set(int(port) for port in ports)
-    counts: dict[tuple[str, int], int] = {}
+    established_counts: dict[tuple[str, int], int] = {}
+    total_counts: dict[tuple[str, int], int] = {}
+    bad_counts: dict[tuple[str, int], int] = {}
+    state_counts: dict[tuple[str, int], dict[str, int]] = {}
     rows_seen = 0
     limited = False
     proc = subprocess.Popen(
-        ["ss", "-Hant", "state", "established"],
+        ["ss", "-Hant"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -170,19 +189,31 @@ def _scan_abusive_ips(ports: list[int]) -> tuple[list[dict], int, bool]:
                 proc.kill()
                 break
             parts = raw.split()
-            if len(parts) < 4:
+            if len(parts) < 5:
                 continue
-            local = _parse_ss_endpoint(parts[2])
-            peer = _parse_ss_endpoint(parts[3])
+            state = str(parts[0] or "").strip().upper()
+            if state in {"LISTEN", "UNCONN"}:
+                continue
+            local = _parse_ss_endpoint(parts[3])
+            peer = _parse_ss_endpoint(parts[4])
             if not local or not peer:
                 continue
             _local_ip, local_port = local
-            peer_ip, _peer_port = peer
+            peer_ip, peer_port = peer
             if local_port not in public_ports:
+                continue
+            if peer_port > 0 and peer_port < 1024:
                 continue
             if _is_loopback_ip(peer_ip):
                 continue
-            counts[(peer_ip, local_port)] = counts.get((peer_ip, local_port), 0) + 1
+            key = (peer_ip, local_port)
+            total_counts[key] = total_counts.get(key, 0) + 1
+            if state == "ESTAB":
+                established_counts[key] = established_counts.get(key, 0) + 1
+            if state in BAD_TCP_STATES:
+                bad_counts[key] = bad_counts.get(key, 0) + 1
+            per_state = state_counts.setdefault(key, {})
+            per_state[state] = per_state.get(state, 0) + 1
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
@@ -193,10 +224,40 @@ def _scan_abusive_ips(ports: list[int]) -> tuple[list[dict], int, bool]:
             proc.stdout.close()
 
     offenders = []
-    for (ip, port), count in counts.items():
-        if count >= BAN_CONNECTIONS:
-            offenders.append({"ip": ip, "port": int(port), "connection_count": int(count)})
-    offenders.sort(key=lambda item: int(item.get("connection_count") or 0), reverse=True)
+    for key, total_count in total_counts.items():
+        ip, port = key
+        established_count = int(established_counts.get(key, 0))
+        bad_count = int(bad_counts.get(key, 0))
+        reason = ""
+        threshold = 0
+        trigger_count = 0
+        if established_count >= BAN_CONNECTIONS:
+            reason = "too_many_established_connections_from_one_ip"
+            threshold = BAN_CONNECTIONS
+            trigger_count = established_count
+        elif bad_count >= BAN_BAD_STATES:
+            reason = "too_many_closing_tcp_states_from_one_ip"
+            threshold = BAN_BAD_STATES
+            trigger_count = bad_count
+        elif total_count >= BAN_TOTAL_STATES:
+            reason = "too_many_tcp_states_from_one_ip"
+            threshold = BAN_TOTAL_STATES
+            trigger_count = total_count
+        if reason:
+            offenders.append(
+                {
+                    "ip": ip,
+                    "port": int(port),
+                    "connection_count": int(established_count),
+                    "total_state_count": int(total_count),
+                    "bad_state_count": int(bad_count),
+                    "trigger_count": int(trigger_count),
+                    "threshold": int(threshold),
+                    "reason": reason,
+                    "state_counts": dict(sorted(state_counts.get(key, {}).items())),
+                }
+            )
+    offenders.sort(key=lambda item: int(item.get("trigger_count") or item.get("connection_count") or 0), reverse=True)
     return offenders, rows_seen, limited
 
 
@@ -354,6 +415,8 @@ def _drop_existing_connections(ip: str, port: int) -> None:
     if not ip or port <= 0:
         return
     if _cmd_exists("ss"):
+        _run(["ss", "-K", "dst", ip, "sport", "=", f":{port}"])
+        _run(["ss", "-K", "src", ip, "dport", "=", f":{port}"])
         _run(["ss", "-K", "state", "established", "src", ip, "sport", f":{port}"])
         _run(["ss", "-K", "state", "established", "dst", ip, "dport", f":{port}"])
     if _cmd_exists("conntrack"):
@@ -387,6 +450,21 @@ def _refresh_dynamic_bans(ports: list[int]) -> list[dict]:
                 int(item.get("connection_count") or 0),
                 int(offender.get("connection_count") or 0),
             )
+            item["total_state_count"] = max(
+                int(item.get("total_state_count") or 0),
+                int(offender.get("total_state_count") or 0),
+            )
+            item["bad_state_count"] = max(
+                int(item.get("bad_state_count") or 0),
+                int(offender.get("bad_state_count") or 0),
+            )
+            item["trigger_count"] = max(
+                int(item.get("trigger_count") or 0),
+                int(offender.get("trigger_count") or 0),
+            )
+            item["threshold"] = int(offender.get("threshold") or item.get("threshold") or BAN_CONNECTIONS)
+            item["reason"] = str(offender.get("reason") or item.get("reason") or "too_many_tcp_states_from_one_ip")
+            item["state_counts"] = offender.get("state_counts") or item.get("state_counts") or {}
             item["last_seen_at"] = _utc_iso(now)
             item["last_seen_at_ts"] = now
             if float(item.get("expires_at_ts") or 0) < expires_at:
@@ -396,7 +474,7 @@ def _refresh_dynamic_bans(ports: list[int]) -> list[dict]:
         else:
             item = {
                 **offender,
-                "reason": "too_many_established_connections_from_one_ip",
+                "reason": str(offender.get("reason") or "too_many_tcp_states_from_one_ip"),
                 "created_at": _utc_iso(now),
                 "created_at_ts": now,
                 "last_seen_at": _utc_iso(now),
@@ -404,7 +482,7 @@ def _refresh_dynamic_bans(ports: list[int]) -> list[dict]:
                 "expires_at": _utc_iso(expires_at),
                 "expires_at_ts": expires_at,
                 "ban_seconds": BAN_SECONDS,
-                "threshold": BAN_CONNECTIONS,
+                "threshold": int(offender.get("threshold") or BAN_CONNECTIONS),
             }
             by_key[key] = item
             new_count += 1
@@ -414,7 +492,12 @@ def _refresh_dynamic_bans(ports: list[int]) -> list[dict]:
                     "ip": ip,
                     "port": port,
                     "connection_count": int(offender.get("connection_count") or 0),
-                    "threshold": BAN_CONNECTIONS,
+                    "total_state_count": int(offender.get("total_state_count") or 0),
+                    "bad_state_count": int(offender.get("bad_state_count") or 0),
+                    "trigger_count": int(offender.get("trigger_count") or 0),
+                    "threshold": int(offender.get("threshold") or BAN_CONNECTIONS),
+                    "reason": str(offender.get("reason") or "too_many_tcp_states_from_one_ip"),
+                    "state_counts": offender.get("state_counts") or {},
                     "ban_seconds": BAN_SECONDS,
                     "expires_at": item["expires_at"],
                     "rows_seen": rows_seen,
@@ -434,7 +517,8 @@ def _refresh_dynamic_bans(ports: list[int]) -> list[dict]:
             "dynamic bans: "
             f"active={len(bans)} new={new_count} extended={extended_count} "
             f"offenders={len(offenders)} rows_seen={rows_seen} limited={limited} "
-            f"threshold={BAN_CONNECTIONS} seconds={BAN_SECONDS}"
+            f"established_threshold={BAN_CONNECTIONS} total_threshold={BAN_TOTAL_STATES} "
+            f"bad_threshold={BAN_BAD_STATES} seconds={BAN_SECONDS}"
         )
     return bans
 
