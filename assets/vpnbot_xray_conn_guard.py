@@ -54,19 +54,19 @@ PORT_BAD_STATES = max(
 )
 PORT_PRESSURE_MIN_IP_TOTAL = max(
     100,
-    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_TOTAL", "500") or "500"),
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_TOTAL", "150") or "150"),
 )
 PORT_PRESSURE_MIN_IP_BAD = max(
-    50,
-    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_BAD", "100") or "100"),
+    25,
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_BAD", "25") or "25"),
 )
 PORT_PRESSURE_MIN_IP_ESTAB = max(
     100,
-    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_ESTAB", "900") or "900"),
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_ESTAB", "700") or "700"),
 )
 PORT_PRESSURE_MAX_BANS_PER_PORT = max(
     1,
-    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MAX_BANS_PER_PORT", "5") or "5"),
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MAX_BANS_PER_PORT", "10") or "10"),
 )
 PORT_PRESSURE_EVENT_COOLDOWN_SECONDS = max(
     60,
