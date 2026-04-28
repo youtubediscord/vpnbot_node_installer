@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-TRACKER_VERSION = "2026-04-28.1"
+TRACKER_VERSION = "2026-04-28.2"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
 MANAGED_INBOUNDS_FILE = Path(
     os.environ.get(
@@ -68,6 +68,52 @@ CONNECTION_TOP_LIMIT = max(
 CONNECTION_TOP_MAX_ROWS = max(
     10_000,
     min(int(os.environ.get("XRAY_CONNECTION_TOP_MAX_ROWS", "80000")), 1_000_000),
+)
+CONN_GUARD_STATE_DIR = Path(
+    os.environ.get("XRAY_CONN_GUARD_STATE_DIR", "/var/lib/vpnbot-xray-conn-guard")
+)
+CONN_GUARD_BAN_STATE_FILE = Path(
+    os.environ.get("XRAY_CONN_GUARD_BAN_STATE_FILE", str(CONN_GUARD_STATE_DIR / "bans.json"))
+)
+CONN_GUARD_EVENTS_FILE = Path(
+    os.environ.get("XRAY_CONN_GUARD_EVENTS_FILE", str(CONN_GUARD_STATE_DIR / "events.jsonl"))
+)
+SOCKET_OVERLOAD_EVENTS_FILE = Path(
+    os.environ.get(
+        "XRAY_SOCKET_OVERLOAD_EVENTS_FILE",
+        "/var/lib/vpnbot-xray-online/socket_overload_events.jsonl",
+    )
+)
+SOCKET_OVERLOAD_AUTO_HEAL_ENABLED = (
+    str(os.environ.get("XRAY_SOCKET_OVERLOAD_AUTO_HEAL_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
+)
+SOCKET_OVERLOAD_WARN_ROWS = max(
+    1000,
+    int(os.environ.get("XRAY_SOCKET_OVERLOAD_WARN_ROWS", "40000") or "40000"),
+)
+SOCKET_OVERLOAD_CONSECUTIVE = max(
+    2,
+    min(int(os.environ.get("XRAY_SOCKET_OVERLOAD_CONSECUTIVE", "2") or "2"), 10),
+)
+SOCKET_OVERLOAD_GUARD_SERVICE = os.environ.get(
+    "XRAY_SOCKET_OVERLOAD_GUARD_SERVICE",
+    "vpnbot-xray-conn-guard.service",
+)
+SOCKET_OVERLOAD_XRAY_SERVICE = os.environ.get(
+    "XRAY_SOCKET_OVERLOAD_XRAY_SERVICE",
+    "vpnbot-xray.service",
+)
+SOCKET_OVERLOAD_GUARD_RESTART_COOLDOWN_SECONDS = max(
+    60,
+    min(int(os.environ.get("XRAY_SOCKET_OVERLOAD_GUARD_RESTART_COOLDOWN_SECONDS", "300") or "300"), 3600),
+)
+SOCKET_OVERLOAD_XRAY_RESTART_COOLDOWN_SECONDS = max(
+    300,
+    min(int(os.environ.get("XRAY_SOCKET_OVERLOAD_XRAY_RESTART_COOLDOWN_SECONDS", "1800") or "1800"), 86400),
+)
+SOCKET_OVERLOAD_XRAY_AFTER_GUARD_SECONDS = max(
+    30,
+    min(int(os.environ.get("XRAY_SOCKET_OVERLOAD_XRAY_AFTER_GUARD_SECONDS", "60") or "60"), 1800),
 )
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
 PER_IP_ACTIVE_BPS = max(0, int(os.environ.get("XRAY_ABUSE_PER_IP_ACTIVE_BPS", "1000000")))
@@ -162,6 +208,18 @@ SOCKET_TRAFFIC_STATUS: dict[str, object] = {
     "max_ss_lines": PER_IP_TRAFFIC_MAX_SS_LINES,
     "unavailable_reason": "",
 }
+SOCKET_OVERLOAD_STATE: dict[str, object] = {
+    "consecutive_high": 0,
+    "last_socket_rows_seen": 0,
+    "last_checked_at": "",
+    "last_checked_at_ts": 0.0,
+    "last_guard_restart_at": "",
+    "last_guard_restart_at_ts": 0.0,
+    "last_xray_restart_at": "",
+    "last_xray_restart_at_ts": 0.0,
+    "last_action": "",
+    "last_error": "",
+}
 MULTI_IP_ABUSE_CACHE: dict[str, tuple[float, dict]] = {}
 CONNECTION_TOP_CACHE: tuple[float, dict] | None = None
 HISTORY_DIRTY = False
@@ -191,6 +249,8 @@ def script_sha256() -> str:
 
 def health_payload() -> dict:
     per_ip_status = _socket_traffic_status_snapshot(time.time())
+    auto_guard = _socket_overload_health_snapshot(time.time())
+    connection_guard = _connection_guard_health_snapshot(time.time())
     return {
         "ok": True,
         "source": "vpnbot_xray_online_tracker",
@@ -231,6 +291,8 @@ def health_payload() -> dict:
             "top_limit": CONNECTION_TOP_LIMIT,
             "max_rows": CONNECTION_TOP_MAX_ROWS,
         },
+        "auto_guard": auto_guard,
+        "connection_guard": connection_guard,
         "access_log": str(ACCESS_LOG),
         "script_path": str(Path(__file__)),
         "script_sha256": script_sha256(),
@@ -249,6 +311,163 @@ def health_payload() -> dict:
 
 def utc_iso(ts: float | None = None) -> str:
     return datetime.fromtimestamp(ts or time.time(), timezone.utc).isoformat()
+
+
+def _tail_jsonl(path: Path, limit: int = 20) -> list[dict]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    out: list[dict] = []
+    for raw in lines[-max(1, limit) :]:
+        try:
+            item = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+def _load_connection_guard_bans(now: float) -> list[dict]:
+    try:
+        payload = json.loads(CONN_GUARD_BAN_STATE_FILE.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return []
+    bans = payload.get("bans") if isinstance(payload, dict) else []
+    out: list[dict] = []
+    for item in bans if isinstance(bans, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            expires_at_ts = float(item.get("expires_at_ts") or 0.0)
+        except Exception:
+            expires_at_ts = 0.0
+        if expires_at_ts > now:
+            out.append(dict(item))
+    return out
+
+
+def _connection_guard_health_snapshot(now: float) -> dict:
+    bans = _load_connection_guard_bans(now)
+    events = _tail_jsonl(CONN_GUARD_EVENTS_FILE, limit=20)
+    return {
+        "enabled": True,
+        "state_dir": str(CONN_GUARD_STATE_DIR),
+        "ban_state_file": str(CONN_GUARD_BAN_STATE_FILE),
+        "events_file": str(CONN_GUARD_EVENTS_FILE),
+        "active_ban_count": len(bans),
+        "active_bans": bans[:20],
+        "recent_events": events[-10:],
+    }
+
+
+def _socket_overload_health_snapshot(now: float) -> dict:
+    with LOCK:
+        state = dict(SOCKET_OVERLOAD_STATE)
+    state.update(
+        {
+            "enabled": SOCKET_OVERLOAD_AUTO_HEAL_ENABLED,
+            "warn_rows": SOCKET_OVERLOAD_WARN_ROWS,
+            "consecutive_threshold": SOCKET_OVERLOAD_CONSECUTIVE,
+            "guard_service": SOCKET_OVERLOAD_GUARD_SERVICE,
+            "xray_service": SOCKET_OVERLOAD_XRAY_SERVICE,
+            "events_file": str(SOCKET_OVERLOAD_EVENTS_FILE),
+            "recent_events": _tail_jsonl(SOCKET_OVERLOAD_EVENTS_FILE, limit=10),
+        }
+    )
+    checked_at_ts = float(state.get("last_checked_at_ts") or 0.0)
+    state["last_checked_age_seconds"] = int(max(0, now - checked_at_ts)) if checked_at_ts > 0 else -1
+    return state
+
+
+def _append_socket_overload_event(event: dict) -> None:
+    try:
+        SOCKET_OVERLOAD_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ts": int(time.time()),
+            "at": utc_iso(),
+            **event,
+        }
+        with SOCKET_OVERLOAD_EVENTS_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
+def _systemctl_restart(service_name: str, timeout_seconds: int = 20) -> tuple[bool, str]:
+    if not service_name:
+        return False, "empty service name"
+    proc = subprocess.run(
+        ["systemctl", "restart", service_name],
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
+    text = (proc.stderr or proc.stdout or "").strip()
+    return proc.returncode == 0, text[-500:]
+
+
+def _maybe_handle_socket_overload(now: float, socket_rows: int, *, limited: bool) -> None:
+    if not SOCKET_OVERLOAD_AUTO_HEAL_ENABLED:
+        return
+
+    with LOCK:
+        state = SOCKET_OVERLOAD_STATE
+        state["last_socket_rows_seen"] = int(max(0, socket_rows))
+        state["last_checked_at"] = utc_iso(now)
+        state["last_checked_at_ts"] = float(now)
+        if socket_rows >= SOCKET_OVERLOAD_WARN_ROWS:
+            state["consecutive_high"] = int(state.get("consecutive_high") or 0) + 1
+        else:
+            state["consecutive_high"] = 0
+            state["last_error"] = ""
+            return
+
+        consecutive = int(state.get("consecutive_high") or 0)
+        last_guard = float(state.get("last_guard_restart_at_ts") or 0.0)
+        last_xray = float(state.get("last_xray_restart_at_ts") or 0.0)
+
+    if consecutive < SOCKET_OVERLOAD_CONSECUTIVE:
+        return
+
+    action = ""
+    service = ""
+    if now - last_guard >= SOCKET_OVERLOAD_GUARD_RESTART_COOLDOWN_SECONDS:
+        action = "restart_connection_guard"
+        service = SOCKET_OVERLOAD_GUARD_SERVICE
+    elif (
+        last_guard > 0
+        and now - last_guard >= SOCKET_OVERLOAD_XRAY_AFTER_GUARD_SECONDS
+        and now - last_xray >= SOCKET_OVERLOAD_XRAY_RESTART_COOLDOWN_SECONDS
+    ):
+        action = "restart_xray"
+        service = SOCKET_OVERLOAD_XRAY_SERVICE
+    else:
+        return
+
+    ok, detail = _systemctl_restart(service)
+    event = {
+        "event": action,
+        "service": service,
+        "ok": ok,
+        "socket_rows_seen": int(socket_rows),
+        "warn_rows": SOCKET_OVERLOAD_WARN_ROWS,
+        "consecutive_high": consecutive,
+        "limited": bool(limited),
+        "detail": detail,
+    }
+    with LOCK:
+        SOCKET_OVERLOAD_STATE["last_action"] = action
+        SOCKET_OVERLOAD_STATE["last_error"] = "" if ok else detail
+        if action == "restart_connection_guard":
+            SOCKET_OVERLOAD_STATE["last_guard_restart_at"] = utc_iso(now)
+            SOCKET_OVERLOAD_STATE["last_guard_restart_at_ts"] = float(now)
+        elif action == "restart_xray":
+            SOCKET_OVERLOAD_STATE["last_xray_restart_at"] = utc_iso(now)
+            SOCKET_OVERLOAD_STATE["last_xray_restart_at_ts"] = float(now)
+    _append_socket_overload_event(event)
 
 
 def _set_socket_traffic_status(
@@ -1801,6 +2020,7 @@ def query_socket_ip_traffic(now: float) -> dict[str, dict]:
         return {}
 
     socket_rows, socket_rows_limited = _established_socket_count_limited(PER_IP_TRAFFIC_MAX_SS_LINES)
+    _maybe_handle_socket_overload(now, socket_rows, limited=socket_rows_limited)
     if socket_rows_limited:
         _set_socket_traffic_status(
             "skipped",
