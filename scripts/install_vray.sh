@@ -1684,8 +1684,10 @@ def rule_covers(rule: dict, key: str, values: list[str]) -> bool:
     return bool(values) and set(values).issubset(present)
 
 
-def exact_managed_rule(rule: dict, key: str, values: list[str]) -> bool:
+def exact_legacy_rule(rule: dict, key: str, values: list[str]) -> bool:
     if rule.get("type") != "field" or rule.get("outboundTag") != "block":
+        return False
+    if rule.get("ruleTag"):
         return False
     return set(rule.get(key) or []) == set(values)
 
@@ -1727,16 +1729,58 @@ rules = routing.setdefault("rules", [])
 if not isinstance(rules, list):
     raise SystemExit(f"Invalid Xray routing JSON in {routing_path}: routing.rules must be an array")
 
+managed_tags = {"vpnbot-block-ru-domains", "vpnbot-block-ru-ips"}
+
 if enabled:
     strategy = str(routing.get("domainStrategy") or "").strip()
     if strategy not in {"IPIfNonMatch", "IPOnDemand"}:
         routing["domainStrategy"] = "IPIfNonMatch"
 
     managed = [
-        ("domain", domains, {"type": "field", "domain": domains, "outboundTag": "block"}),
-        ("ip", ips, {"type": "field", "ip": ips, "outboundTag": "block"}),
+        (
+            "vpnbot-block-ru-domains",
+            "domain",
+            domains,
+            {
+                "type": "field",
+                "domain": domains,
+                "outboundTag": "block",
+                "ruleTag": "vpnbot-block-ru-domains",
+            },
+        ),
+        (
+            "vpnbot-block-ru-ips",
+            "ip",
+            ips,
+            {
+                "type": "field",
+                "ip": ips,
+                "outboundTag": "block",
+                "ruleTag": "vpnbot-block-ru-ips",
+            },
+        ),
     ]
-    for key, values, rule in reversed(managed):
+    for tag, key, values, rule in reversed(managed):
+        tagged_index = next(
+            (idx for idx, existing in enumerate(rules) if isinstance(existing, dict) and existing.get("ruleTag") == tag),
+            None,
+        )
+        if tagged_index is not None:
+            rules[tagged_index] = rule
+            continue
+
+        legacy_index = next(
+            (
+                idx
+                for idx, existing in enumerate(rules)
+                if isinstance(existing, dict) and exact_legacy_rule(existing, key, values)
+            ),
+            None,
+        )
+        if legacy_index is not None:
+            rules[legacy_index] = rule
+            continue
+
         if not any(rule_covers(existing, key, values) for existing in rules if isinstance(existing, dict)):
             rules.insert(0, rule)
 else:
@@ -1746,8 +1790,9 @@ else:
         if not (
             isinstance(rule, dict)
             and (
-                exact_managed_rule(rule, "domain", domains)
-                or exact_managed_rule(rule, "ip", ips)
+                rule.get("ruleTag") in managed_tags
+                or exact_legacy_rule(rule, "domain", domains)
+                or exact_legacy_rule(rule, "ip", ips)
             )
         )
     ]
