@@ -1551,6 +1551,7 @@ _LOG_EMAIL_RE = re.compile(r"\bemail:\s*(?P<email>\S+)")
 _SS_ENDPOINT_RE = re.compile(r"^(?P<host>.+):(?P<port>\d+)$")
 _SS_BYTES_SENT_RE = re.compile(r"\bbytes_sent:(?P<value>\d+)\b")
 _SS_BYTES_RECEIVED_RE = re.compile(r"\bbytes_received:(?P<value>\d+)\b")
+_SHARED_PORT_RE = re.compile(r"\[shared:(?P<port>\d{1,5})\]")
 
 
 def _parse_ss_endpoint(value: str) -> tuple[str, int] | None:
@@ -1612,6 +1613,17 @@ def _managed_public_ports() -> set[int]:
     for inbound in data.get("inbounds") or []:
         if not isinstance(inbound, dict) or inbound.get("enable") is False:
             continue
+        marker_text = " ".join(
+            str(inbound.get(key) or "")
+            for key in ("tag", "remark", "name")
+        )
+        for match in _SHARED_PORT_RE.finditer(marker_text):
+            try:
+                shared_port = int(match.group("port") or 0)
+            except Exception:
+                shared_port = 0
+            if 0 < shared_port <= 65535:
+                ports.add(shared_port)
         try:
             port = int(inbound.get("port") or 0)
         except Exception:

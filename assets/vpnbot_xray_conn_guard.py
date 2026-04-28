@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -23,6 +24,7 @@ ENABLED = str(os.environ.get("XRAY_CONN_GUARD_ENABLED", "1")).strip().lower() no
 MAX_PER_IP = max(1, int(os.environ.get("XRAY_CONN_GUARD_MAX_PER_IP", "3000") or "3000"))
 IPV6_MAX_PER_IP = max(1, int(os.environ.get("XRAY_CONN_GUARD_IPV6_MAX_PER_IP", str(MAX_PER_IP)) or MAX_PER_IP))
 CHAIN = os.environ.get("XRAY_CONN_GUARD_CHAIN", "VPNBOT_XRAY_CONN_GUARD")
+SHARED_PORT_RE = re.compile(r"\[shared:(?P<port>\d{1,5})\]")
 
 
 def _run(args: list[str], *, check: bool = False) -> subprocess.CompletedProcess:
@@ -43,6 +45,17 @@ def _managed_public_ports() -> list[int]:
     for inbound in data.get("inbounds") or []:
         if not isinstance(inbound, dict) or inbound.get("enable") is False:
             continue
+        marker_text = " ".join(
+            str(inbound.get(key) or "")
+            for key in ("tag", "remark", "name")
+        )
+        for match in SHARED_PORT_RE.finditer(marker_text):
+            try:
+                shared_port = int(match.group("port") or 0)
+            except Exception:
+                shared_port = 0
+            if 0 < shared_port <= 65535:
+                ports.add(shared_port)
         try:
             port = int(inbound.get("port") or 0)
         except Exception:
