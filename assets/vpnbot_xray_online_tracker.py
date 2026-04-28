@@ -67,7 +67,7 @@ CONNECTION_TOP_LIMIT = max(
 )
 CONNECTION_TOP_MAX_ROWS = max(
     10_000,
-    min(int(os.environ.get("XRAY_CONNECTION_TOP_MAX_ROWS", "350000")), 1_000_000),
+    min(int(os.environ.get("XRAY_CONNECTION_TOP_MAX_ROWS", "80000")), 1_000_000),
 )
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
 PER_IP_ACTIVE_BPS = max(0, int(os.environ.get("XRAY_ABUSE_PER_IP_ACTIVE_BPS", "1000000")))
