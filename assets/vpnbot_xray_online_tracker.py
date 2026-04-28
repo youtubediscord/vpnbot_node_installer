@@ -15,8 +15,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-TRACKER_VERSION = "2026-04-27.15"
+TRACKER_VERSION = "2026-04-28.1"
 ACCESS_LOG = Path(os.environ.get("XRAY_ONLINE_ACCESS_LOG", "/opt/vpnbot/xray-core/logs/access.log"))
+MANAGED_INBOUNDS_FILE = Path(
+    os.environ.get(
+        "XRAY_MANAGED_INBOUNDS_FILE",
+        "/opt/vpnbot/xray-core/config/50_vpnbot_managed_inbounds.json",
+    )
+)
 BIND_HOST = os.environ.get("XRAY_ONLINE_BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.environ.get("XRAY_ONLINE_BIND_PORT", "10086"))
 WINDOW_SECONDS = max(10, min(int(os.environ.get("XRAY_ONLINE_WINDOW_SECONDS", "180")), 3600))
@@ -50,6 +56,18 @@ PER_IP_TRAFFIC_STALE_SECONDS = max(
 PER_IP_TRAFFIC_MAX_SS_LINES = max(
     1000,
     min(int(os.environ.get("XRAY_ABUSE_PER_IP_TRAFFIC_MAX_SS_LINES", "50000")), 500000),
+)
+CONNECTION_TOP_CACHE_TTL_SECONDS = max(
+    5.0,
+    min(float(os.environ.get("XRAY_CONNECTION_TOP_CACHE_TTL_SECONDS", "30")), 300.0),
+)
+CONNECTION_TOP_LIMIT = max(
+    3,
+    min(int(os.environ.get("XRAY_CONNECTION_TOP_LIMIT", "10")), 50),
+)
+CONNECTION_TOP_MAX_ROWS = max(
+    10_000,
+    min(int(os.environ.get("XRAY_CONNECTION_TOP_MAX_ROWS", "350000")), 1_000_000),
 )
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
 PER_IP_ACTIVE_BPS = max(0, int(os.environ.get("XRAY_ABUSE_PER_IP_ACTIVE_BPS", "1000000")))
@@ -145,6 +163,7 @@ SOCKET_TRAFFIC_STATUS: dict[str, object] = {
     "unavailable_reason": "",
 }
 MULTI_IP_ABUSE_CACHE: dict[str, tuple[float, dict]] = {}
+CONNECTION_TOP_CACHE: tuple[float, dict] | None = None
 HISTORY_DIRTY = False
 LAST_HISTORY_SAVE_AT = 0.0
 LAST_LINE_AT = 0.0
@@ -183,6 +202,7 @@ def health_payload() -> dict:
             "abuse_multi_ip": True,
             "multi_ip_cache": ABUSE_MULTI_IP_CACHE_TTL_SECONDS > 0,
             "per_ip_traffic": True,
+            "connection_top": True,
         },
         "abuse_audit": {
             "enabled": ABUSE_AUDIT_ENABLED,
@@ -204,6 +224,12 @@ def health_payload() -> dict:
             "stale_seconds": PER_IP_TRAFFIC_STALE_SECONDS,
             "max_ss_lines": PER_IP_TRAFFIC_MAX_SS_LINES,
             "unavailable_reason": per_ip_status.get("unavailable_reason") or "",
+        },
+        "connection_top": {
+            "endpoint": "/connections/top",
+            "cache_ttl_seconds": CONNECTION_TOP_CACHE_TTL_SECONDS,
+            "top_limit": CONNECTION_TOP_LIMIT,
+            "max_rows": CONNECTION_TOP_MAX_ROWS,
         },
         "access_log": str(ACCESS_LOG),
         "script_path": str(Path(__file__)),
@@ -1557,6 +1583,141 @@ def _is_loopback_ip(value: str) -> bool:
         return False
 
 
+def _managed_public_ports() -> set[int]:
+    try:
+        data = json.loads(MANAGED_INBOUNDS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+
+    ports: set[int] = set()
+    for inbound in data.get("inbounds") or []:
+        if not isinstance(inbound, dict) or inbound.get("enable") is False:
+            continue
+        try:
+            port = int(inbound.get("port") or 0)
+        except Exception:
+            port = 0
+        if port <= 0 or port > 65535:
+            continue
+        listen = str(inbound.get("listen") or "0.0.0.0").strip().lower()
+        if listen in {"127.0.0.1", "::1", "localhost"}:
+            continue
+        ports.add(port)
+    return ports
+
+
+def _counter_rows(counter: dict, limit: int = CONNECTION_TOP_LIMIT) -> list[dict]:
+    rows = []
+    if hasattr(counter, "most_common"):
+        items = counter.most_common(limit)
+    else:
+        items = sorted(counter.items(), key=lambda item: int(item[1] or 0), reverse=True)[:limit]
+    for key, count in items:
+        rows.append({"key": str(key), "count": int(count)})
+    return rows
+
+
+def _connection_top_payload(now: float) -> dict:
+    import collections
+
+    global CONNECTION_TOP_CACHE
+    with LOCK:
+        cached = CONNECTION_TOP_CACHE
+        if cached is not None and (now - float(cached[0])) <= CONNECTION_TOP_CACHE_TTL_SECONDS:
+            return dict(cached[1])
+
+    public_ports = _managed_public_ports()
+    local_ports = collections.Counter()
+    peer_ports = collections.Counter()
+    peer_ips = collections.Counter()
+    public_peer_ips = collections.Counter()
+    other_peer_ips = collections.Counter()
+    local_api = 0
+    rows_seen = 0
+    limited = False
+    per_port_peer_ips: dict[int, collections.Counter] = {}
+
+    proc = subprocess.Popen(
+        [SS_BIN, "-Hant", "state", "established"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            rows_seen += 1
+            if rows_seen > CONNECTION_TOP_MAX_ROWS:
+                limited = True
+                proc.kill()
+                break
+
+            parts = raw.split()
+            if len(parts) < 4:
+                continue
+            local = _parse_ss_endpoint(parts[2])
+            peer = _parse_ss_endpoint(parts[3])
+            if not local or not peer:
+                continue
+            local_ip, local_port = local
+            peer_ip, peer_port = peer
+            local_ports[local_port] += 1
+            peer_ports[peer_port] += 1
+            peer_ips[peer_ip] += 1
+
+            if _is_loopback_ip(local_ip) or _is_loopback_ip(peer_ip):
+                if local_port in {10085, 10086} or peer_port in {10085, 10086}:
+                    local_api += 1
+
+            if local_port in public_ports:
+                public_peer_ips[peer_ip] += 1
+                per_port_peer_ips.setdefault(local_port, collections.Counter())[peer_ip] += 1
+            else:
+                other_peer_ips[peer_ip] += 1
+
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+    top_local_ports = []
+    for port, count in local_ports.most_common(CONNECTION_TOP_LIMIT):
+        port_int = int(port)
+        top_local_ports.append(
+            {
+                "port": port_int,
+                "count": int(count),
+                "managed_public": port_int in public_ports,
+                "top_peer_ips": _counter_rows(per_port_peer_ips.get(port_int, collections.Counter()), 5),
+            }
+        )
+
+    payload = {
+        "ok": True,
+        "source": "ss_established_top",
+        "version": TRACKER_VERSION,
+        "checked_at": utc_iso(now),
+        "checked_at_ts": now,
+        "rows_seen": rows_seen,
+        "limited": limited,
+        "max_rows": CONNECTION_TOP_MAX_ROWS,
+        "managed_public_ports": sorted(public_ports),
+        "local_api_established": local_api,
+        "top_local_ports": top_local_ports,
+        "top_peer_ips": _counter_rows(peer_ips),
+        "top_public_peer_ips": _counter_rows(public_peer_ips),
+        "top_other_peer_ips": _counter_rows(other_peer_ips),
+        "top_peer_ports": _counter_rows(peer_ports),
+    }
+    with LOCK:
+        CONNECTION_TOP_CACHE = (now, payload)
+    return dict(payload)
+
+
 def _known_recent_client_ips(now: float) -> set[str]:
     cutoff = now - max(WINDOW_SECONDS, max(ABUSE_MULTI_IP_WINDOWS or [WINDOW_SECONDS]))
     out: set[str] = set()
@@ -2072,6 +2233,9 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     window = None
             self._send_json(200, build_multi_ip_abuse(window))
+            return
+        if parsed.path == "/connections/top":
+            self._send_json(200, _connection_top_payload(time.time()))
             return
         self._send_json(404, {"ok": False, "error": "not_found"})
 

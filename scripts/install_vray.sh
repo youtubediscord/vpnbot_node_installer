@@ -114,6 +114,14 @@ XRAY_CORE_ROLLOUT_BUNDLE_FILE="${XRAY_CORE_ROLLOUT_BUNDLE_FILE:-/etc/vpnbot-xray
 XRAY_CORE_API_SERVER="${XRAY_CORE_API_SERVER:-127.0.0.1:10085}"
 XRAY_CTL_SCRIPT="${XRAY_CTL_SCRIPT:-/usr/local/bin/vpnbot-xrayctl}"
 XRAY_RESERVED_PORTS_SCRIPT="${XRAY_RESERVED_PORTS_SCRIPT:-/usr/local/bin/vpnbot-xray-reserve-ports}"
+XRAY_CONN_GUARD_SCRIPT="${XRAY_CONN_GUARD_SCRIPT:-/usr/local/bin/vpnbot-xray-conn-guard}"
+XRAY_CONN_GUARD_SERVICE_NAME="${XRAY_CONN_GUARD_SERVICE_NAME:-vpnbot-xray-conn-guard.service}"
+XRAY_CONN_GUARD_SERVICE_FILE="${XRAY_CONN_GUARD_SERVICE_FILE:-/etc/systemd/system/${XRAY_CONN_GUARD_SERVICE_NAME}}"
+XRAY_CONN_GUARD_PATH_FILE="${XRAY_CONN_GUARD_PATH_FILE:-/etc/systemd/system/vpnbot-xray-conn-guard.path}"
+XRAY_CONN_GUARD_TIMER_FILE="${XRAY_CONN_GUARD_TIMER_FILE:-/etc/systemd/system/vpnbot-xray-conn-guard.timer}"
+XRAY_CONN_GUARD_ENABLED="${XRAY_CONN_GUARD_ENABLED:-1}"
+XRAY_CONN_GUARD_MAX_PER_IP="${XRAY_CONN_GUARD_MAX_PER_IP:-3000}"
+XRAY_CONN_GUARD_IPV6_MAX_PER_IP="${XRAY_CONN_GUARD_IPV6_MAX_PER_IP:-3000}"
 XRAY_ONLINE_TRACKER_CANONICAL_SCRIPT="/usr/local/bin/vpnbot-xray-online-tracker"
 XRAY_ONLINE_TRACKER_LEGACY_SCRIPT="/root/vpnbot-xray-online-tracker"
 XRAY_ONLINE_TRACKER_SCRIPT="${XRAY_ONLINE_TRACKER_SCRIPT:-${XRAY_ONLINE_TRACKER_CANONICAL_SCRIPT}}"
@@ -146,6 +154,10 @@ XRAY_ABUSE_MULTI_IP_RISK_EVENT_MIN_INTERVAL_SECONDS="${XRAY_ABUSE_MULTI_IP_RISK_
 XRAY_ABUSE_MULTI_IP_CACHE_TTL_SECONDS="${XRAY_ABUSE_MULTI_IP_CACHE_TTL_SECONDS:-10}"
 XRAY_ABUSE_PER_IP_TRAFFIC_MAX_SS_LINES="${XRAY_ABUSE_PER_IP_TRAFFIC_MAX_SS_LINES:-50000}"
 XRAY_ABUSE_MULTI_IP_URL="${XRAY_ABUSE_MULTI_IP_URL:-http://${XRAY_ONLINE_TRACKER_BIND}:${XRAY_ONLINE_TRACKER_PORT}/abuse/multi-ip}"
+XRAY_CONNECTION_TOP_URL="${XRAY_CONNECTION_TOP_URL:-http://${XRAY_ONLINE_TRACKER_BIND}:${XRAY_ONLINE_TRACKER_PORT}/connections/top}"
+XRAY_CONNECTION_TOP_CACHE_TTL_SECONDS="${XRAY_CONNECTION_TOP_CACHE_TTL_SECONDS:-30}"
+XRAY_CONNECTION_TOP_LIMIT="${XRAY_CONNECTION_TOP_LIMIT:-10}"
+XRAY_CONNECTION_TOP_MAX_ROWS="${XRAY_CONNECTION_TOP_MAX_ROWS:-350000}"
 XRAY_SYNC_SCRIPT="${XRAY_SYNC_SCRIPT:-/usr/local/bin/vpnbot-xray-sync-routes}"
 XRAY_SYNC_SERVICE="${XRAY_SYNC_SERVICE:-/etc/systemd/system/vpnbot-xray-sync-routes.service}"
 XRAY_SYNC_PATH="${XRAY_SYNC_PATH:-/etc/systemd/system/vpnbot-xray-sync-routes.path}"
@@ -168,6 +180,11 @@ XRAY_CORE_SMOKE_LINK=""
 INSTALL_VRAY_CURL_COMMAND='bash <(curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/youtubediscord/vpnbot_node_installer/refs/heads/main/install.sh?ts=$(date +%s)")'
 VPNBOT_NETWORK_SYSCTL_FILE="${VPNBOT_NETWORK_SYSCTL_FILE:-/etc/sysctl.d/99-vpnbot-network.conf}"
 VPNBOT_XRAY_RESERVED_PORTS_SYSCTL_FILE="${VPNBOT_XRAY_RESERVED_PORTS_SYSCTL_FILE:-/etc/sysctl.d/99-vpnbot-xray-reserved-ports.conf}"
+XRAY_POLICY_HANDSHAKE_SECONDS="${XRAY_POLICY_HANDSHAKE_SECONDS:-4}"
+XRAY_POLICY_CONN_IDLE_SECONDS="${XRAY_POLICY_CONN_IDLE_SECONDS:-180}"
+XRAY_POLICY_UPLINK_ONLY_SECONDS="${XRAY_POLICY_UPLINK_ONLY_SECONDS:-8}"
+XRAY_POLICY_DOWNLINK_ONLY_SECONDS="${XRAY_POLICY_DOWNLINK_ONLY_SECONDS:-20}"
+VPNBOT_NF_CONNTRACK_TCP_ESTABLISHED_TIMEOUT="${VPNBOT_NF_CONNTRACK_TCP_ESTABLISHED_TIMEOUT:-7200}"
 VPNBOT_XRAY_RESERVED_EXTRA_PORTS="${VPNBOT_XRAY_RESERVED_EXTRA_PORTS:-10086}"
 VPNBOT_NF_CONNTRACK_MAX="${VPNBOT_NF_CONNTRACK_MAX:-1048576}"
 
@@ -1334,7 +1351,7 @@ EOF
     append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_keepalive_intvl" "60" && written=$((written + 1))
     append_vpnbot_sysctl_setting "${tmp}" "net.ipv4.tcp_keepalive_probes" "5" && written=$((written + 1))
     append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_max" "${effective}" && written=$((written + 1))
-    append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_tcp_timeout_established" "86400" && written=$((written + 1))
+    append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_tcp_timeout_established" "${VPNBOT_NF_CONNTRACK_TCP_ESTABLISHED_TIMEOUT}" && written=$((written + 1))
     append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_tcp_timeout_close" "10" && written=$((written + 1))
     append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_tcp_timeout_close_wait" "60" && written=$((written + 1))
     append_vpnbot_sysctl_setting "${tmp}" "net.netfilter.nf_conntrack_tcp_timeout_fin_wait" "120" && written=$((written + 1))
@@ -1687,12 +1704,15 @@ EOF
 }
 EOF
 
-    if [[ ! -f "${XRAY_CORE_CONFIG_DIR}/40_policy.json" ]]; then
-        cat > "${XRAY_CORE_CONFIG_DIR}/40_policy.json" <<'EOF'
+    cat > "${XRAY_CORE_CONFIG_DIR}/40_policy.json" <<EOF
 {
   "policy": {
     "levels": {
       "0": {
+        "handshake": ${XRAY_POLICY_HANDSHAKE_SECONDS},
+        "connIdle": ${XRAY_POLICY_CONN_IDLE_SECONDS},
+        "uplinkOnly": ${XRAY_POLICY_UPLINK_ONLY_SECONDS},
+        "downlinkOnly": ${XRAY_POLICY_DOWNLINK_ONLY_SECONDS},
         "statsUserUplink": true,
         "statsUserDownlink": true,
         "statsUserOnline": true
@@ -1707,7 +1727,6 @@ EOF
   }
 }
 EOF
-    fi
 }
 
 
@@ -2102,6 +2121,10 @@ Environment=XRAY_ONLINE_BOOTSTRAP_BYTES=${XRAY_ONLINE_TRACKER_BOOTSTRAP_BYTES}
 Environment=XRAY_ONLINE_STATS_INTERVAL_SECONDS=${XRAY_ONLINE_TRACKER_STATS_INTERVAL_SECONDS}
 Environment=XRAY_ONLINE_XRAY_BIN=${XRAY_CORE_BIN}
 Environment=XRAY_ONLINE_XRAY_API_SERVER=${XRAY_CORE_API_SERVER}
+Environment=XRAY_MANAGED_INBOUNDS_FILE=${XRAY_CORE_MANAGED_INBOUNDS_FILE}
+Environment=XRAY_CONNECTION_TOP_CACHE_TTL_SECONDS=${XRAY_CONNECTION_TOP_CACHE_TTL_SECONDS}
+Environment=XRAY_CONNECTION_TOP_LIMIT=${XRAY_CONNECTION_TOP_LIMIT}
+Environment=XRAY_CONNECTION_TOP_MAX_ROWS=${XRAY_CONNECTION_TOP_MAX_ROWS}
 # Detailed /abuse target audit is intentionally locked off: it parses target/port
 # details from access.log and was too expensive on busy nodes. Multi-IP abuse
 # detection uses IP churn plus per-IP socket traffic instead.
@@ -2143,6 +2166,61 @@ EOF
     log "Installed Xray-core online tracker service: ${XRAY_ONLINE_TRACKER_SERVICE_NAME}"
     info "Xray-core online tracker API: ${XRAY_ONLINE_TRACKER_URL}"
     info "Xray-core abuse audit API: ${XRAY_ABUSE_AUDIT_URL}"
+}
+
+
+write_xray_conn_guard_assets() {
+    download_node_installer_asset "assets/vpnbot_xray_conn_guard.py" "${XRAY_CONN_GUARD_SCRIPT}" 755
+    log "Installed Xray-core connection guard helper: ${XRAY_CONN_GUARD_SCRIPT}"
+
+    cat > "${XRAY_CONN_GUARD_SERVICE_FILE}" <<EOF
+[Unit]
+Description=VPnBot Xray-core per-IP connection guard
+After=network-online.target ${XRAY_CORE_SERVICE_NAME}
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=XRAY_CORE_MANAGED_INBOUNDS_FILE=${XRAY_CORE_MANAGED_INBOUNDS_FILE}
+Environment=XRAY_CONN_GUARD_ENABLED=${XRAY_CONN_GUARD_ENABLED}
+Environment=XRAY_CONN_GUARD_MAX_PER_IP=${XRAY_CONN_GUARD_MAX_PER_IP}
+Environment=XRAY_CONN_GUARD_IPV6_MAX_PER_IP=${XRAY_CONN_GUARD_IPV6_MAX_PER_IP}
+ExecStart=${XRAY_CONN_GUARD_SCRIPT}
+EOF
+
+    cat > "${XRAY_CONN_GUARD_PATH_FILE}" <<EOF
+[Unit]
+Description=Watch Xray managed inbounds and refresh VPnBot connection guard
+
+[Path]
+PathChanged=${XRAY_CORE_MANAGED_INBOUNDS_FILE}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > "${XRAY_CONN_GUARD_TIMER_FILE}" <<EOF
+[Unit]
+Description=Periodic VPnBot Xray-core connection guard refresh
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Unit=${XRAY_CONN_GUARD_SERVICE_NAME}
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now "$(basename "${XRAY_CONN_GUARD_PATH_FILE}")" >/dev/null
+    systemctl enable --now "$(basename "${XRAY_CONN_GUARD_TIMER_FILE}")" >/dev/null
+    case "${XRAY_CONN_GUARD_ENABLED,,}" in
+        1|true|yes|on) systemctl start "${XRAY_CONN_GUARD_SERVICE_NAME}" || true ;;
+    esac
+    log "Installed Xray-core connection guard service: ${XRAY_CONN_GUARD_SERVICE_NAME}"
+    info "Connection guard max per source IP per public inbound port: IPv4=${XRAY_CONN_GUARD_MAX_PER_IP}, IPv6=${XRAY_CONN_GUARD_IPV6_MAX_PER_IP}"
 }
 
 
@@ -2758,6 +2836,12 @@ write_xray_core_installer_state() {
     XRAY_ABUSE_MULTI_IP_HISTORY_FILE_VALUE="${XRAY_ABUSE_MULTI_IP_HISTORY_FILE}" \
     XRAY_ABUSE_MULTI_IP_KNOWN_IP_TTL_SECONDS_VALUE="${XRAY_ABUSE_MULTI_IP_KNOWN_IP_TTL_SECONDS}" \
     XRAY_ABUSE_MULTI_IP_REPEAT_WINDOW_SECONDS_VALUE="${XRAY_ABUSE_MULTI_IP_REPEAT_WINDOW_SECONDS}" \
+    XRAY_CONNECTION_TOP_URL_VALUE="${XRAY_CONNECTION_TOP_URL}" \
+    XRAY_CONN_GUARD_SCRIPT_VALUE="${XRAY_CONN_GUARD_SCRIPT}" \
+    XRAY_CONN_GUARD_SERVICE_NAME_VALUE="${XRAY_CONN_GUARD_SERVICE_NAME}" \
+    XRAY_CONN_GUARD_ENABLED_VALUE="${XRAY_CONN_GUARD_ENABLED}" \
+    XRAY_CONN_GUARD_MAX_PER_IP_VALUE="${XRAY_CONN_GUARD_MAX_PER_IP}" \
+    XRAY_CONN_GUARD_IPV6_MAX_PER_IP_VALUE="${XRAY_CONN_GUARD_IPV6_MAX_PER_IP}" \
     XRAY_CORE_VERSION_VALUE="${XRAY_CORE_INSTALLED_VERSION}" \
     XRAY_CORE_PUBLIC_ENDPOINT_VALUE="${XRAY_CORE_PUBLIC_ENDPOINT}" \
     APP_DOMAIN_VALUE="${APP_DOMAIN}" \
@@ -2822,6 +2906,14 @@ payload = {
             "repeat_window_seconds": int(os.environ["XRAY_ABUSE_MULTI_IP_REPEAT_WINDOW_SECONDS_VALUE"]),
         },
         "multi_ip_history_file": os.environ["XRAY_ABUSE_MULTI_IP_HISTORY_FILE_VALUE"],
+        "connection_top_api_url": os.environ["XRAY_CONNECTION_TOP_URL_VALUE"],
+    },
+    "connection_guard": {
+        "script": os.environ["XRAY_CONN_GUARD_SCRIPT_VALUE"],
+        "service_name": os.environ["XRAY_CONN_GUARD_SERVICE_NAME_VALUE"],
+        "enabled": parse_bool(os.environ.get("XRAY_CONN_GUARD_ENABLED_VALUE")),
+        "max_per_ipv4": int(os.environ["XRAY_CONN_GUARD_MAX_PER_IP_VALUE"]),
+        "max_per_ipv6": int(os.environ["XRAY_CONN_GUARD_IPV6_MAX_PER_IP_VALUE"]),
     },
     "xray_version": os.environ["XRAY_CORE_VERSION_VALUE"],
     "public_endpoint": os.environ["XRAY_CORE_PUBLIC_ENDPOINT_VALUE"],
@@ -3538,6 +3630,7 @@ main() {
         install_standalone_xray_core
         write_xrayctl_assets
         write_xray_online_tracker_assets
+        write_xray_conn_guard_assets
         ensure_nginx_layout
         ensure_bootstrap_tls_cert
         write_nginx_http_site
