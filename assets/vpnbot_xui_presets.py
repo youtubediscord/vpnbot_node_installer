@@ -363,7 +363,7 @@ def build_sniffing(enabled: bool) -> dict:
         "enabled": enabled,
         "destOverride": ["http", "tls", "quic", "fakedns"],
         "metadataOnly": False,
-        "routeOnly": False,
+        "routeOnly": bool(enabled),
     }
 
 

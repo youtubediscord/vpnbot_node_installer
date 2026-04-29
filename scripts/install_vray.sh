@@ -2145,7 +2145,8 @@ payload = {
             "sniffing": {
                 "enabled": True,
                 "destOverride": ["http", "tls", "quic"],
-                "metadataOnly": False
+                "metadataOnly": False,
+                "routeOnly": True
             }
         }
     ]

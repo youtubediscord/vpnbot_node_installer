@@ -1028,7 +1028,7 @@ def build_xray_payload(spec: dict, rows: list[dict]) -> tuple[dict | None, str]:
             "enabled": security != "reality",
             "destOverride": ["http", "tls", "quic"],
             "metadataOnly": False,
-            "routeOnly": False,
+            "routeOnly": security != "reality",
         },
     }
     return payload, (
