@@ -72,7 +72,9 @@ allowed before the RU block. DonationAlerts widgets are also allowed through
 base domain. Kodik player domains are allowed through `domain:kodikplayer.com`,
 `domain:kodikres.com`, and `domain:kodik-cdn.com`. Habr is allowed through
 `domain:habr.com`, `domain:habrastorage.org`, and `domain:hsto.org`, covering
-Habr pages, subdomains, static assets, and image storage. The same narrow exception is used for Majestic RP game
+Habr pages, subdomains, static assets, and image storage. RuTracker is allowed
+through `domain:rutracker.org` and `domain:rutracker.cc`, covering the forum and
+its static assets. The same narrow exception is used for Majestic RP game
 infrastructure: `domain:majestic-rp.ru`, `domain:majestic-launcher.ru`,
 `domain:majestic-files.net`, `domain:majestic-files.com`, and
 `domain:gta5majestic.com`. This does not add a server firewall rule, so REALITY
