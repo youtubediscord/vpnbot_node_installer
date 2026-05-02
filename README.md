@@ -65,9 +65,10 @@ domains/IPs by default through Xray `routing` and the `blackhole` outbound. The
 installer downloads `roscomvpn-geosite.dat` from
 `hydraponique/roscomvpn-geosite` and uses `ext:roscomvpn-geosite.dat:category-ru`
 plus conservative fallback rules for `.ru`, `.su`, `.рф`, Yandex/VK domains and
-`geoip:ru`. Payment gateways `domain:pally.info` and `domain:pal24.pro` are
-allowed before the RU block. DonationAlerts widgets are also allowed through
-`domain:donationalerts.com`, which covers `www.donationalerts.com`,
+`geoip:ru`. Payment gateways `domain:pally.info`, `domain:pal24.pro`, and
+`domain:donatepay.ru` are allowed before the RU block. DonationAlerts widgets
+are also allowed through `domain:donationalerts.com` and explicit
+`domain:www.donationalerts.com`, which cover the main widget page,
 `files.donationalerts.com`, and the realtime widget connection under the same
 base domain. Kodik player domains are allowed through `domain:kodikplayer.com`,
 `domain:kodikres.com`, and `domain:kodik-cdn.com`. Habr is allowed through

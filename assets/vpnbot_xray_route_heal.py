@@ -101,10 +101,10 @@ def build_default_rules(share_dir: Path) -> tuple[list[str], list[str], list[str
     allow_domains = split_list(
         os.environ.get(
             "VPNBOT_XRAY_RU_EGRESS_ALLOW_DOMAINS",
-            "domain:pally.info,domain:pal24.pro,domain:donationalerts.com,domain:kodikplayer.com,"
-            "domain:kodikres.com,domain:kodik-cdn.com,domain:habr.com,domain:habrastorage.org,"
-            "domain:hsto.org,domain:rutracker.org,domain:rutracker.cc,domain:majestic-rp.ru,"
-            "domain:majestic-launcher.ru,"
+            "domain:pally.info,domain:pal24.pro,domain:donatepay.ru,domain:donationalerts.com,"
+            "domain:www.donationalerts.com,domain:kodikplayer.com,domain:kodikres.com,"
+            "domain:kodik-cdn.com,domain:habr.com,domain:habrastorage.org,domain:hsto.org,"
+            "domain:rutracker.org,domain:rutracker.cc,domain:majestic-rp.ru,domain:majestic-launcher.ru,"
             "domain:majestic-files.net,domain:majestic-files.com,domain:gta5majestic.com",
         )
     )
