@@ -98,7 +98,14 @@ def build_default_rules(share_dir: Path) -> tuple[list[str], list[str], list[str
 
     domains = default_domains + split_list(os.environ.get("VPNBOT_XRAY_BLOCK_RU_EXTRA_DOMAINS", ""))
     ips = default_ips + split_list(os.environ.get("VPNBOT_XRAY_BLOCK_RU_EXTRA_IPS", ""))
-    allow_domains = split_list(os.environ.get("VPNBOT_XRAY_RU_EGRESS_ALLOW_DOMAINS", ""))
+    allow_domains = split_list(
+        os.environ.get(
+            "VPNBOT_XRAY_RU_EGRESS_ALLOW_DOMAINS",
+            "domain:pally.info,domain:pal24.pro,domain:donationalerts.com,domain:majestic-rp.ru,"
+            "domain:majestic-launcher.ru,domain:majestic-files.net,domain:majestic-files.com,"
+            "domain:gta5majestic.com",
+        )
+    )
     return domains, ips, allow_domains
 
 

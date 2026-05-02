@@ -66,8 +66,11 @@ installer downloads `roscomvpn-geosite.dat` from
 `hydraponique/roscomvpn-geosite` and uses `ext:roscomvpn-geosite.dat:category-ru`
 plus conservative fallback rules for `.ru`, `.su`, `.рф`, Yandex/VK domains and
 `geoip:ru`. Payment gateways `domain:pally.info` and `domain:pal24.pro` are
-allowed before the RU block, and the same narrow exception is used for Majestic
-RP game infrastructure: `domain:majestic-rp.ru`, `domain:majestic-launcher.ru`,
+allowed before the RU block. DonationAlerts widgets are also allowed through
+`domain:donationalerts.com`, which covers `www.donationalerts.com`,
+`files.donationalerts.com`, and the realtime widget connection under the same
+base domain. The same narrow exception is used for Majestic RP game
+infrastructure: `domain:majestic-rp.ru`, `domain:majestic-launcher.ru`,
 `domain:majestic-files.net`, `domain:majestic-files.com`, and
 `domain:gta5majestic.com`. This does not add a server firewall rule, so REALITY
 `dest` camouflage targets such as Yandex remain reachable by the node itself.
