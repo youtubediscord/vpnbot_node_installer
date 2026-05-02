@@ -38,31 +38,31 @@ BAN_CONNECTIONS = max(
 )
 BAN_TOTAL_STATES = max(
     100,
-    int(os.environ.get("XRAY_CONN_GUARD_BAN_TOTAL_STATES", "700") or "700"),
+    int(os.environ.get("XRAY_CONN_GUARD_BAN_TOTAL_STATES", "8000") or "8000"),
 )
 BAN_BAD_STATES = max(
     50,
-    int(os.environ.get("XRAY_CONN_GUARD_BAN_BAD_STATES", "350") or "350"),
+    int(os.environ.get("XRAY_CONN_GUARD_BAN_BAD_STATES", "2500") or "2500"),
 )
 PORT_TOTAL_STATES = max(
     1000,
-    int(os.environ.get("XRAY_CONN_GUARD_PORT_TOTAL_STATES", "6000") or "6000"),
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_TOTAL_STATES", "30000") or "30000"),
 )
 PORT_BAD_STATES = max(
     300,
-    int(os.environ.get("XRAY_CONN_GUARD_PORT_BAD_STATES", "1200") or "1200"),
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_BAD_STATES", "8000") or "8000"),
 )
 PORT_PRESSURE_MIN_IP_TOTAL = max(
     100,
-    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_TOTAL", "150") or "150"),
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_TOTAL", "2000") or "2000"),
 )
 PORT_PRESSURE_MIN_IP_BAD = max(
     25,
-    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_BAD", "25") or "25"),
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_BAD", "500") or "500"),
 )
 PORT_PRESSURE_MIN_IP_ESTAB = max(
     100,
-    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_ESTAB", "700") or "700"),
+    int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_MIN_IP_ESTAB", "2000") or "2000"),
 )
 PORT_PRESSURE_MAX_BANS_PER_PORT = max(
     1,
@@ -72,7 +72,7 @@ PORT_PRESSURE_EVENT_COOLDOWN_SECONDS = max(
     60,
     int(os.environ.get("XRAY_CONN_GUARD_PORT_PRESSURE_EVENT_COOLDOWN_SECONDS", "300") or "300"),
 )
-BAN_SECONDS = max(60, min(int(os.environ.get("XRAY_CONN_GUARD_BAN_SECONDS", "3600") or "3600"), 86400))
+BAN_SECONDS = max(60, min(int(os.environ.get("XRAY_CONN_GUARD_BAN_SECONDS", "900") or "900"), 86400))
 SCAN_MAX_ROWS = max(
     1000,
     min(int(os.environ.get("XRAY_CONN_GUARD_SCAN_MAX_ROWS", "80000") or "80000"), 1_000_000),
