@@ -53,6 +53,15 @@ files to stay readable and testable as normal files:
 - `assets/vpnbot_xui_sync_routes.py` - nginx route sync helper for legacy
   3x-ui inbounds.
 
+REALITY presets intentionally keep client-facing SNI separate from the upstream
+`dest`. The helper picks a live `dest` from `VPNBOT_REALITY_DEST_POOL`
+(default: `dl.google.com`, `www.cloudflare.com`, `gateway.icloud.com`,
+`ya.ru`, `max.ru`, `www.lovense.com`) and checks TLS reachability from the node
+before writing the inbound. This avoids a single local site, for example
+`rbc.ru`, silently breaking Reality on providers where that site no longer
+answers. Use `VPNBOT_REALITY_DEST=<host[:port]>` for a forced target or
+`VPNBOT_REALITY_DEST_CHECK=0` only for a manual emergency override.
+
 Standalone Xray-core installs block proxied user egress to Russian destination
 domains/IPs by default through Xray `routing` and the `blackhole` outbound. The
 installer downloads `roscomvpn-geosite.dat` from
