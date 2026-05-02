@@ -75,7 +75,11 @@ base domain. Kodik player domains are allowed through `domain:kodikplayer.com`,
 `domain:habr.com`, `domain:habrastorage.org`, and `domain:hsto.org`, covering
 Habr pages, subdomains, static assets, and image storage. RuTracker is allowed
 through `domain:rutracker.org` and `domain:rutracker.cc`, covering the forum and
-its static assets. The same narrow exception is used for Majestic RP game
+its static assets. Common LordFilm mirrors are allowed through `domain:lordfilm.ru`,
+`domain:lordfilm.com`, `domain:lordfilm.tv`, `domain:lordfilm.lu`,
+`domain:lordfilm.gg`, `domain:lordfilm.black`, `domain:lordfilm.film`,
+`domain:lordfilm1.ru`, `domain:lordfilm2.ru`, and `domain:lordfilm2025.ru`.
+The same narrow exception is used for Majestic RP game
 infrastructure: `domain:majestic-rp.ru`, `domain:majestic-launcher.ru`,
 `domain:majestic-files.net`, `domain:majestic-files.com`, and
 `domain:gta5majestic.com`. This does not add a server firewall rule, so REALITY

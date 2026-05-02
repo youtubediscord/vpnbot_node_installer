@@ -104,7 +104,10 @@ def build_default_rules(share_dir: Path) -> tuple[list[str], list[str], list[str
             "domain:pally.info,domain:pal24.pro,domain:donatepay.ru,domain:donationalerts.com,"
             "domain:www.donationalerts.com,domain:kodikplayer.com,domain:kodikres.com,"
             "domain:kodik-cdn.com,domain:habr.com,domain:habrastorage.org,domain:hsto.org,"
-            "domain:rutracker.org,domain:rutracker.cc,domain:majestic-rp.ru,domain:majestic-launcher.ru,"
+            "domain:rutracker.org,domain:rutracker.cc,domain:lordfilm.ru,domain:lordfilm.com,"
+            "domain:lordfilm.tv,domain:lordfilm.lu,domain:lordfilm.gg,domain:lordfilm.black,"
+            "domain:lordfilm.film,domain:lordfilm1.ru,domain:lordfilm2.ru,domain:lordfilm2025.ru,"
+            "domain:majestic-rp.ru,domain:majestic-launcher.ru,"
             "domain:majestic-files.net,domain:majestic-files.com,domain:gta5majestic.com",
         )
     )
