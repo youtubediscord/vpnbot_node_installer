@@ -28,16 +28,6 @@ DEFAULT_TLS_KEY = os.environ.get("NGINX_SSL_KEY", "/etc/nginx/ssl/vpnbot/privkey
 PORT_MIN = 20000
 PORT_MAX = 45000
 REALITY_FINGERPRINT = "chrome"
-DEFAULT_REALITY_DEST_POOL = [
-    "dl.google.com:443",
-    "www.cloudflare.com:443",
-    "gateway.icloud.com:443",
-    "ya.ru:443",
-    "max.ru:443",
-    "www.lovense.com:443",
-]
-REALITY_DEST_OVERRIDE = os.environ.get("VPNBOT_REALITY_DEST", "").strip()
-REALITY_DEST_POOL_RAW = os.environ.get("VPNBOT_REALITY_DEST_POOL", "").strip()
 REALITY_DEST_CHECK = os.environ.get("VPNBOT_REALITY_DEST_CHECK", "1").strip().lower() not in {"0", "false", "no", "off", "нет"}
 REALITY_DEST_CHECK_TIMEOUT = float(os.environ.get("VPNBOT_REALITY_DEST_CHECK_TIMEOUT", "4"))
 REALITY_DEST_CHECK_CACHE: dict[str, bool] = {}
@@ -88,10 +78,6 @@ REALITY_SERVER_NAME_POOL = load_reality_server_name_pool()
 MARK_RE = re.compile(r"\[(?P<value>direct|shared:\d+|\d+)\]", re.IGNORECASE)
 
 
-def split_reality_dest_pool(raw: str) -> list[str]:
-    return [item for item in re.split(r"[\s,;]+", str(raw or "").strip()) if item]
-
-
 def normalize_reality_dest(value: str) -> str:
     raw = str(value or "").strip().lower()
     if not raw:
@@ -103,26 +89,6 @@ def normalize_reality_dest(value: str) -> str:
     if sep and port.isdigit():
         return f"{host}:{int(port)}" if host else ""
     return f"{raw}:443"
-
-
-def reality_dest_host(dest: str) -> str:
-    normalized = normalize_reality_dest(dest)
-    host, _, _port = normalized.rpartition(":")
-    return host
-
-
-def configured_reality_dest_pool() -> list[str]:
-    raw_items = [REALITY_DEST_OVERRIDE] if REALITY_DEST_OVERRIDE else split_reality_dest_pool(REALITY_DEST_POOL_RAW)
-    if not raw_items:
-        raw_items = DEFAULT_REALITY_DEST_POOL
-    result: list[str] = []
-    seen: set[str] = set()
-    for item in raw_items:
-        normalized = normalize_reality_dest(item)
-        if normalized and normalized not in seen:
-            result.append(normalized)
-            seen.add(normalized)
-    return result
 
 
 def is_reality_dest_reachable(dest: str) -> bool:
@@ -146,22 +112,16 @@ def is_reality_dest_reachable(dest: str) -> bool:
     return ok
 
 
-def choose_reality_dest(primary_sni: str) -> str:
-    candidates = configured_reality_dest_pool()
-    if not candidates:
-        raise SystemExit("REALITY dest pool is empty")
-    if REALITY_DEST_OVERRIDE or not REALITY_DEST_CHECK:
-        return candidates[0]
-    if len(candidates) > 1:
-        start = random.randrange(len(candidates))
-        candidates = candidates[start:] + candidates[:start]
-    for dest in candidates:
-        if is_reality_dest_reachable(dest):
-            return dest
+def require_reality_dest_reachable(sni: str) -> str:
+    dest = normalize_reality_dest(sni)
+    if not dest:
+        raise SystemExit("Для REALITY нужно указать SNI/dest из полного пула")
+    if not REALITY_DEST_CHECK or is_reality_dest_reachable(dest):
+        return dest
     raise SystemExit(
-        "Не удалось подобрать живой REALITY dest: TLS handshake не прошёл ни с одним кандидатом "
-        f"из VPNBOT_REALITY_DEST_POOL ({', '.join(configured_reality_dest_pool())}). "
-        "Проверь сеть с этой ноды или временно задай VPNBOT_REALITY_DEST_CHECK=0."
+        f"REALITY dest {dest} недоступен с этой ноды: TLS handshake не прошёл. "
+        "Выбери другой SNI из полного REALITY SNI pool или временно задай "
+        "VPNBOT_REALITY_DEST_CHECK=0 только для ручной аварийной установки."
     )
 
 
@@ -174,7 +134,6 @@ def reality_server_names(primary: str) -> list[str]:
     names: list[str] = []
     for raw in [
         primary,
-        *[reality_dest_host(dest) for dest in configured_reality_dest_pool()],
         *globals().get("REALITY_SERVER_NAME_POOL", []),
         *globals().get("CATALOG_REALITY_TCP_DOMAINS", []),
         *globals().get("CATALOG_REALITY_XHTTP_DOMAINS", []),
@@ -1034,7 +993,7 @@ def build_xray_payload(spec: dict, rows: list[dict]) -> tuple[dict | None, str]:
         stream_settings["sockopt"] = {"acceptProxyProtocol": True}
 
     if security == "reality":
-        reality_dest = choose_reality_dest(domain)
+        reality_dest = require_reality_dest_reachable(domain)
         server_names = reality_server_names(domain)
         stream_settings["realitySettings"] = {
             "show": False,
